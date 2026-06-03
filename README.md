@@ -109,9 +109,22 @@ A scenario is a JSON file that describes a sequence of steps to execute.
 
 #### `connect`
 
-Opens a TCP connection to `target_address`. Subscribes all currently-supported
-protocols on the multiplexer (Handshake=0, Chain-Sync=2, Block-Fetch=3).
-Unused channels sit idle at negligible cost. No parameters.
+Opens a TCP connection to `target_address` and subscribes the full N2N
+mini-protocol suite on the multiplexer before spawning it.
+
+| Protocol | ID | Status |
+|----------|----|--------|
+| Handshake | 0 | Active — required before any other protocol |
+| Chain-Sync | 2 | Active — `chain_sync` step |
+| Block-Fetch | 3 | Active — `block_fetch` step |
+| Tx-Submission | 4 | Subscribed, idle — no step handler yet |
+| Keep-Alive | 8 | Active — background loop sends periodic pings |
+| Peer-Sharing | — | Not in pallas-network 0.36.0; will be added version-conditionally (≥ v13) |
+
+All subscriptions happen before `plexer.spawn()` (a Pallas requirement). Unused
+channels sit idle at negligible memory cost. The keep-alive client loop starts
+immediately and sends `MsgKeepAlive(cookie)` every 20 s; the node echoes
+`MsgResponseKeepAlive(cookie)`. Without this the node drops the connection.
 
 A scenario may contain multiple `connect` / `disconnect` cycles in any order.
 
@@ -299,7 +312,7 @@ cargo test
 
 - `trace::tests` — serialisation, `Direction::Internal`, `with_protocol`/`with_states`
 - `scenario::tests` — parsing, validation, `parse_point`
-- `scenario::runner::tests` — assertion evaluator (all eight cases)
+- `scenario::runner::tests` — assertion evaluator (all eight cases), `subscribed_protocols` suite check
 - `miniprotocols::handshake::tests` — graceful error on refused connection
 - `miniprotocols::chainsync::tests` — hex encoding, point extraction, payload fields
 - `miniprotocols::blockfetch::tests` — payload fields, summary fields
@@ -351,5 +364,7 @@ scripts/
 - Tx-Submission mini-protocol
 - Parse slot/hash/block_number from Block-Fetch block body CBOR
 - Named connection handles for multi-connection scenarios
-- Version-conditional protocol subscriptions (e.g. Peer-Sharing on N2N v13+)
+- Peer-Sharing mini-protocol (once pallas-network exposes it; version ≥ 13)
+- Tx-Submission step handler
+- Keep-Alive trace events (requires making Tracer concurrency-safe for the background loop)
 - Agda specification verifier integration

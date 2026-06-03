@@ -39,7 +39,7 @@ pub async fn run_block_fetch(
     channel: AgentChannel,
     points: Vec<Point>,
     batch_size: usize,
-    tracer: &mut Tracer,
+    tracer: &Tracer,
 ) -> anyhow::Result<BlockFetchSummary> {
     let started_at = Instant::now();
     let mut client = Client::new(channel);
@@ -273,7 +273,7 @@ fn build_summary(
     }
 }
 
-async fn emit_summary(tracer: &mut Tracer, summary: &BlockFetchSummary) {
+async fn emit_summary(tracer: &Tracer, summary: &BlockFetchSummary) {
     let _ = tracer
         .emit(
             TraceEvent::new(

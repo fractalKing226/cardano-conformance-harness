@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt as _;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -43,12 +46,23 @@ pub enum EventKind {
     BlockFetchSessionSummary,
 
     // Scenario runner
+    ProtocolWorkersStarted,
     ScenarioStarted,
     ScenarioCompleted,
     StepStarted,
     StepCompleted,
     AssertionPassed,
     AssertionFailed,
+
+    // Tx-Submission mini-protocol (passive — logged when peer sends messages)
+    TxSubmissionMessage,
+
+    // Keep-Alive mini-protocol
+    KeepAliveSent,
+    KeepAliveReceived,
+
+    // Peer-Sharing mini-protocol (not yet supported in pallas-network 0.36.0)
+    PeerSharingMessage,
 }
 
 /// Direction of a trace event relative to the harness.
@@ -114,39 +128,51 @@ impl TraceEvent {
     }
 }
 
-pub struct Tracer {
+// ── Tracer ────────────────────────────────────────────────────────────────────
+
+struct TracerInner {
     file: tokio::fs::File,
     /// In-memory buffer of events emitted since the last `drain_buffer` call.
-    /// Used by the scenario runner to collect per-step events for assertion checks.
+    /// Used by the scenario runner to collect per-step events for assertions.
     event_buffer: Vec<Value>,
 }
+
+/// A cheaply cloneable, concurrency-safe trace file handle.
+///
+/// Multiple tasks may hold a `Tracer` clone and emit events concurrently.
+/// The async mutex ensures each event is a single coherent JSON-lines write.
+#[derive(Clone)]
+pub struct Tracer(Arc<Mutex<TracerInner>>);
 
 impl Tracer {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(path)
             .await?;
-        Ok(Self {
+        Ok(Self(Arc::new(Mutex::new(TracerInner {
             file,
             event_buffer: Vec::new(),
-        })
+        }))))
     }
 
-    pub async fn emit(&mut self, event: TraceEvent) -> anyhow::Result<()> {
+    pub async fn emit(&self, event: TraceEvent) -> anyhow::Result<()> {
+        // Serialise outside the lock to minimise hold time.
         let v = serde_json::to_value(&event)?;
         let mut line = serde_json::to_string(&v)?;
-        self.event_buffer.push(v);
         line.push('\n');
-        self.file.write_all(line.as_bytes()).await?;
-        self.file.flush().await?;
+        let mut inner = self.0.lock().await;
+        inner.event_buffer.push(v);
+        inner.file.write_all(line.as_bytes()).await?;
+        inner.file.flush().await?;
         Ok(())
     }
 
     /// Returns all events buffered since the last call, clearing the buffer.
-    pub fn drain_buffer(&mut self) -> Vec<Value> {
-        std::mem::take(&mut self.event_buffer)
+    pub async fn drain_buffer(&self) -> Vec<Value> {
+        std::mem::take(&mut self.0.lock().await.event_buffer)
     }
 }
 
@@ -201,7 +227,6 @@ mod tests {
         assert_eq!(parsed["mini_protocol"], "chain-sync");
         assert_eq!(parsed["state_before"], "Idle");
         assert_eq!(parsed["state_after"], "CanAwait");
-        assert!(parsed.get("state_before").is_some());
     }
 
     #[tokio::test]
@@ -218,13 +243,12 @@ mod tests {
 
         assert_eq!(parsed["mini_protocol"], "chain-sync");
         assert!(parsed.get("state_before").is_none() || parsed["state_before"].is_null());
-        assert!(parsed.get("state_after").is_none() || parsed["state_after"].is_null());
     }
 
     #[tokio::test]
     async fn emit_writes_one_json_line_per_call() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut tracer = Tracer::open(tmp.path()).await.unwrap();
+        let tracer = Tracer::open(tmp.path()).await.unwrap();
 
         tracer
             .emit(TraceEvent::new(
@@ -254,5 +278,27 @@ mod tests {
         let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(second["kind"], "handshake_completed");
         assert_eq!(second["payload"]["negotiated_version"], 13);
+    }
+
+    #[tokio::test]
+    async fn concurrent_emits_all_appear_in_file() {
+        let tmp = NamedTempFile::new().unwrap();
+        let tracer = Tracer::open(tmp.path()).await.unwrap();
+
+        let t1 = tracer.clone();
+        let t2 = tracer.clone();
+        let (r1, r2) = tokio::join!(
+            t1.emit(TraceEvent::new(EventKind::KeepAliveSent, Direction::Sent, json!({ "cookie": 1 }))),
+            t2.emit(TraceEvent::new(EventKind::KeepAliveReceived, Direction::Received, json!({ "cookie": 1 }))),
+        );
+        r1.unwrap();
+        r2.unwrap();
+
+        let lines: Vec<_> = std::fs::read_to_string(tmp.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
     }
 }

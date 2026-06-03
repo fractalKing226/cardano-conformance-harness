@@ -93,7 +93,7 @@ pub async fn run_chain_sync(
     intersection_points: Vec<Point>,
     count: u64,
     await_timeout: Duration,
-    tracer: &mut Tracer,
+    tracer: &Tracer,
 ) -> anyhow::Result<ChainSyncSummary> {
     let started_at = Instant::now();
     let mut client = N2NClient::new(channel);
@@ -466,7 +466,7 @@ fn build_summary(
     }
 }
 
-async fn emit_summary(tracer: &mut Tracer, summary: &ChainSyncSummary) {
+async fn emit_summary(tracer: &Tracer, summary: &ChainSyncSummary) {
     let _ = tracer
         .emit(
             TraceEvent::new(

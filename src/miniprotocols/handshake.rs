@@ -14,7 +14,7 @@ use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
 pub async fn handshake_on_channel(
     channel: AgentChannel,
     magic: u64,
-    tracer: &mut Tracer,
+    tracer: &Tracer,
 ) -> anyhow::Result<u64> {
     tracer
         .emit(TraceEvent::new(
@@ -117,7 +117,7 @@ pub async fn handshake_on_channel(
 /// Standalone handshake probe: opens its own TCP connection, performs the
 /// handshake, and closes cleanly. Used by unit tests and the handshake-only
 /// code path.
-pub async fn run_handshake(addr: &str, magic: u64, tracer: &mut Tracer) -> anyhow::Result<u64> {
+pub async fn run_handshake(addr: &str, magic: u64, tracer: &Tracer) -> anyhow::Result<u64> {
     info!(%addr, "Opening TCP connection");
 
     let bearer = Bearer::connect_tcp(addr)
@@ -172,10 +172,10 @@ mod tests {
     #[tokio::test]
     async fn fails_gracefully_on_refused_connection() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut tracer = crate::trace::Tracer::open(tmp.path()).await.unwrap();
+        let tracer = crate::trace::Tracer::open(tmp.path()).await.unwrap();
 
         // Port 1 is reserved and will be refused on any standard OS.
-        let result = run_handshake("127.0.0.1:1", 1, &mut tracer).await;
+        let result = run_handshake("127.0.0.1:1", 1, &tracer).await;
 
         assert!(result.is_err());
 

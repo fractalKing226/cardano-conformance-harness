@@ -2,8 +2,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use pallas_network::miniprotocols::{Point, PROTOCOL_N2N_HANDSHAKE};
+
+use crate::miniprotocols::keepalive::{run_keepalive, KEEP_ALIVE_INTERVAL, KEEP_ALIVE_PROTOCOL};
+use crate::miniprotocols::txsubmission::{run_tx_submission, TX_SUBMISSION_PROTOCOL};
 use pallas_network::multiplexer::{AgentChannel, Bearer, Plexer, RunningPlexer};
 use serde_json::{json, Value};
+use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::miniprotocols::blockfetch::{run_block_fetch, BLOCK_FETCH_PROTOCOL};
@@ -13,6 +17,30 @@ use crate::scenario::{BlockFetchPoints, Scenario, StepDef, StepKind};
 use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
 
 use super::parse_point;
+
+// ── Protocol subscription ─────────────────────────────────────────────────────
+
+/// Returns the set of N2N protocol IDs to subscribe on every connection,
+/// based on the (post-handshake) negotiated version.
+///
+/// All subscriptions must happen before `plexer.spawn()`, so this is called
+/// at connect time with `u64::MAX` as a conservative upper bound. Once the
+/// harness can defer subscriptions until after handshake, pass the real version.
+///
+/// When Pallas adds `PROTOCOL_N2N_PEER_SHARING` (not present in 0.36.0),
+/// add: `if negotiated_version >= 13 { protocols.push(PROTOCOL_N2N_PEER_SHARING); }`
+pub fn subscribed_protocols(_negotiated_version: u64) -> Vec<u16> {
+    vec![
+        CHAIN_SYNC_PROTOCOL,
+        BLOCK_FETCH_PROTOCOL,
+        TX_SUBMISSION_PROTOCOL,
+        KEEP_ALIVE_PROTOCOL,
+        // Peer-Sharing: not in pallas-network 0.36.0.
+        // When added: if negotiated_version >= PEER_SHARING_MIN_VERSION {
+        //     protocols.push(PEER_SHARING_PROTOCOL);
+        // }
+    ]
+}
 
 // ── Runner ────────────────────────────────────────────────────────────────────
 
@@ -26,7 +54,7 @@ impl ScenarioRunner {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
-        let mut tracer = Tracer::open(&self.scenario.trace_output_path).await?;
+        let tracer = Tracer::open(&self.scenario.trace_output_path).await?;
         let started_at = Instant::now();
 
         tracer
@@ -51,7 +79,7 @@ impl ScenarioRunner {
         for (idx, step_def) in self.scenario.steps.iter().enumerate() {
             // Clear the buffer before each step so assertions only see this
             // step's own events.
-            tracer.drain_buffer();
+            tracer.drain_buffer().await;
 
             tracer
                 .emit(TraceEvent::new(
@@ -62,18 +90,18 @@ impl ScenarioRunner {
                 .await?;
 
             // Drain again so StepStarted is not visible to this step's assertions.
-            tracer.drain_buffer();
+            tracer.drain_buffer().await;
 
             let step_result = execute_step(
                 step_def,
                 &self.scenario.target_address,
                 self.scenario.network_magic,
                 &mut state,
-                &mut tracer,
+                &tracer,
             )
             .await;
 
-            let step_events = tracer.drain_buffer();
+            let step_events = tracer.drain_buffer().await;
 
             // Evaluate expect clauses.
             let mut assertions_ok = true;
@@ -121,9 +149,9 @@ impl ScenarioRunner {
                             json!({ "index": idx, "outcome": "assertion_failed" }),
                         ))
                         .await?;
-                    cleanup(&mut state, &mut tracer).await;
+                    cleanup(&mut state, &tracer).await;
                     emit_completed(
-                        &mut tracer,
+                        &tracer,
                         &self.scenario.name,
                         steps_passed,
                         steps_failed,
@@ -146,9 +174,9 @@ impl ScenarioRunner {
                             json!({ "index": idx, "outcome": "error", "error": e.to_string() }),
                         ))
                         .await?;
-                    cleanup(&mut state, &mut tracer).await;
+                    cleanup(&mut state, &tracer).await;
                     emit_completed(
-                        &mut tracer,
+                        &tracer,
                         &self.scenario.name,
                         steps_passed,
                         steps_failed,
@@ -162,7 +190,7 @@ impl ScenarioRunner {
         }
 
         emit_completed(
-            &mut tracer,
+            &tracer,
             &self.scenario.name,
             steps_passed,
             steps_failed,
@@ -179,9 +207,15 @@ impl ScenarioRunner {
 #[derive(Default)]
 struct RunnerState {
     plexer_handle: Option<RunningPlexer>,
+    ka_handle: Option<JoinHandle<()>>,
+    ts_handle: Option<JoinHandle<()>>,
     hs_channel: Option<AgentChannel>,
     cs_channel: Option<AgentChannel>,
     bf_channel: Option<AgentChannel>,
+    /// Stored during connect; background task is spawned after handshake.
+    ka_channel: Option<AgentChannel>,
+    /// Stored during connect; background task is spawned after handshake.
+    ts_channel: Option<AgentChannel>,
     #[allow(dead_code)]
     negotiated_version: Option<u64>,
     last_chain_sync_points: Vec<Point>,
@@ -194,10 +228,15 @@ async fn execute_step(
     target_address: &str,
     network_magic: u64,
     state: &mut RunnerState,
-    tracer: &mut Tracer,
+    tracer: &Tracer,
 ) -> anyhow::Result<()> {
     match step.kind {
         StepKind::Connect => {
+            // Phase 1 of the two-phase connection lifecycle: structural setup.
+            // Subscribe every protocol channel and spawn the multiplexer.
+            // No mini-protocol traffic is sent here — the Cardano N2N spec
+            // requires Handshake to complete before any other protocol can be
+            // used. Background workers are started in the Handshake arm below.
             let bearer = Bearer::connect_tcp(target_address)
                 .await
                 .with_context(|| format!("failed to connect to {target_address}"))?;
@@ -208,29 +247,54 @@ async fn execute_step(
                     json!({ "addr": target_address }),
                 ))
                 .await?;
-            // Subscribe every protocol the harness currently supports before
-            // spawning the plexer (Pallas requires all subscriptions upfront).
-            // Unused channels sit idle at negligible cost.
-            //
-            // When version-conditional protocols are added (e.g. Peer-Sharing
-            // only on N2N v13+), thread the negotiated version here and call a
-            // version-aware subscribe function instead of this static list.
             let mut plexer = Plexer::new(bearer);
             state.hs_channel = Some(plexer.subscribe_client(PROTOCOL_N2N_HANDSHAKE));
             state.cs_channel = Some(plexer.subscribe_client(CHAIN_SYNC_PROTOCOL));
             state.bf_channel = Some(plexer.subscribe_client(BLOCK_FETCH_PROTOCOL));
+            state.ts_channel = Some(plexer.subscribe_client(TX_SUBMISSION_PROTOCOL));
+            state.ka_channel = Some(plexer.subscribe_client(KEEP_ALIVE_PROTOCOL));
             state.plexer_handle = Some(plexer.spawn());
             Ok(())
         }
 
         StepKind::Handshake => {
+            // Phase 2 of the two-phase connection lifecycle: version negotiation
+            // and worker activation. Only after handshake_on_channel returns
+            // successfully do we know the negotiated version and that the node
+            // will accept traffic on other channels. Background tasks are spawned
+            // here, never in Connect, so they cannot send messages prematurely.
             let channel = state
                 .hs_channel
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("handshake step: no channel (missing connect?)"))?;
             let version = handshake_on_channel(channel, network_magic, tracer).await?;
             state.negotiated_version = Some(version);
-            info!(version, "Handshake complete");
+
+            let mut spawned_protocols: Vec<&str> = Vec::new();
+
+            if let Some(ka_channel) = state.ka_channel.take() {
+                let ka_client = pallas_network::miniprotocols::keepalive::Client::new(ka_channel);
+                state.ka_handle = Some(tokio::spawn(run_keepalive(
+                    ka_client,
+                    tracer.clone(),
+                    KEEP_ALIVE_INTERVAL,
+                )));
+                spawned_protocols.push("keep-alive");
+            }
+            if let Some(ts_channel) = state.ts_channel.take() {
+                state.ts_handle = Some(tokio::spawn(run_tx_submission(ts_channel, tracer.clone())));
+                spawned_protocols.push("tx-submission");
+            }
+
+            tracer
+                .emit(TraceEvent::new(
+                    EventKind::ProtocolWorkersStarted,
+                    Direction::Internal,
+                    json!({ "protocols": spawned_protocols }),
+                ))
+                .await?;
+
+            info!(version, protocols = ?spawned_protocols, "Handshake complete, workers started");
             Ok(())
         }
 
@@ -297,6 +361,17 @@ async fn execute_step(
         }
 
         StepKind::Disconnect => {
+            // Abort background loops before the plexer — they use the channels.
+            // ka_channel / ts_channel are Some only if handshake never ran;
+            // dropping them here is harmless (the plexer hasn't seen traffic on them).
+            state.ka_channel.take();
+            state.ts_channel.take();
+            if let Some(handle) = state.ka_handle.take() {
+                handle.abort();
+            }
+            if let Some(handle) = state.ts_handle.take() {
+                handle.abort();
+            }
             if let Some(handle) = state.plexer_handle.take() {
                 handle.abort().await;
             }
@@ -319,9 +394,17 @@ async fn execute_step(
     }
 }
 
-/// Abort the plexer and emit ConnectionClosed if still connected. Called on
-/// error/assertion-failure paths before returning from `run`.
-async fn cleanup(state: &mut RunnerState, tracer: &mut Tracer) {
+/// Abort the keep-alive loop and plexer, emit ConnectionClosed if still
+/// connected. Called on error/assertion-failure paths before returning.
+async fn cleanup(state: &mut RunnerState, tracer: &Tracer) {
+    state.ka_channel.take();
+    state.ts_channel.take();
+    if let Some(handle) = state.ka_handle.take() {
+        handle.abort();
+    }
+    if let Some(handle) = state.ts_handle.take() {
+        handle.abort();
+    }
     if let Some(handle) = state.plexer_handle.take() {
         handle.abort().await;
         let _ = tracer
@@ -335,7 +418,7 @@ async fn cleanup(state: &mut RunnerState, tracer: &mut Tracer) {
 }
 
 async fn emit_completed(
-    tracer: &mut Tracer,
+    tracer: &Tracer,
     name: &str,
     steps_passed: u64,
     steps_failed: u64,
@@ -520,5 +603,76 @@ mod tests {
         let results = evaluate_assertions(&a, &events(&["handshake_completed"]));
         assert!(results.iter().any(|r| r.passed));
         assert!(results.iter().any(|r| !r.passed));
+    }
+
+    #[test]
+    fn subscribed_protocols_contains_full_n2n_suite() {
+        use pallas_network::miniprotocols::{
+            PROTOCOL_N2N_KEEP_ALIVE, PROTOCOL_N2N_TX_SUBMISSION,
+        };
+        // Same set expected for all currently-deployed N2N versions.
+        for &version in &[7u64, 11, 13, 14] {
+            let ps = subscribed_protocols(version);
+            assert!(ps.contains(&CHAIN_SYNC_PROTOCOL),    "v{version}: missing chain-sync");
+            assert!(ps.contains(&BLOCK_FETCH_PROTOCOL),   "v{version}: missing block-fetch");
+            assert!(ps.contains(&PROTOCOL_N2N_TX_SUBMISSION), "v{version}: missing tx-submission");
+            assert!(ps.contains(&PROTOCOL_N2N_KEEP_ALIVE),    "v{version}: missing keep-alive");
+        }
+    }
+
+    /// Background workers must not exist until after handshake. This encodes
+    /// the lifecycle invariant: Connect is structural (channels only), Handshake
+    /// is behavioral (spawns workers). See the Connect and Handshake step arms
+    /// in execute_step for the authoritative comments explaining why.
+    #[test]
+    fn runner_state_starts_with_no_workers() {
+        let state = RunnerState::default();
+        assert!(state.ka_handle.is_none(),  "ka_handle must be None — workers spawn in Handshake, not Connect");
+        assert!(state.ts_handle.is_none(),  "ts_handle must be None — workers spawn in Handshake, not Connect");
+        assert!(state.ka_channel.is_none(), "ka_channel must be None before Connect runs");
+        assert!(state.ts_channel.is_none(), "ts_channel must be None before Connect runs");
+    }
+
+    /// After Connect, channels are allocated but workers are not yet running.
+    /// After Handshake, workers are running and channels are consumed.
+    /// Requires the devnet; verifies the invariant at runtime against a real connection.
+    ///
+    /// Run with: cargo test -p cardano-conformance-harness scenario::runner::tests::background_workers_spawned_after_handshake_not_before -- --ignored
+    #[tokio::test]
+    #[ignore = "requires devnet: docker compose up"]
+    async fn background_workers_spawned_after_handshake_not_before() {
+        use crate::scenario::{StepDef, StepKind, StepParams};
+        use tempfile::NamedTempFile;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let tracer = crate::trace::Tracer::open(tmp.path()).await.unwrap();
+        let mut state = RunnerState::default();
+
+        let connect = StepDef { kind: StepKind::Connect, params: StepParams::default(), expect: None };
+        execute_step(&connect, "localhost:3001", crate::DEVNET_MAGIC, &mut state, &tracer)
+            .await
+            .expect("connect should succeed");
+
+        // After Connect: channels exist but no workers yet.
+        assert!(state.ka_handle.is_none(),  "ka_handle must be None after Connect");
+        assert!(state.ts_handle.is_none(),  "ts_handle must be None after Connect");
+        assert!(state.ka_channel.is_some(), "ka_channel must be Some after Connect");
+        assert!(state.ts_channel.is_some(), "ts_channel must be Some after Connect");
+
+        let handshake = StepDef { kind: StepKind::Handshake, params: StepParams::default(), expect: None };
+        execute_step(&handshake, "localhost:3001", crate::DEVNET_MAGIC, &mut state, &tracer)
+            .await
+            .expect("handshake should succeed");
+
+        // After Handshake: channels consumed, workers running.
+        assert!(state.ka_handle.is_some(),  "ka_handle must be Some after Handshake");
+        assert!(state.ts_handle.is_some(),  "ts_handle must be Some after Handshake");
+        assert!(state.ka_channel.is_none(), "ka_channel must be None after Handshake (consumed)");
+        assert!(state.ts_channel.is_none(), "ts_channel must be None after Handshake (consumed)");
+
+        // Cleanup.
+        if let Some(h) = state.ka_handle.take() { h.abort(); }
+        if let Some(h) = state.ts_handle.take() { h.abort(); }
+        if let Some(h) = state.plexer_handle.take() { h.abort().await; }
     }
 }
