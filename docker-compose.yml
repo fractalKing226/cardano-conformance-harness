@@ -1,0 +1,32 @@
+services:
+  cardano-node:
+    image: ghcr.io/intersectmbo/cardano-node:10.6.2
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - ./devnet:/devnet
+    environment:
+      - CARDANO_BLOCK_PRODUCER=true
+      - CARDANO_SOCKET_PATH=/devnet/ipc/node.socket
+    command:
+      - run
+      - --config
+      - /devnet/cardano-node.json
+      - --topology
+      - /devnet/topology.json
+      - --database-path
+      - /devnet/db
+      - --shelley-kes-key
+      - /devnet/kes.skey
+      - --shelley-vrf-key
+      - /devnet/vrf.skey
+      - --shelley-operational-certificate
+      - /devnet/opcert.cert
+      - --byron-delegation-certificate
+      - /devnet/byron-delegation.cert
+      - --byron-signing-key
+      - /devnet/byron-delegate.key
+      - --host-addr
+      - "0.0.0.0"
+      - --port
+      - "3001"

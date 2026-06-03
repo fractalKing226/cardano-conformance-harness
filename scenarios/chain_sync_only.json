@@ -1,0 +1,17 @@
+{
+  "name": "chain_sync_only",
+  "description": "Sync 5 headers from genesis and exit cleanly",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "connect" },
+    { "kind": "handshake" },
+    {
+      "kind": "chain_sync",
+      "count": 5
+    },
+    { "kind": "disconnect" }
+  ]
+}

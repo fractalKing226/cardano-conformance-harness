@@ -1,0 +1,21 @@
+{
+  "name": "chain_sync_then_block_fetch",
+  "description": "Sync 10 headers from genesis, then fetch the full block bodies",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "connect" },
+    { "kind": "handshake" },
+    {
+      "kind": "chain_sync",
+      "count": 10
+    },
+    {
+      "kind": "block_fetch",
+      "points": "from_chain_sync"
+    },
+    { "kind": "disconnect" }
+  ]
+}

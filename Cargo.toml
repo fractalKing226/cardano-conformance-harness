@@ -1,0 +1,28 @@
+[package]
+name = "cardano-conformance-harness"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "cardano-conformance-harness"
+path = "src/main.rs"
+
+[lib]
+name = "cardano_conformance_harness"
+path = "src/lib.rs"
+
+[dependencies]
+pallas-network = "0.36.0"
+pallas-codec = "0.36.0"
+pallas-crypto = "0.36.0"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"

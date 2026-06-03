@@ -1,0 +1,258 @@
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::path::Path;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt as _;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    // Connection lifecycle
+    ConnectionOpened,
+    ConnectionClosed,
+    Error,
+
+    // Handshake mini-protocol
+    HandshakeStarted,
+    HandshakeVersionProposed,
+    HandshakeVersionAccepted,
+    HandshakeVersionRejected,
+    HandshakeCompleted,
+
+    // Chain-Sync mini-protocol
+    ChainSyncStarted,
+    ChainSyncFindIntersect,
+    ChainSyncIntersectFound,
+    ChainSyncIntersectNotFound,
+    ChainSyncRequestNext,
+    ChainSyncRollForward,
+    ChainSyncRollBackward,
+    ChainSyncAwaitReply,
+    ChainSyncDone,
+    ChainSyncSessionSummary,
+
+    // Block-Fetch mini-protocol
+    BlockFetchStarted,
+    BlockFetchRequestRange,
+    BlockFetchNoBlocks,
+    BlockFetchStartBatch,
+    BlockFetchBlock,
+    BlockFetchBatchDone,
+    BlockFetchClientDone,
+    BlockFetchSessionSummary,
+
+    // Scenario runner
+    ScenarioStarted,
+    ScenarioCompleted,
+    StepStarted,
+    StepCompleted,
+    AssertionPassed,
+    AssertionFailed,
+}
+
+/// Direction of a trace event relative to the harness.
+///
+/// - `Sent` / `Received` correspond to actual wire messages.
+/// - `Internal` is for harness-generated meta-events (session boundaries,
+///   summaries, errors) that do not map to a single wire message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Sent,
+    Received,
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceEvent {
+    pub timestamp: String,
+    pub kind: EventKind,
+    pub direction: Direction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mini_protocol: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_after: Option<String>,
+    pub payload: Value,
+}
+
+impl TraceEvent {
+    pub fn new(kind: EventKind, direction: Direction, payload: Value) -> Self {
+        Self {
+            timestamp: Utc::now().to_rfc3339(),
+            kind,
+            direction,
+            mini_protocol: None,
+            state_before: None,
+            state_after: None,
+            payload,
+        }
+    }
+
+    /// Tags a wire-message event with its mini-protocol name and the state
+    /// transition it caused. Use for `Sent` and `Received` events.
+    pub fn with_states(
+        mut self,
+        mini_protocol: &'static str,
+        state_before: impl Into<String>,
+        state_after: impl Into<String>,
+    ) -> Self {
+        self.mini_protocol = Some(mini_protocol);
+        self.state_before = Some(state_before.into());
+        self.state_after = Some(state_after.into());
+        self
+    }
+
+    /// Tags a meta/internal event with its mini-protocol name only.
+    /// Use for `Internal` events (session starts, summaries, errors) where
+    /// state-before/after fields are not meaningful.
+    pub fn with_protocol(mut self, mini_protocol: &'static str) -> Self {
+        self.mini_protocol = Some(mini_protocol);
+        self
+    }
+}
+
+pub struct Tracer {
+    file: tokio::fs::File,
+    /// In-memory buffer of events emitted since the last `drain_buffer` call.
+    /// Used by the scenario runner to collect per-step events for assertion checks.
+    event_buffer: Vec<Value>,
+}
+
+impl Tracer {
+    pub async fn open(path: &Path) -> anyhow::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        Ok(Self {
+            file,
+            event_buffer: Vec::new(),
+        })
+    }
+
+    pub async fn emit(&mut self, event: TraceEvent) -> anyhow::Result<()> {
+        let v = serde_json::to_value(&event)?;
+        let mut line = serde_json::to_string(&v)?;
+        self.event_buffer.push(v);
+        line.push('\n');
+        self.file.write_all(line.as_bytes()).await?;
+        self.file.flush().await?;
+        Ok(())
+    }
+
+    /// Returns all events buffered since the last call, clearing the buffer.
+    pub fn drain_buffer(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.event_buffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn event_serialises_with_snake_case_fields() {
+        let event = TraceEvent::new(
+            EventKind::ConnectionOpened,
+            Direction::Internal,
+            json!({ "addr": "localhost:3001" }),
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+
+        assert_eq!(parsed["kind"], "connection_opened");
+        assert_eq!(parsed["direction"], "internal");
+        assert!(parsed["timestamp"].is_string());
+        assert_eq!(parsed["payload"]["addr"], "localhost:3001");
+    }
+
+    #[tokio::test]
+    async fn protocol_fields_are_omitted_when_none() {
+        let event = TraceEvent::new(
+            EventKind::HandshakeStarted,
+            Direction::Internal,
+            json!({}),
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("mini_protocol"));
+        assert!(!json.contains("state_before"));
+        assert!(!json.contains("state_after"));
+    }
+
+    #[tokio::test]
+    async fn with_states_populates_optional_fields() {
+        let event = TraceEvent::new(
+            EventKind::ChainSyncRequestNext,
+            Direction::Sent,
+            json!({}),
+        )
+        .with_states("chain-sync", "Idle", "CanAwait");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+
+        assert_eq!(parsed["mini_protocol"], "chain-sync");
+        assert_eq!(parsed["state_before"], "Idle");
+        assert_eq!(parsed["state_after"], "CanAwait");
+        assert!(parsed.get("state_before").is_some());
+    }
+
+    #[tokio::test]
+    async fn with_protocol_sets_only_mini_protocol() {
+        let event = TraceEvent::new(
+            EventKind::ChainSyncStarted,
+            Direction::Internal,
+            json!({}),
+        )
+        .with_protocol("chain-sync");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+
+        assert_eq!(parsed["mini_protocol"], "chain-sync");
+        assert!(parsed.get("state_before").is_none() || parsed["state_before"].is_null());
+        assert!(parsed.get("state_after").is_none() || parsed["state_after"].is_null());
+    }
+
+    #[tokio::test]
+    async fn emit_writes_one_json_line_per_call() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut tracer = Tracer::open(tmp.path()).await.unwrap();
+
+        tracer
+            .emit(TraceEvent::new(
+                EventKind::HandshakeStarted,
+                Direction::Internal,
+                json!({ "magic": 1_u64 }),
+            ))
+            .await
+            .unwrap();
+        tracer
+            .emit(TraceEvent::new(
+                EventKind::HandshakeCompleted,
+                Direction::Internal,
+                json!({ "negotiated_version": 13_u64 }),
+            ))
+            .await
+            .unwrap();
+
+        let contents = std::fs::read_to_string(tmp.path()).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["kind"], "handshake_started");
+        assert_eq!(first["payload"]["magic"], 1);
+
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["kind"], "handshake_completed");
+        assert_eq!(second["payload"]["negotiated_version"], 13);
+    }
+}
