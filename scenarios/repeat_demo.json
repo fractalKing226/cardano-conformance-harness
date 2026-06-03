@@ -1,0 +1,28 @@
+{
+  "name": "repeat_demo",
+  "description": "Fetch 3 headers and their block bodies, repeated 4 times",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "connect" },
+    { "kind": "handshake" },
+    {
+      "kind": "repeat",
+      "times": 4,
+      "body": [
+        {
+          "kind": "chain_sync",
+          "count": 3,
+          "output": "pts"
+        },
+        {
+          "kind": "block_fetch",
+          "points": "$pts"
+        }
+      ]
+    },
+    { "kind": "disconnect" }
+  ]
+}

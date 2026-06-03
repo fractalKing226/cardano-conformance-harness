@@ -30,13 +30,14 @@ fn make_scenario(name: &str, trace_path: &std::path::Path, steps: Vec<StepDef>) 
 }
 
 fn simple_step(kind: StepKind) -> StepDef {
-    StepDef { kind, params: StepParams::default(), expect: None }
+    StepDef { kind, raw_params: serde_json::json!({}), output: None, expect: None }
 }
 
 fn chain_sync_step(count: u64) -> StepDef {
     StepDef {
         kind: StepKind::ChainSync,
-        params: StepParams { count: Some(count), ..Default::default() },
+        raw_params: serde_json::json!({ "count": count }),
+        output: None,
         expect: None,
     }
 }
@@ -44,13 +45,14 @@ fn chain_sync_step(count: u64) -> StepDef {
 fn sleep_step(secs: u64) -> StepDef {
     StepDef {
         kind: StepKind::Sleep,
-        params: StepParams { duration_secs: Some(secs), ..Default::default() },
+        raw_params: serde_json::json!({ "duration_secs": secs }),
+        output: None,
         expect: None,
     }
 }
 
 fn step_with_expect(kind: StepKind, expect: Assertions) -> StepDef {
-    StepDef { kind, params: StepParams::default(), expect: Some(expect) }
+    StepDef { kind, raw_params: serde_json::json!({}), output: None, expect: Some(expect) }
 }
 
 const DEVNET_ADDR: &str = "localhost:3001";
@@ -646,5 +648,160 @@ async fn tx_submission_init_and_exchange_logged() {
     assert_eq!(
         requests.len(), replies.len(),
         "every request_tx_ids must have a corresponding reply_tx_ids"
+    );
+}
+
+// ── Repeat semantics tests ────────────────────────────────────────────────────
+
+/// Successful repeat: all iterations produce RepeatIterationCompleted(ok) and
+/// the scenario ends with ScenarioCompleted(completed). Uses only sleep steps —
+/// no devnet required.
+#[tokio::test]
+async fn repeat_all_iterations_complete_successfully() {
+    let tmp = NamedTempFile::new().unwrap();
+    // No connect/disconnect — sleep steps need no connection.
+    let scenario = make_scenario(
+        "repeat_success_test",
+        tmp.path(),
+        vec![StepDef {
+            kind: StepKind::Repeat,
+            raw_params: serde_json::json!({
+                "times": 3,
+                "body": [{ "kind": "sleep", "duration_secs": 0 }]
+            }),
+            output: None,
+            expect: None,
+        }],
+    );
+
+    ScenarioRunner::new(scenario).run().await.expect("scenario should succeed");
+
+    let events = read_trace(&tmp);
+
+    let started: Vec<_> = events.iter().filter(|e| e["kind"] == "repeat_iteration_started").collect();
+    let completed: Vec<_> = events.iter().filter(|e| e["kind"] == "repeat_iteration_completed").collect();
+    assert_eq!(started.len(), 3, "3 iterations must have started");
+    assert_eq!(completed.len(), 3, "3 iterations must have completed");
+    for (i, c) in completed.iter().enumerate() {
+        assert_eq!(c["payload"]["iteration"], i, "iteration numbers must be sequential");
+        assert_eq!(c["payload"]["outcome"], "ok");
+    }
+
+    let sc = events.iter().find(|e| e["kind"] == "scenario_completed").unwrap();
+    assert_eq!(sc["payload"]["outcome"], "completed");
+}
+
+/// When a body step's assertion fails on iteration N, the trace must record:
+/// (a) RepeatIterationCompleted(error) for iteration N,
+/// (b) iterations > N never start,
+/// (c) ScenarioCompleted(step_error) still fires.
+/// Uses only sleep steps — no devnet required.
+#[tokio::test]
+async fn repeat_error_path_emits_correct_trace_events() {
+    let tmp = NamedTempFile::new().unwrap();
+    let scenario = make_scenario(
+        "repeat_error_test",
+        tmp.path(),
+        vec![StepDef {
+            kind: StepKind::Repeat,
+            raw_params: serde_json::json!({
+                "times": 3,
+                "body": [{
+                    "kind": "sleep",
+                    "duration_secs": 0,
+                    // sleep emits 0 events — min_events: 999 always fails
+                    "expect": { "min_events": 999 }
+                }]
+            }),
+            output: None,
+            expect: None,
+        }],
+    );
+
+    let result = ScenarioRunner::new(scenario).run().await;
+    assert!(result.is_err(), "scenario must fail when body assertion fails");
+
+    let events = read_trace(&tmp);
+
+    // Only iteration 0 should have started.
+    let started: Vec<_> = events.iter().filter(|e| e["kind"] == "repeat_iteration_started").collect();
+    assert_eq!(started.len(), 1, "only the failing iteration should have started");
+    assert_eq!(started[0]["payload"]["iteration"], 0);
+
+    // Iteration 0 must have a RepeatIterationCompleted with an error outcome.
+    let completed: Vec<_> = events.iter().filter(|e| e["kind"] == "repeat_iteration_completed").collect();
+    assert_eq!(completed.len(), 1, "exactly one RepeatIterationCompleted must be emitted");
+    assert_eq!(completed[0]["payload"]["iteration"], 0);
+    assert_ne!(completed[0]["payload"]["outcome"], "ok", "failing iteration must not report ok");
+
+    // ScenarioCompleted must always fire — even on failure.
+    let sc = events.iter().find(|e| e["kind"] == "scenario_completed")
+        .expect("scenario_completed must be present even on failure");
+    assert_ne!(sc["payload"]["outcome"], "completed");
+    assert_eq!(sc["payload"]["steps_failed"], 1);
+}
+
+/// Body steps within a repeat iteration see variables set by earlier body steps
+/// in the same iteration. query_tip stores the tip in a variable; chain_sync
+/// immediately uses it as the intersection point.
+///
+/// Run with: cargo test --test live_node -- --ignored
+#[tokio::test]
+#[ignore = "requires devnet: docker compose up"]
+async fn repeat_body_variables_visible_within_same_iteration() {
+    let tmp = NamedTempFile::new().unwrap();
+    let scenario = make_scenario(
+        "repeat_variable_visibility",
+        tmp.path(),
+        vec![
+            simple_step(StepKind::Connect),
+            simple_step(StepKind::Handshake),
+            // Single iteration: query_tip then immediately chain_sync from that tip.
+            // If variable visibility worked, chain_sync uses $tip.point; if it didn't,
+            // the substitution would fail with "unknown variable: tip".
+            StepDef {
+                kind: StepKind::Repeat,
+                raw_params: serde_json::json!({
+                    "times": 1,
+                    "body": [
+                        { "kind": "query_tip", "output": "tip" },
+                        {
+                            "kind": "chain_sync",
+                            "intersection_points": ["$tip.point"],
+                            "count": 2
+                        }
+                    ]
+                }),
+                output: None,
+                expect: None,
+            },
+            simple_step(StepKind::Disconnect),
+        ],
+    );
+
+    ScenarioRunner::new(scenario).run().await
+        .expect("scenario should succeed — $tip.point must be visible to chain_sync in the same iteration");
+
+    let events = read_trace(&tmp);
+
+    // Variable resolution event must be present for the $tip.point reference.
+    let var_refs: Vec<_> = events.iter()
+        .filter(|e| e["kind"] == "variable_referenced")
+        .collect();
+    assert!(
+        var_refs.iter().any(|e| e["payload"]["reference"] == "$tip.point"),
+        "expected a variable_referenced event for $tip.point"
+    );
+
+    // chain_sync must have actually run — roll_forward events must appear.
+    assert!(
+        events.iter().any(|e| e["kind"] == "chain_sync_roll_forward"),
+        "chain_sync must have executed successfully using the resolved tip point"
+    );
+
+    // No error events.
+    assert!(
+        events.iter().all(|e| e["kind"] != "error"),
+        "no error events expected"
     );
 }

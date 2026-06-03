@@ -21,6 +21,14 @@ REQUIRED_FILES=(
 )
 
 echo "==> Preparing devnet in $DEVNET"
+
+# Wipe the chain database so the freshly-stamped genesis doesn't have blocks
+# "from the future" (left over from the previous run's genesis timing).
+rm -rf "$DEVNET/db"
+# Remove any stale Unix socket file — cardano-node can't unlink it through
+# Docker Desktop's macOS filesystem layer on startup.
+rm -f "$DEVNET/ipc/node.socket"
+
 mkdir -p "$DEVNET" "$DEVNET/db" "$DEVNET/ipc"
 
 for f in "${REQUIRED_FILES[@]}"; do

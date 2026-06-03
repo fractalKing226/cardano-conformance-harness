@@ -1,0 +1,22 @@
+{
+  "name": "query_tip_chain_sync",
+  "description": "Query the current tip, then sync 5 headers starting from that tip point",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "connect" },
+    { "kind": "handshake" },
+    {
+      "kind": "query_tip",
+      "output": "tip"
+    },
+    {
+      "kind": "chain_sync",
+      "intersection_points": ["$tip.point"],
+      "count": 5
+    },
+    { "kind": "disconnect" }
+  ]
+}

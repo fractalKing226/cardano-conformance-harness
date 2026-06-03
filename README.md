@@ -105,7 +105,36 @@ A scenario is a JSON file that describes a sequence of steps to execute.
 | `trace_output_path` | yes | Path for the JSON-lines trace output |
 | `expected_outcome` | no | Informational string logged in `scenario_completed` (e.g. `"success"`) |
 
+### Variables
+
+Steps that produce data can store it in a named variable using the `output` field.
+Later steps reference variables using a `$name` prefix.
+
+```json
+{ "kind": "query_tip", "output": "tip" }
+{ "kind": "chain_sync", "intersection_points": ["$tip.point"], "count": 5 }
+```
+
+**Supported reference forms:**
+
+| Form | Meaning |
+|------|---------|
+| `$name` | The whole variable value |
+| `$name.field` | A field of a record variable |
+| `$name[i]` | An element of a list variable |
+
+Variable substitution happens at parameter-binding time, just before each step executes. Any string starting with `$` in any parameter field is treated as a reference. A `VariableReferenced` trace event is emitted for every substitution made, and a `VariableSet` event is emitted when a step stores a result.
+
+Unresolved references produce a clear error: `unknown variable: "foo"` or `"tip" has no field "slut"`.
+
 ### Step kinds and parameters
+
+> **Note on channel reuse.** Each `chain_sync` and `block_fetch` step consumes its
+> multiplexer channel (the channel is passed into the Pallas client by value and is
+> gone after `MsgDone`). A second `chain_sync` step on the same connection will fail
+> with "no channel". Use a `disconnect` / `connect` / `handshake` cycle between
+> sessions if you need multiple chain-sync rounds. Channel reuse across sequential
+> sessions is a planned improvement.
 
 #### `connect`
 
@@ -141,14 +170,64 @@ Runs the NodeToNode Handshake mini-protocol. No parameters.
 | `await_timeout_secs` | `30` | Seconds to wait in MustReply state |
 
 Collects the point of each `RollForward` header (slot + blake2b-256 of header
-bytes) for use by a subsequent `block_fetch` step.
+bytes). When `output` is set, stores the collected points as a list in the named
+variable so a later `block_fetch` can reference them via `"$varname"`.
 
 #### `block_fetch`
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `points` | `"from_chain_sync"` | `"from_chain_sync"` uses points from the most recent `chain_sync`; or an array of `"slot:hex_hash"` strings |
+| `points` | `"from_chain_sync"` | `"from_chain_sync"` (deprecated — prefer `output` + `"$varname"`), a `"$varname"` reference, or an array of `"slot:hex_hash"` strings |
 | `batch_size` | `1` | Points per `MsgRequestRange` |
+
+The `"from_chain_sync"` keyword still works for backward compatibility but is deprecated. Prefer the explicit variable pattern:
+
+```json
+{ "kind": "chain_sync", "count": 5, "output": "pts" }
+{ "kind": "block_fetch", "points": "$pts" }
+```
+
+#### `query_tip`
+
+Opens a temporary TCP connection, performs a handshake, and does a minimal
+Chain-Sync round-trip to obtain the current chain tip. The connection is
+closed after the query. All wire events are logged to the trace.
+
+| Output variable shape | Fields |
+|-----------------------|--------|
+| `tip` record | `point` (string: `"origin"` or `"slot:hex_hash"`), `block_number` (integer) |
+
+```json
+{ "kind": "query_tip", "output": "tip" }
+```
+
+After this step, `$tip.point` is a valid intersection point string and
+`$tip.block_number` is the block number at the time of the query.
+
+#### `repeat`
+
+Executes a sequence of body steps a fixed number of times.
+
+| Parameter | Description |
+|-----------|-------------|
+| `times` | Number of iterations — a literal integer or a `$varname` reference |
+| `body` | Array of steps to execute each iteration |
+
+Variables written inside the body (via `output`) persist to the outer scope and
+accumulate across iterations. A `RepeatIterationStarted` and `RepeatIterationCompleted`
+event is emitted around each iteration. If a body step fails, the iteration fails
+and the repeat step fails, aborting the scenario at that point.
+
+```json
+{
+  "kind": "repeat",
+  "times": 4,
+  "body": [
+    { "kind": "chain_sync", "count": 3, "output": "pts" },
+    { "kind": "block_fetch", "points": "$pts" }
+  ]
+}
+```
 
 #### `disconnect`
 
@@ -202,6 +281,9 @@ scenario with a non-zero exit code.
 | `scenarios/chain_sync_only.json` | Chain-Sync 5 headers, no block fetch |
 | `scenarios/chain_sync_then_block_fetch.json` | Chain-Sync 10 + Block-Fetch |
 | `scenarios/assertion_demo.json` | Demonstrates `expect` clauses |
+| `scenarios/query_tip_chain_sync.json` | Query tip, then Chain-Sync from that tip |
+| `scenarios/repeat_demo.json` | Repeat 4×: sync 3 headers + fetch bodies |
+| `scenarios/combined_variables.json` | All features: variables, query_tip, repeat |
 
 ## Trace file format
 
@@ -312,7 +394,9 @@ cargo test
 
 - `trace::tests` — serialisation, `Direction::Internal`, `with_protocol`/`with_states`
 - `scenario::tests` — parsing, validation, `parse_point`
-- `scenario::runner::tests` — assertion evaluator (all eight cases), `subscribed_protocols` suite check
+- `scenario::vars::tests` — `resolve_ref` (all forms, error cases), `substitute_in_value`, `point_to_str`
+- `scenario::tests` — step parsing (variables, query_tip, repeat), validate constraints
+- `scenario::runner::tests` — assertion evaluator, `subscribed_protocols` suite check
 - `miniprotocols::handshake::tests` — graceful error on refused connection
 - `miniprotocols::chainsync::tests` — hex encoding, point extraction, payload fields
 - `miniprotocols::blockfetch::tests` — payload fields, summary fields

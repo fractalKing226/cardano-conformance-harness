@@ -1,0 +1,53 @@
+{
+  "name": "combined_variables",
+  "description": "Demonstrates variables, query_tip, and repeat. Each repeat iteration opens a fresh connection so chain_sync's channel is available (channel reuse across sessions on one connection is a future improvement).",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "connect" },
+    { "kind": "handshake" },
+    {
+      "kind": "query_tip",
+      "output": "tip"
+    },
+    {
+      "kind": "chain_sync",
+      "intersection_points": ["$tip.point"],
+      "count": 5,
+      "output": "initial_points"
+    },
+    {
+      "kind": "block_fetch",
+      "points": "$initial_points"
+    },
+    { "kind": "disconnect" },
+    {
+      "kind": "repeat",
+      "times": 2,
+      "body": [
+        { "kind": "connect" },
+        { "kind": "handshake" },
+        {
+          "kind": "query_tip",
+          "output": "current_tip"
+        },
+        {
+          "kind": "chain_sync",
+          "intersection_points": ["$current_tip.point"],
+          "count": 2,
+          "output": "loop_pts",
+          "expect": {
+            "must_contain_kind": ["chain_sync_roll_forward"]
+          }
+        },
+        {
+          "kind": "block_fetch",
+          "points": "$loop_pts"
+        },
+        { "kind": "disconnect" }
+      ]
+    }
+  ]
+}

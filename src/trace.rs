@@ -48,6 +48,12 @@ pub enum EventKind {
     // Scenario runner
     ProtocolWorkersStarted,
     ScenarioStarted,
+    QueryTipStarted,
+    QueryTipCompleted,
+    RepeatIterationStarted,
+    RepeatIterationCompleted,
+    VariableSet,
+    VariableReferenced,
     ScenarioCompleted,
     StepStarted,
     StepCompleted,

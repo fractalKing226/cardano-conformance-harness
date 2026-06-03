@@ -1,0 +1,55 @@
+{
+  "name": "block_consistency_across_sessions",
+  "description": "Fetches the same block bodies twice via separate Block-Fetch sessions, with a disconnect in between. The trace contains both sets of block bytes; a verifier can check that bodies returned for the same point are byte-identical across sessions. This tests node determinism for block content.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_consistency.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    {
+      "kind": "connect"
+    },
+    {
+      "kind": "handshake"
+    },
+    {
+      "kind": "query_tip",
+      "output": "starting_tip"
+    },
+    {
+      "kind": "chain_sync",
+      "intersection_points": ["$starting_tip.point"],
+      "count": 5,
+      "output": "test_points",
+      "expect": {
+        "must_contain_kind": ["chain_sync_roll_forward"]
+      }
+    },
+    {
+      "kind": "block_fetch",
+      "points": "$test_points",
+      "expect": {
+        "must_contain_kind": ["block_fetch_block"]
+      }
+    },
+    {
+      "kind": "disconnect"
+    },
+    {
+      "kind": "connect"
+    },
+    {
+      "kind": "handshake"
+    },
+    {
+      "kind": "block_fetch",
+      "points": "$test_points",
+      "expect": {
+        "must_contain_kind": ["block_fetch_block"]
+      }
+    },
+    {
+      "kind": "disconnect"
+    }
+  ]
+}

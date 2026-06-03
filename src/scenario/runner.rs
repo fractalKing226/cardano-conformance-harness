@@ -1,10 +1,10 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use pallas_network::miniprotocols::chainsync::{N2NClient, Tip};
 use pallas_network::miniprotocols::{Point, PROTOCOL_N2N_HANDSHAKE};
-
-use crate::miniprotocols::keepalive::{run_keepalive, KEEP_ALIVE_INTERVAL, KEEP_ALIVE_PROTOCOL};
-use crate::miniprotocols::txsubmission::{run_tx_submission, TX_SUBMISSION_PROTOCOL};
 use pallas_network::multiplexer::{AgentChannel, Bearer, Plexer, RunningPlexer};
 use serde_json::{json, Value};
 use tokio::task::JoinHandle;
@@ -13,32 +13,26 @@ use tracing::info;
 use crate::miniprotocols::blockfetch::{run_block_fetch, BLOCK_FETCH_PROTOCOL};
 use crate::miniprotocols::chainsync::{run_chain_sync, CHAIN_SYNC_PROTOCOL};
 use crate::miniprotocols::handshake::handshake_on_channel;
-use crate::scenario::{BlockFetchPoints, Scenario, StepDef, StepKind};
+use crate::miniprotocols::keepalive::{run_keepalive, KEEP_ALIVE_INTERVAL, KEEP_ALIVE_PROTOCOL};
+use crate::miniprotocols::txsubmission::{run_tx_submission, TX_SUBMISSION_PROTOCOL};
+use crate::scenario::vars::{point_to_str, substitute_in_value, VarStore};
+use crate::scenario::{BlockFetchPoints, Scenario, StepDef, StepKind, StepParams};
 use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
 
 use super::parse_point;
 
 // ── Protocol subscription ─────────────────────────────────────────────────────
 
-/// Returns the set of N2N protocol IDs to subscribe on every connection,
-/// based on the (post-handshake) negotiated version.
-///
-/// All subscriptions must happen before `plexer.spawn()`, so this is called
-/// at connect time with `u64::MAX` as a conservative upper bound. Once the
-/// harness can defer subscriptions until after handshake, pass the real version.
+/// Returns the set of N2N protocol IDs to subscribe on every connection.
 ///
 /// When Pallas adds `PROTOCOL_N2N_PEER_SHARING` (not present in 0.36.0),
-/// add: `if negotiated_version >= 13 { protocols.push(PROTOCOL_N2N_PEER_SHARING); }`
+/// add: `if negotiated_version >= PEER_SHARING_MIN_VERSION { ... }`
 pub fn subscribed_protocols(_negotiated_version: u64) -> Vec<u16> {
     vec![
         CHAIN_SYNC_PROTOCOL,
         BLOCK_FETCH_PROTOCOL,
         TX_SUBMISSION_PROTOCOL,
         KEEP_ALIVE_PROTOCOL,
-        // Peer-Sharing: not in pallas-network 0.36.0.
-        // When added: if negotiated_version >= PEER_SHARING_MIN_VERSION {
-        //     protocols.push(PEER_SHARING_PROTOCOL);
-        // }
     ]
 }
 
@@ -77,103 +71,21 @@ impl ScenarioRunner {
         let mut steps_failed: u64 = 0;
 
         for (idx, step_def) in self.scenario.steps.iter().enumerate() {
-            // Clear the buffer before each step so assertions only see this
-            // step's own events.
-            tracer.drain_buffer().await;
-
-            tracer
-                .emit(TraceEvent::new(
-                    EventKind::StepStarted,
-                    Direction::Internal,
-                    json!({ "index": idx, "kind": step_def.kind.as_str() }),
-                ))
-                .await?;
-
-            // Drain again so StepStarted is not visible to this step's assertions.
-            tracer.drain_buffer().await;
-
-            let step_result = execute_step(
+            match run_step(
                 step_def,
+                idx,
                 &self.scenario.target_address,
                 self.scenario.network_magic,
                 &mut state,
                 &tracer,
             )
-            .await;
-
-            let step_events = tracer.drain_buffer().await;
-
-            // Evaluate expect clauses.
-            let mut assertions_ok = true;
-            if let Some(expect) = &step_def.expect {
-                for result in evaluate_assertions(expect, &step_events) {
-                    if !result.passed {
-                        assertions_ok = false;
-                    }
-                    let kind = if result.passed {
-                        EventKind::AssertionPassed
-                    } else {
-                        EventKind::AssertionFailed
-                    };
-                    tracer
-                        .emit(TraceEvent::new(
-                            kind,
-                            Direction::Internal,
-                            json!({
-                                "step_index": idx,
-                                "assertion":  result.name,
-                                "message":    result.message,
-                            }),
-                        ))
-                        .await?;
-                }
-            }
-
-            match (step_result, assertions_ok) {
-                (Ok(_), true) => {
+            .await
+            {
+                Ok(()) => {
                     steps_passed += 1;
-                    tracer
-                        .emit(TraceEvent::new(
-                            EventKind::StepCompleted,
-                            Direction::Internal,
-                            json!({ "index": idx, "outcome": "ok" }),
-                        ))
-                        .await?;
                 }
-                (Ok(_), false) => {
+                Err(e) => {
                     steps_failed += 1;
-                    tracer
-                        .emit(TraceEvent::new(
-                            EventKind::StepCompleted,
-                            Direction::Internal,
-                            json!({ "index": idx, "outcome": "assertion_failed" }),
-                        ))
-                        .await?;
-                    cleanup(&mut state, &tracer).await;
-                    emit_completed(
-                        &tracer,
-                        &self.scenario.name,
-                        steps_passed,
-                        steps_failed,
-                        started_at,
-                        "assertion_failed",
-                    )
-                    .await;
-                    anyhow::bail!(
-                        "scenario \"{}\" step {idx} ({}) failed assertions",
-                        self.scenario.name,
-                        step_def.kind.as_str()
-                    );
-                }
-                (Err(e), _) => {
-                    steps_failed += 1;
-                    tracer
-                        .emit(TraceEvent::new(
-                            EventKind::StepCompleted,
-                            Direction::Internal,
-                            json!({ "index": idx, "outcome": "error", "error": e.to_string() }),
-                        ))
-                        .await?;
                     cleanup(&mut state, &tracer).await;
                     emit_completed(
                         &tracer,
@@ -219,192 +131,482 @@ struct RunnerState {
     #[allow(dead_code)]
     negotiated_version: Option<u64>,
     last_chain_sync_points: Vec<Point>,
+    /// Flat variable namespace populated by steps with `output` fields.
+    vars: VarStore,
+}
+
+// ── Step execution with bookkeeping ───────────────────────────────────────────
+
+/// Runs one step with full trace bookkeeping: StepStarted/Completed events,
+/// variable substitution, assertion evaluation, and VariableReferenced events.
+///
+/// Returns `Ok(())` on success (step + assertions passed) or `Err` on failure.
+/// Does NOT handle scenario-level cleanup on failure — that's the caller's job.
+///
+/// Returns `Pin<Box<...>>` to allow recursive invocation from `repeat` steps.
+fn run_step<'a>(
+    step: &'a StepDef,
+    step_idx: usize,
+    target_address: &'a str,
+    network_magic: u64,
+    state: &'a mut RunnerState,
+    tracer: &'a Tracer,
+) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>> {
+    Box::pin(async move {
+        // Clear buffer so assertions only see this step's events.
+        tracer.drain_buffer().await;
+
+        tracer
+            .emit(TraceEvent::new(
+                EventKind::StepStarted,
+                Direction::Internal,
+                json!({ "index": step_idx, "kind": step.kind.as_str() }),
+            ))
+            .await?;
+        tracer.drain_buffer().await; // StepStarted is not part of this step's assertions
+
+        // Variable substitution: resolve all $refs in params before execution.
+        let mut resolved = step.raw_params.clone();
+        // For repeat steps, exclude the `body` array from substitution.
+        // Body steps are substituted per-iteration when they actually execute
+        // (inside the repeat handler, which calls run_step for each body step).
+        // Substituting the body here would try to resolve variables that haven't
+        // been set yet — e.g. a query_tip inside the body sets a variable that a
+        // later body step in the same iteration needs.
+        if step.kind == StepKind::Repeat {
+            if let serde_json::Value::Object(ref mut map) = resolved {
+                map.remove("body");
+            }
+        }
+        let refs_made = substitute_in_value(&mut resolved, &state.vars)
+            .with_context(|| format!("step[{step_idx}] ({}): variable substitution failed", step.kind.as_str()))?;
+
+        for (ref_expr, type_name) in &refs_made {
+            let _ = tracer
+                .emit(TraceEvent::new(
+                    EventKind::VariableReferenced,
+                    Direction::Internal,
+                    json!({ "step_index": step_idx, "reference": ref_expr, "resolved_type": type_name }),
+                ))
+                .await;
+        }
+
+        let step_result = execute_step(step, &resolved, target_address, network_magic, state, tracer).await;
+
+        let step_events = tracer.drain_buffer().await;
+
+        // Evaluate expect clauses.
+        let mut assertions_ok = true;
+        if let Some(expect) = &step.expect {
+            for result in evaluate_assertions(expect, &step_events) {
+                if !result.passed {
+                    assertions_ok = false;
+                }
+                let kind = if result.passed {
+                    EventKind::AssertionPassed
+                } else {
+                    EventKind::AssertionFailed
+                };
+                let _ = tracer
+                    .emit(TraceEvent::new(
+                        kind,
+                        Direction::Internal,
+                        json!({
+                            "step_index": step_idx,
+                            "assertion":  result.name,
+                            "message":    result.message,
+                        }),
+                    ))
+                    .await;
+            }
+        }
+
+        match (step_result, assertions_ok) {
+            (Ok(()), true) => {
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::StepCompleted,
+                        Direction::Internal,
+                        json!({ "index": step_idx, "outcome": "ok" }),
+                    ))
+                    .await?;
+                Ok(())
+            }
+            (Ok(()), false) => {
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::StepCompleted,
+                        Direction::Internal,
+                        json!({ "index": step_idx, "outcome": "assertion_failed" }),
+                    ))
+                    .await?;
+                anyhow::bail!(
+                    "step {step_idx} ({}) failed assertions",
+                    step.kind.as_str()
+                )
+            }
+            (Err(e), _) => {
+                let _ = tracer
+                    .emit(TraceEvent::new(
+                        EventKind::StepCompleted,
+                        Direction::Internal,
+                        json!({ "index": step_idx, "outcome": "error", "error": e.to_string() }),
+                    ))
+                    .await;
+                Err(e)
+            }
+        }
+    })
 }
 
 // ── Step dispatch ─────────────────────────────────────────────────────────────
 
-async fn execute_step(
-    step: &StepDef,
-    target_address: &str,
+/// Executes a single step against resolved params. Does not handle
+/// StepStarted/Completed or assertion evaluation — that's run_step's job.
+///
+/// Returns `Pin<Box<...>>` to allow recursive invocation from `repeat` steps.
+fn execute_step<'a>(
+    step: &'a StepDef,
+    resolved: &'a Value,
+    target_address: &'a str,
     network_magic: u64,
-    state: &mut RunnerState,
-    tracer: &Tracer,
-) -> anyhow::Result<()> {
-    match step.kind {
-        StepKind::Connect => {
-            // Phase 1 of the two-phase connection lifecycle: structural setup.
-            // Subscribe every protocol channel and spawn the multiplexer.
-            // No mini-protocol traffic is sent here — the Cardano N2N spec
-            // requires Handshake to complete before any other protocol can be
-            // used. Background workers are started in the Handshake arm below.
-            let bearer = Bearer::connect_tcp(target_address)
-                .await
-                .with_context(|| format!("failed to connect to {target_address}"))?;
-            tracer
-                .emit(TraceEvent::new(
-                    EventKind::ConnectionOpened,
-                    Direction::Internal,
-                    json!({ "addr": target_address }),
-                ))
-                .await?;
-            let mut plexer = Plexer::new(bearer);
-            state.hs_channel = Some(plexer.subscribe_client(PROTOCOL_N2N_HANDSHAKE));
-            state.cs_channel = Some(plexer.subscribe_client(CHAIN_SYNC_PROTOCOL));
-            state.bf_channel = Some(plexer.subscribe_client(BLOCK_FETCH_PROTOCOL));
-            state.ts_channel = Some(plexer.subscribe_client(TX_SUBMISSION_PROTOCOL));
-            state.ka_channel = Some(plexer.subscribe_client(KEEP_ALIVE_PROTOCOL));
-            state.plexer_handle = Some(plexer.spawn());
-            Ok(())
-        }
+    state: &'a mut RunnerState,
+    tracer: &'a Tracer,
+) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>> {
+    Box::pin(async move {
+        let params: StepParams = serde_json::from_value(resolved.clone())
+            .with_context(|| format!("step ({}): invalid params after substitution", step.kind.as_str()))?;
 
-        StepKind::Handshake => {
-            // Phase 2 of the two-phase connection lifecycle: version negotiation
-            // and worker activation. Only after handshake_on_channel returns
-            // successfully do we know the negotiated version and that the node
-            // will accept traffic on other channels. Background tasks are spawned
-            // here, never in Connect, so they cannot send messages prematurely.
-            let channel = state
-                .hs_channel
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("handshake step: no channel (missing connect?)"))?;
-            let version = handshake_on_channel(channel, network_magic, tracer).await?;
-            state.negotiated_version = Some(version);
-
-            let mut spawned_protocols: Vec<&str> = Vec::new();
-
-            if let Some(ka_channel) = state.ka_channel.take() {
-                let ka_client = pallas_network::miniprotocols::keepalive::Client::new(ka_channel);
-                state.ka_handle = Some(tokio::spawn(run_keepalive(
-                    ka_client,
-                    tracer.clone(),
-                    KEEP_ALIVE_INTERVAL,
-                )));
-                spawned_protocols.push("keep-alive");
-            }
-            if let Some(ts_channel) = state.ts_channel.take() {
-                state.ts_handle = Some(tokio::spawn(run_tx_submission(ts_channel, tracer.clone())));
-                spawned_protocols.push("tx-submission");
+        match step.kind {
+            StepKind::Connect => {
+                // Phase 1 of the two-phase connection lifecycle: structural setup.
+                // Subscribe every protocol channel and spawn the multiplexer.
+                // No mini-protocol traffic is sent here — the Cardano N2N spec
+                // requires Handshake to complete before any other protocol can be
+                // used. Background workers are started in the Handshake arm below.
+                let bearer = Bearer::connect_tcp(target_address)
+                    .await
+                    .with_context(|| format!("failed to connect to {target_address}"))?;
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::ConnectionOpened,
+                        Direction::Internal,
+                        json!({ "addr": target_address }),
+                    ))
+                    .await?;
+                let mut plexer = Plexer::new(bearer);
+                state.hs_channel = Some(plexer.subscribe_client(PROTOCOL_N2N_HANDSHAKE));
+                state.cs_channel = Some(plexer.subscribe_client(CHAIN_SYNC_PROTOCOL));
+                state.bf_channel = Some(plexer.subscribe_client(BLOCK_FETCH_PROTOCOL));
+                state.ts_channel = Some(plexer.subscribe_client(TX_SUBMISSION_PROTOCOL));
+                state.ka_channel = Some(plexer.subscribe_client(KEEP_ALIVE_PROTOCOL));
+                state.plexer_handle = Some(plexer.spawn());
+                Ok(())
             }
 
-            tracer
-                .emit(TraceEvent::new(
-                    EventKind::ProtocolWorkersStarted,
-                    Direction::Internal,
-                    json!({ "protocols": spawned_protocols }),
-                ))
+            StepKind::Handshake => {
+                // Phase 2 of the two-phase connection lifecycle: version negotiation
+                // and worker activation. Only after handshake_on_channel returns
+                // successfully do we know the negotiated version and that the node
+                // will accept traffic on other channels. Background tasks are spawned
+                // here, never in Connect, so they cannot send messages prematurely.
+                let channel = state
+                    .hs_channel
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("handshake step: no channel (missing connect?)"))?;
+                let version = handshake_on_channel(channel, network_magic, tracer).await?;
+                state.negotiated_version = Some(version);
+
+                let mut spawned_protocols: Vec<&str> = Vec::new();
+
+                if let Some(ka_channel) = state.ka_channel.take() {
+                    let ka_client = pallas_network::miniprotocols::keepalive::Client::new(ka_channel);
+                    state.ka_handle = Some(tokio::spawn(run_keepalive(
+                        ka_client,
+                        tracer.clone(),
+                        KEEP_ALIVE_INTERVAL,
+                    )));
+                    spawned_protocols.push("keep-alive");
+                }
+                if let Some(ts_channel) = state.ts_channel.take() {
+                    state.ts_handle = Some(tokio::spawn(run_tx_submission(ts_channel, tracer.clone())));
+                    spawned_protocols.push("tx-submission");
+                }
+
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::ProtocolWorkersStarted,
+                        Direction::Internal,
+                        json!({ "protocols": spawned_protocols }),
+                    ))
+                    .await?;
+
+                info!(version, protocols = ?spawned_protocols, "Handshake complete, workers started");
+                Ok(())
+            }
+
+            StepKind::QueryTip => {
+                // This opens a separate TCP connection because the main connection's
+                // Chain-Sync channel is currently consumed by chain_sync steps. A
+                // future refactor to support sequential sessions on a single channel
+                // would let query_tip share the main connection. The current design
+                // is acceptable because handshake overhead is small and the second-
+                // connection model also generalizes to future multi-peer scenarios.
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::QueryTipStarted,
+                        Direction::Internal,
+                        json!({}),
+                    ))
+                    .await?;
+
+                let tip = fetch_tip(target_address, network_magic, tracer).await?;
+                let Tip(tip_point, block_number) = &tip;
+                let tip_val = json!({
+                    "point": point_to_str(tip_point),
+                    "block_number": block_number,
+                });
+
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::QueryTipCompleted,
+                        Direction::Internal,
+                        json!({ "tip": tip_val }),
+                    ))
+                    .await?;
+
+                if let Some(output_var) = &step.output {
+                    state.vars.insert(output_var.clone(), tip_val.clone());
+                    tracer
+                        .emit(TraceEvent::new(
+                            EventKind::VariableSet,
+                            Direction::Internal,
+                            json!({ "name": output_var, "shape": "tip{point,block_number}" }),
+                        ))
+                        .await?;
+                    info!(var = output_var.as_str(), "Stored tip");
+                }
+                Ok(())
+            }
+
+            StepKind::ChainSync => {
+                let channel = state
+                    .cs_channel
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("chain_sync step: no channel"))?;
+
+                let origin = vec!["origin".to_string()];
+                let raw_pts = params.intersection_points.as_deref().unwrap_or(origin.as_slice());
+                let intersection_points = raw_pts
+                    .iter()
+                    .map(|s| parse_point(s))
+                    .collect::<anyhow::Result<Vec<Point>>>()?;
+
+                let count = params.count.unwrap_or(10);
+                let await_secs = params.await_timeout_secs.unwrap_or(30);
+
+                let summary = run_chain_sync(
+                    channel,
+                    intersection_points,
+                    count,
+                    Duration::from_secs(await_secs),
+                    tracer,
+                )
                 .await?;
 
-            info!(version, protocols = ?spawned_protocols, "Handshake complete, workers started");
-            Ok(())
-        }
+                let n = summary.collected_points.len();
+                state.last_chain_sync_points = summary.collected_points.clone();
 
-        StepKind::ChainSync => {
-            let channel = state
-                .cs_channel
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("chain_sync step: no channel"))?;
-
-            let origin = vec!["origin".to_string()];
-            let raw_points = step.params.intersection_points.as_ref().unwrap_or(&origin);
-            let intersection_points = raw_points
-                .iter()
-                .map(|s| parse_point(s))
-                .collect::<anyhow::Result<Vec<Point>>>()?;
-
-            let count = step.params.count.unwrap_or(10);
-            let await_secs = step.params.await_timeout_secs.unwrap_or(30);
-
-            let summary = run_chain_sync(
-                channel,
-                intersection_points,
-                count,
-                Duration::from_secs(await_secs),
-                tracer,
-            )
-            .await?;
-
-            let n = summary.collected_points.len();
-            state.last_chain_sync_points = summary.collected_points;
-            info!(headers = summary.headers_received, points = n, "Chain-sync step complete");
-            Ok(())
-        }
-
-        StepKind::BlockFetch => {
-            let channel = state
-                .bf_channel
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("block_fetch step: no channel"))?;
-
-            let points: Vec<Point> =
-                match step.params.points.as_ref().unwrap_or(&BlockFetchPoints::FromChainSync) {
-                    BlockFetchPoints::FromChainSync => {
-                        anyhow::ensure!(
-                            !state.last_chain_sync_points.is_empty(),
-                            "block_fetch: from_chain_sync but no chain_sync points available"
-                        );
-                        std::mem::take(&mut state.last_chain_sync_points)
-                    }
-                    BlockFetchPoints::Explicit(strings) => strings
+                if let Some(output_var) = &step.output {
+                    let pts_json: Vec<Value> = summary
+                        .collected_points
                         .iter()
-                        .map(|s| parse_point(s))
-                        .collect::<anyhow::Result<Vec<Point>>>()?,
-                };
+                        .map(|p| Value::String(point_to_str(p)))
+                        .collect();
+                    state.vars.insert(output_var.clone(), Value::Array(pts_json));
+                    tracer
+                        .emit(TraceEvent::new(
+                            EventKind::VariableSet,
+                            Direction::Internal,
+                            json!({ "name": output_var, "shape": format!("array[{n}]") }),
+                        ))
+                        .await?;
+                    info!(var = output_var.as_str(), points = n, "Stored chain-sync points");
+                }
 
-            let batch_size = step.params.batch_size.unwrap_or(1);
-            let summary = run_block_fetch(channel, points, batch_size, tracer).await?;
-            info!(
-                blocks = summary.blocks_received,
-                bytes = summary.total_bytes,
-                "Block-fetch step complete"
-            );
-            Ok(())
-        }
+                info!(headers = summary.headers_received, points = n, "Chain-sync step complete");
+                Ok(())
+            }
 
-        StepKind::Disconnect => {
-            // Abort background loops before the plexer — they use the channels.
-            // ka_channel / ts_channel are Some only if handshake never ran;
-            // dropping them here is harmless (the plexer hasn't seen traffic on them).
-            state.ka_channel.take();
-            state.ts_channel.take();
-            if let Some(handle) = state.ka_handle.take() {
-                handle.abort();
-            }
-            if let Some(handle) = state.ts_handle.take() {
-                handle.abort();
-            }
-            if let Some(handle) = state.plexer_handle.take() {
-                handle.abort().await;
-            }
-            tracer
-                .emit(TraceEvent::new(
-                    EventKind::ConnectionClosed,
-                    Direction::Internal,
-                    json!({}),
-                ))
-                .await?;
-            Ok(())
-        }
+            StepKind::BlockFetch => {
+                let channel = state
+                    .bf_channel
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("block_fetch step: no channel"))?;
 
-        StepKind::Sleep => {
-            let secs = step.params.duration_secs.unwrap_or(0);
-            info!(secs, "Sleeping");
-            tokio::time::sleep(Duration::from_secs(secs)).await;
-            Ok(())
+                let points: Vec<Point> =
+                    match params.points.as_ref().unwrap_or(&BlockFetchPoints::FromChainSync) {
+                        BlockFetchPoints::FromChainSync => {
+                            anyhow::ensure!(
+                                !state.last_chain_sync_points.is_empty(),
+                                "block_fetch: from_chain_sync but no chain_sync points available"
+                            );
+                            std::mem::take(&mut state.last_chain_sync_points)
+                        }
+                        BlockFetchPoints::Explicit(strings) => strings
+                            .iter()
+                            .map(|s| parse_point(s))
+                            .collect::<anyhow::Result<Vec<Point>>>()?,
+                    };
+
+                let batch_size = params.batch_size.unwrap_or(1);
+                let summary = run_block_fetch(channel, points, batch_size, tracer).await?;
+                info!(
+                    blocks = summary.blocks_received,
+                    bytes = summary.total_bytes,
+                    "Block-fetch step complete"
+                );
+                Ok(())
+            }
+
+            StepKind::Repeat => {
+                let times_val = resolved
+                    .get("times")
+                    .ok_or_else(|| anyhow::anyhow!("repeat step requires times"))?;
+                let times: u64 = times_val
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("repeat times must be a non-negative integer, got {times_val}"))?;
+
+                // Body steps are parsed from the ORIGINAL raw_params so that
+                // each iteration substitutes variables fresh from the current state.
+                // Variable resolution happens inside run_step, per-step — a variable
+                // set by body step N (e.g. query_tip output: "tip") is immediately
+                // visible to body step N+1 (e.g. chain_sync intersection_points: ["$tip.point"])
+                // because all body steps share the same &mut RunnerState.vars.
+                let body_val = step
+                    .raw_params
+                    .get("body")
+                    .ok_or_else(|| anyhow::anyhow!("repeat step requires body"))?;
+                let body: Vec<StepDef> = serde_json::from_value(body_val.clone())
+                    .context("invalid repeat body")?;
+
+                for iteration in 0..times {
+                    tracer
+                        .emit(TraceEvent::new(
+                            EventKind::RepeatIterationStarted,
+                            Direction::Internal,
+                            json!({ "iteration": iteration, "total": times }),
+                        ))
+                        .await?;
+
+                    for (body_idx, body_step) in body.iter().enumerate() {
+                        if let Err(e) = run_step(
+                            body_step,
+                            body_idx,
+                            target_address,
+                            network_magic,
+                            state,
+                            tracer,
+                        )
+                        .await
+                        {
+                            tracer
+                                .emit(TraceEvent::new(
+                                    EventKind::RepeatIterationCompleted,
+                                    Direction::Internal,
+                                    json!({
+                                        "iteration": iteration,
+                                        "outcome": "error",
+                                        "error": e.to_string(),
+                                    }),
+                                ))
+                                .await?;
+                            return Err(e);
+                        }
+                    }
+
+                    tracer
+                        .emit(TraceEvent::new(
+                            EventKind::RepeatIterationCompleted,
+                            Direction::Internal,
+                            json!({ "iteration": iteration, "outcome": "ok" }),
+                        ))
+                        .await?;
+                }
+                Ok(())
+            }
+
+            StepKind::Disconnect => {
+                // Abort background loops before the plexer — they use the channels.
+                state.ka_channel.take();
+                state.ts_channel.take();
+                if let Some(handle) = state.ka_handle.take() { handle.abort(); }
+                if let Some(handle) = state.ts_handle.take() { handle.abort(); }
+                if let Some(handle) = state.plexer_handle.take() {
+                    handle.abort().await;
+                }
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::ConnectionClosed,
+                        Direction::Internal,
+                        json!({}),
+                    ))
+                    .await?;
+                Ok(())
+            }
+
+            StepKind::Sleep => {
+                let secs = params.duration_secs.unwrap_or(0);
+                info!(secs, "Sleeping");
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                Ok(())
+            }
         }
-    }
+    })
 }
+
+// ── query_tip implementation ──────────────────────────────────────────────────
+
+/// Opens a temporary TCP connection to `target_address`, performs a handshake,
+/// then does a minimal Chain-Sync round-trip to obtain the current chain tip.
+/// All wire events are logged to the shared tracer.
+async fn fetch_tip(target_address: &str, network_magic: u64, tracer: &Tracer) -> anyhow::Result<Tip> {
+    let bearer = Bearer::connect_tcp(target_address)
+        .await
+        .with_context(|| format!("query_tip: failed to connect to {target_address}"))?;
+
+    let mut plexer = Plexer::new(bearer);
+    let hs_channel = plexer.subscribe_client(PROTOCOL_N2N_HANDSHAKE);
+    let cs_channel = plexer.subscribe_client(CHAIN_SYNC_PROTOCOL);
+    let plexer_handle = plexer.spawn();
+
+    handshake_on_channel(hs_channel, network_magic, tracer)
+        .await
+        .context("query_tip: handshake failed")?;
+
+    let mut cs = N2NClient::new(cs_channel);
+
+    // FindIntersect at origin — the response includes the current tip directly.
+    let (_, tip) = cs
+        .find_intersect(vec![Point::Origin])
+        .await
+        .context("query_tip: find_intersect failed")?;
+
+    cs.send_done().await.ok(); // best-effort clean close
+    plexer_handle.abort().await;
+
+    Ok(tip)
+}
+
+// ── Shared utilities ──────────────────────────────────────────────────────────
 
 /// Abort the keep-alive loop and plexer, emit ConnectionClosed if still
 /// connected. Called on error/assertion-failure paths before returning.
 async fn cleanup(state: &mut RunnerState, tracer: &Tracer) {
     state.ka_channel.take();
     state.ts_channel.take();
-    if let Some(handle) = state.ka_handle.take() {
-        handle.abort();
-    }
-    if let Some(handle) = state.ts_handle.take() {
-        handle.abort();
-    }
+    if let Some(handle) = state.ka_handle.take() { handle.abort(); }
+    if let Some(handle) = state.ts_handle.take() { handle.abort(); }
     if let Some(handle) = state.plexer_handle.take() {
         handle.abort().await;
         let _ = tracer
@@ -610,11 +812,10 @@ mod tests {
         use pallas_network::miniprotocols::{
             PROTOCOL_N2N_KEEP_ALIVE, PROTOCOL_N2N_TX_SUBMISSION,
         };
-        // Same set expected for all currently-deployed N2N versions.
         for &version in &[7u64, 11, 13, 14] {
             let ps = subscribed_protocols(version);
-            assert!(ps.contains(&CHAIN_SYNC_PROTOCOL),    "v{version}: missing chain-sync");
-            assert!(ps.contains(&BLOCK_FETCH_PROTOCOL),   "v{version}: missing block-fetch");
+            assert!(ps.contains(&CHAIN_SYNC_PROTOCOL),        "v{version}: missing chain-sync");
+            assert!(ps.contains(&BLOCK_FETCH_PROTOCOL),       "v{version}: missing block-fetch");
             assert!(ps.contains(&PROTOCOL_N2N_TX_SUBMISSION), "v{version}: missing tx-submission");
             assert!(ps.contains(&PROTOCOL_N2N_KEEP_ALIVE),    "v{version}: missing keep-alive");
         }
@@ -635,42 +836,48 @@ mod tests {
 
     /// After Connect, channels are allocated but workers are not yet running.
     /// After Handshake, workers are running and channels are consumed.
-    /// Requires the devnet; verifies the invariant at runtime against a real connection.
     ///
     /// Run with: cargo test -p cardano-conformance-harness scenario::runner::tests::background_workers_spawned_after_handshake_not_before -- --ignored
     #[tokio::test]
     #[ignore = "requires devnet: docker compose up"]
     async fn background_workers_spawned_after_handshake_not_before() {
-        use crate::scenario::{StepDef, StepKind, StepParams};
+        use crate::scenario::StepDef;
         use tempfile::NamedTempFile;
 
         let tmp = NamedTempFile::new().unwrap();
         let tracer = crate::trace::Tracer::open(tmp.path()).await.unwrap();
         let mut state = RunnerState::default();
 
-        let connect = StepDef { kind: StepKind::Connect, params: StepParams::default(), expect: None };
-        execute_step(&connect, "localhost:3001", crate::DEVNET_MAGIC, &mut state, &tracer)
+        let connect = StepDef {
+            kind: StepKind::Connect,
+            raw_params: json!({}),
+            output: None,
+            expect: None,
+        };
+        execute_step(&connect, &json!({}), "localhost:3001", crate::DEVNET_MAGIC, &mut state, &tracer)
             .await
             .expect("connect should succeed");
 
-        // After Connect: channels exist but no workers yet.
         assert!(state.ka_handle.is_none(),  "ka_handle must be None after Connect");
         assert!(state.ts_handle.is_none(),  "ts_handle must be None after Connect");
         assert!(state.ka_channel.is_some(), "ka_channel must be Some after Connect");
         assert!(state.ts_channel.is_some(), "ts_channel must be Some after Connect");
 
-        let handshake = StepDef { kind: StepKind::Handshake, params: StepParams::default(), expect: None };
-        execute_step(&handshake, "localhost:3001", crate::DEVNET_MAGIC, &mut state, &tracer)
+        let handshake = StepDef {
+            kind: StepKind::Handshake,
+            raw_params: json!({}),
+            output: None,
+            expect: None,
+        };
+        execute_step(&handshake, &json!({}), "localhost:3001", crate::DEVNET_MAGIC, &mut state, &tracer)
             .await
             .expect("handshake should succeed");
 
-        // After Handshake: channels consumed, workers running.
         assert!(state.ka_handle.is_some(),  "ka_handle must be Some after Handshake");
         assert!(state.ts_handle.is_some(),  "ts_handle must be Some after Handshake");
         assert!(state.ka_channel.is_none(), "ka_channel must be None after Handshake (consumed)");
         assert!(state.ts_channel.is_none(), "ts_channel must be None after Handshake (consumed)");
 
-        // Cleanup.
         if let Some(h) = state.ka_handle.take() { h.abort(); }
         if let Some(h) = state.ts_handle.take() { h.abort(); }
         if let Some(h) = state.plexer_handle.take() { h.abort().await; }
