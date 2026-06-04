@@ -157,6 +157,9 @@ struct RunnerState {
     peer_server: Option<PeerServer>,
     /// Path to write fixture entries to (from `--capture-fixture` CLI flag).
     capture_fixture: Option<std::path::PathBuf>,
+    /// True once the anchor line has been written to the fixture file this run.
+    /// Avoids re-writing the anchor if multiple chain_sync steps capture to the same file.
+    fixture_anchor_written: bool,
 }
 
 // ── Step execution with bookkeeping ───────────────────────────────────────────
@@ -460,24 +463,29 @@ fn execute_step<'a>(
 
                 // Write fixture if --capture-fixture was set.
                 if let Some(ref fixture_path) = state.capture_fixture {
-                    if summary.captured_headers.is_empty() {
-                        // First time: write the anchor line.
-                        fixture::write_anchor(fixture_path, &Point::Origin)?;
+                    if !summary.captured_headers.is_empty() {
+                        // Write the anchor exactly once per run, truncating any
+                        // existing file. Checked by flag rather than file existence
+                        // so a pre-existing stale file doesn't suppress the anchor.
+                        if !state.fixture_anchor_written {
+                            fixture::write_anchor(fixture_path, &Point::Origin)?;
+                            state.fixture_anchor_written = true;
+                        }
+                        for h in &summary.captured_headers {
+                            let entry = fixture::FixtureEntry {
+                                slot: h.slot,
+                                block_hash: fixture::encode_hex(&h.block_hash),
+                                block_number: h.block_number,
+                                cbor_hex: fixture::encode_hex(&h.cbor),
+                            };
+                            fixture::append_entry(fixture_path, &entry)?;
+                        }
+                        info!(
+                            headers = summary.captured_headers.len(),
+                            path = %fixture_path.display(),
+                            "Wrote fixture entries"
+                        );
                     }
-                    for h in &summary.captured_headers {
-                        let entry = fixture::FixtureEntry {
-                            slot: h.slot,
-                            block_hash: fixture::encode_hex(&h.block_hash),
-                            block_number: h.block_number,
-                            cbor_hex: fixture::encode_hex(&h.cbor),
-                        };
-                        fixture::append_entry(fixture_path, &entry)?;
-                    }
-                    info!(
-                        headers = summary.captured_headers.len(),
-                        path = %fixture_path.display(),
-                        "Wrote fixture entries"
-                    );
                 }
 
                 info!(headers = summary.headers_received, points = n, "Chain-sync step complete");

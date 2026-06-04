@@ -328,6 +328,25 @@ mod tests {
         assert_eq!(chain.entries.len(), 0);
     }
 
+    #[test]
+    fn write_anchor_truncates_on_second_capture_keeping_exactly_one_anchor() {
+        // Invariant: write_anchor always truncates, so a second capture run on the
+        // same path produces a well-formed file (one anchor, M entries) not a
+        // concatenation of two runs (two anchors, N+M entries).
+        let tmp = NamedTempFile::new().unwrap();
+        let entry = FixtureEntry { slot: 1, block_hash: "aa".repeat(32), block_number: 1, cbor_hex: "deadbeef".into() };
+
+        write_anchor(tmp.path(), &Point::Origin).unwrap();
+        append_entry(tmp.path(), &entry).unwrap(); // first run: 1 anchor + 1 entry
+
+        write_anchor(tmp.path(), &Point::Origin).unwrap();
+        append_entry(tmp.path(), &entry).unwrap();
+        append_entry(tmp.path(), &entry).unwrap(); // second run: truncated, 1 anchor + 2 entries
+
+        let chain = load(tmp.path()).unwrap();
+        assert_eq!(chain.entries.len(), 2, "second capture should have replaced the first, not appended to it");
+    }
+
     // ── Cursor: find_intersect ────────────────────────────────────────────────
 
     #[test]
