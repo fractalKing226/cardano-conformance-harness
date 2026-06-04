@@ -26,7 +26,7 @@ pub struct Scenario {
 
 /// A single scenario step, storing raw JSON params for uniform variable
 /// substitution at execution time.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StepDef {
     pub kind: StepKind,
     /// Raw JSON params map — used for variable substitution before execution.
@@ -108,6 +108,9 @@ pub enum StepKind {
     ServeBlockFetch,
     /// Stop the listener and close any active server connections.
     CloseListener,
+    /// Run multiple step branches concurrently. Completes when all branches
+    /// complete, or aborts remaining branches if one fails.
+    Parallel,
 }
 
 impl StepKind {
@@ -126,6 +129,7 @@ impl StepKind {
             StepKind::ServeChainSync  => "serve_chain_sync",
             StepKind::ServeBlockFetch => "serve_block_fetch",
             StepKind::CloseListener   => "close_listener",
+            StepKind::Parallel        => "parallel",
         }
     }
 
@@ -211,7 +215,7 @@ pub struct StepParams {
 }
 
 /// How Block-Fetch obtains its point list.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BlockFetchPoints {
     /// Use the points collected by the most recent Chain-Sync step.
     /// Deprecated: prefer `output` on the chain_sync step and `"$varname"`.
@@ -237,7 +241,7 @@ impl<'de> Deserialize<'de> for BlockFetchPoints {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Assertions {
     pub min_events: Option<usize>,
     pub must_contain_kind: Option<Vec<String>>,
@@ -365,10 +369,9 @@ fn validate_connection_names(steps: &[StepDef], errors: &mut Vec<String>) {
                 open_listeners.remove(&on_name);
                 // Server connections from this listener remain valid until closed.
             }
-            StepKind::Repeat => {
-                // Validate body steps with inherited open sets — for simplicity,
-                // body steps inherit the parent's open state. Nested validation
-                // of connection names in repeat bodies is deferred.
+            StepKind::Repeat | StepKind::Parallel => {
+                // Body/branch validation is deferred; connection-name tracking
+                // across nested step lists is not enforced here.
             }
             StepKind::Sleep => {}
         }
@@ -464,6 +467,23 @@ fn validate_step(
         }
 
         StepKind::Listen | StepKind::AcceptHandshake | StepKind::CloseListener => {}
+
+        StepKind::Parallel => {
+            match step.raw_params.get("branches") {
+                None => errors.push(format!("{pos}: parallel step requires branches")),
+                Some(Value::Array(arr)) if arr.is_empty() =>
+                    errors.push(format!("{pos}: parallel step requires at least one branch")),
+                Some(Value::Array(arr)) => {
+                    for (b, branch_val) in arr.iter().enumerate() {
+                        match serde_json::from_value::<Vec<StepDef>>(branch_val.clone()) {
+                            Ok(body) => validate_steps(&body, errors, has_chain_sync),
+                            Err(e)   => errors.push(format!("{pos}: branches[{b}]: {e}")),
+                        }
+                    }
+                }
+                Some(_) => errors.push(format!("{pos}: parallel branches must be an array")),
+            }
+        }
 
         StepKind::ServeBlockFetch => {
             let has_fixture   = step.raw_params.get("block_fetch_fixture_path").is_some();

@@ -1,0 +1,22 @@
+{
+  "name": "parallel_with_error",
+  "description": "One branch connects successfully; the other attempts to connect to a port that has no listener. Validates that a failure in any branch causes the parallel step (and hence the scenario) to fail.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_parallel_with_error.jsonl",
+  "expected_outcome": "failure",
+  "steps": [
+    {
+      "kind": "parallel",
+      "branches": [
+        [
+          { "kind": "connect", "as": "good_client" },
+          { "kind": "handshake", "on": "good_client" }
+        ],
+        [
+          { "kind": "connect", "as": "bad_client", "target_address": "localhost:19999" }
+        ]
+      ]
+    }
+  ]
+}

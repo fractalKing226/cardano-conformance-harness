@@ -1,0 +1,25 @@
+{
+  "name": "parallel_two_clients",
+  "description": "Opens two outgoing connections in parallel, runs Handshake and Chain-Sync on each concurrently. Validates that the harness can maintain multiple independent client sessions simultaneously.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_parallel_two_clients.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    {
+      "kind": "parallel",
+      "branches": [
+        [
+          { "kind": "connect", "as": "client_a" },
+          { "kind": "handshake", "on": "client_a" },
+          { "kind": "chain_sync", "on": "client_a", "count": 5 }
+        ],
+        [
+          { "kind": "connect", "as": "client_b" },
+          { "kind": "handshake", "on": "client_b" },
+          { "kind": "chain_sync", "on": "client_b", "count": 5 }
+        ]
+      ]
+    }
+  ]
+}

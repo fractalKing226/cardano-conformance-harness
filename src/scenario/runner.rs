@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use futures::future::try_join_all;
 use pallas_network::miniprotocols::chainsync::{N2NClient, Tip};
-use pallas_network::miniprotocols::handshake::n2n::VersionTable;
 use pallas_network::miniprotocols::handshake::{RefuseReason, Server as HandshakeServer};
 use pallas_network::miniprotocols::{Point, PROTOCOL_N2N_HANDSHAKE, PROTOCOL_N2N_KEEP_ALIVE as PROTOCOL_N2N_KEEP_ALIVE_SERVER};
 use pallas_network::multiplexer::{AgentChannel, Bearer, Plexer, RunningPlexer};
@@ -87,8 +90,8 @@ impl ScenarioRunner {
             .await?;
 
         let mut state = RunnerState {
-            capture_fixture:           self.capture_fixture.clone(),
-            capture_block_fixture:     self.capture_block_fixture.clone(),
+            capture_fixture_path:         self.capture_fixture.clone(),
+            capture_block_fixture_path:   self.capture_block_fixture.clone(),
             ..Default::default()
         };
         let mut steps_passed: u64 = 0;
@@ -140,30 +143,86 @@ impl ScenarioRunner {
 
 // ── Connection structs ────────────────────────────────────────────────────────
 
+// ── RAII guard for checked-out connections ────────────────────────────────────
+
+/// Removes a value from a shared HashMap for exclusive use by one step,
+/// then reinserts it automatically on drop — whether from normal return,
+/// `?` error propagation, or tokio task abort.
+///
+/// Use `consume()` for steps that intentionally remove the entry (disconnect,
+/// close_listener) so that `Drop` does NOT reinsert.
+///
+/// **Undefined behaviour note.** If another branch calls `consume()` to remove
+/// the same name from the HashMap while this guard is still alive, `Drop` will
+/// reinsert a connection the scenario considers closed. This mirrors the
+/// undefined behaviour of two branches concurrently using the same connection —
+/// scenarios must use disjoint connection names across parallel branches.
+struct CheckedOut<V> {
+    name:  String,
+    value: Option<V>,
+    map:   Arc<Mutex<HashMap<String, V>>>,
+}
+
+impl<V> CheckedOut<V> {
+    fn take(map: &Arc<Mutex<HashMap<String, V>>>, name: &str) -> anyhow::Result<Self> {
+        let value = map.lock().unwrap()   // lock for <1 μs (HashMap::remove)
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!(
+                "connection \"{name}\" not found (missing connect/accept_handshake, or already in use by another branch)"
+            ))?;
+        Ok(Self { name: name.to_string(), value: Some(value), map: Arc::clone(map) })
+    }
+
+    fn get_mut(&mut self) -> &mut V {
+        self.value.as_mut().unwrap()
+    }
+
+    /// Take ownership without reinsertion — use for disconnect/close_listener.
+    #[allow(dead_code)]
+    fn consume(mut self) -> V {
+        self.value.take().unwrap()
+        // Drop sees None → no reinsertion.
+    }
+}
+
+impl<V> Drop for CheckedOut<V> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            if let Ok(mut guard) = self.map.lock() {
+                guard.insert(self.name.clone(), value);
+            }
+            // Poisoned mutex means the runtime is already panicking;
+            // losing the connection entry here is acceptable.
+        }
+    }
+}
+
+// ── Connection structs ────────────────────────────────────────────────────────
+
 /// State for one outgoing (client-mode) connection, indexed by name.
 struct ClientConnection {
     plexer: RunningPlexer,
-    // Protocol channels — subscribed at connect, consumed by protocol steps.
     hs_channel: Option<AgentChannel>,
     cs_channel: Option<AgentChannel>,
     bf_channel: Option<AgentChannel>,
     /// Stored at connect; consumed at handshake to spawn background loops.
     ka_channel: Option<AgentChannel>,
     ts_channel: Option<AgentChannel>,
-    // Background workers, spawned after handshake completes.
     ka_handle: Option<JoinHandle<()>>,
     ts_handle: Option<JoinHandle<()>>,
     #[allow(dead_code)]
     negotiated_version: Option<u64>,
-    /// Points collected by the most-recent chain_sync on this connection.
+    /// Points from the most-recent chain_sync on this connection.
     /// Legacy backing for `points: "from_chain_sync"`. Prefer explicit
-    /// `output` + `"$varname"` in new multi-connection scenarios.
+    /// `output` + `"$varname"` in multi-connection scenarios.
     last_chain_sync_points: Vec<Point>,
 }
 
 /// State for one bound TCP listener, indexed by name.
+/// The `TcpListener` is behind an `Arc` so multiple `accept_handshake` steps
+/// (from parallel branches) can all call `accept_tcp` on the same listener.
 struct ServerListener {
-    listener: TcpListener,
+    listener: Arc<tokio::net::TcpListener>,
 }
 
 /// State for one accepted (server-mode) connection, indexed by name.
@@ -171,29 +230,50 @@ struct ServerConnection {
     plexer: RunningPlexer,
     cs_channel: Option<AgentChannel>,
     bf_channel: Option<AgentChannel>,
-    /// Idle but must stay alive — see comment in accept_handshake handler.
+    /// Idle but must stay alive — dropping it causes the demuxer to exit.
+    #[allow(dead_code)]
     ts_channel: Option<AgentChannel>,
     ka_handle: Option<JoinHandle<()>>,
 }
 
 // ── Runner state ──────────────────────────────────────────────────────────────
 
-#[derive(Default)]
+/// All heavy fields are behind `Arc` so that cloning `RunnerState` is O(1)
+/// (six reference-count bumps). Parallel branches receive a clone and share
+/// the underlying data through the `Arc`s.
+#[derive(Clone)]
 struct RunnerState {
-    /// Outgoing connections, keyed by `as` name (default: `"default"`).
-    connections: std::collections::HashMap<String, ClientConnection>,
-    /// Bound TCP listeners, keyed by `as` name.
-    listeners: std::collections::HashMap<String, ServerListener>,
-    /// Accepted server connections, keyed by `as` name.
-    server_connections: std::collections::HashMap<String, ServerConnection>,
-    /// Flat variable namespace shared across all connections.
-    vars: VarStore,
-    /// Path to write fixture entries to (from `--capture-fixture` CLI flag).
-    capture_fixture: Option<std::path::PathBuf>,
-    fixture_anchor_written: bool,
-    /// Path for --capture-block-fixture output.
-    capture_block_fixture: Option<std::path::PathBuf>,
-    block_fixture_anchor_written: bool,
+    /// Outgoing connections. Lock held only for HashMap lookup (<1 μs);
+    /// connection is taken out for the duration of a step via `CheckedOut`.
+    connections: Arc<Mutex<HashMap<String, ClientConnection>>>,
+    /// Bound listeners. `TcpListener` is `Arc`-wrapped inside so multiple
+    /// parallel branches can call `accept_tcp` on the same listener.
+    listeners: Arc<Mutex<HashMap<String, ServerListener>>>,
+    /// Accepted server connections. Same take/reinsert pattern as `connections`.
+    server_connections: Arc<Mutex<HashMap<String, ServerConnection>>>,
+    /// Flat variable namespace. Lock held only for read/write of individual keys.
+    vars: Arc<Mutex<VarStore>>,
+    /// Written exactly once per run via compare-exchange.
+    fixture_anchor_written:       Arc<AtomicBool>,
+    block_fixture_anchor_written: Arc<AtomicBool>,
+    // These are set-once at construction and cloned cheaply into spawned tasks.
+    capture_fixture_path:         Option<std::path::PathBuf>,
+    capture_block_fixture_path:   Option<std::path::PathBuf>,
+}
+
+impl Default for RunnerState {
+    fn default() -> Self {
+        Self {
+            connections:             Arc::new(Mutex::new(HashMap::new())),
+            listeners:               Arc::new(Mutex::new(HashMap::new())),
+            server_connections:      Arc::new(Mutex::new(HashMap::new())),
+            vars:                    Arc::new(Mutex::new(VarStore::new())),
+            fixture_anchor_written:       Arc::new(AtomicBool::new(false)),
+            block_fixture_anchor_written: Arc::new(AtomicBool::new(false)),
+            capture_fixture_path:         None,
+            capture_block_fixture_path:   None,
+        }
+    }
 }
 
 // ── Step execution with bookkeeping ───────────────────────────────────────────
@@ -234,12 +314,15 @@ fn run_step<'a>(
         // Substituting the body here would try to resolve variables that haven't
         // been set yet — e.g. a query_tip inside the body sets a variable that a
         // later body step in the same iteration needs.
-        if step.kind == StepKind::Repeat {
+        if matches!(step.kind, StepKind::Repeat | StepKind::Parallel) {
             if let serde_json::Value::Object(ref mut map) = resolved {
                 map.remove("body");
+                map.remove("branches");
             }
         }
-        let refs_made = substitute_in_value(&mut resolved, &state.vars)
+        // Snapshot vars before substitution — brief lock, released before any I/O.
+        let vars_snapshot = state.vars.lock().unwrap().clone();
+        let refs_made = substitute_in_value(&mut resolved, &vars_snapshot)
             .with_context(|| format!("step[{step_idx}] ({}): variable substitution failed", step.kind.as_str()))?;
 
         for (ref_expr, type_name) in &refs_made {
@@ -363,7 +446,7 @@ fn execute_step<'a>(
                 let ts_ch = plexer.subscribe_client(TX_SUBMISSION_PROTOCOL);
                 let ka_ch = plexer.subscribe_client(KEEP_ALIVE_PROTOCOL);
                 let plexer = plexer.spawn();
-                state.connections.insert(conn_name, ClientConnection {
+                state.connections.lock().unwrap().insert(conn_name, ClientConnection {
                     plexer,
                     hs_channel: Some(hs_ch),
                     cs_channel: Some(cs_ch),
@@ -385,8 +468,8 @@ fn execute_step<'a>(
                 // successfully do we know the negotiated version and that the node
                 // will accept traffic on other channels. Background tasks are spawned
                 // here, never in Connect, so they cannot send messages prematurely.
-                let conn = state.connections.get_mut(conn_name)
-                    .ok_or_else(|| anyhow::anyhow!("handshake: connection \"{conn_name}\" not found"))?;
+                let mut co = CheckedOut::take(&state.connections, conn_name)?;
+                let conn = co.get_mut();
                 let channel = conn.hs_channel.take()
                     .ok_or_else(|| anyhow::anyhow!("handshake: no channel (already used?)"))?;
                 let version = handshake_on_channel(channel, network_magic, tracer).await?;
@@ -429,7 +512,7 @@ fn execute_step<'a>(
                         .with_connection(conn_name))
                     .await?;
                 if let Some(output_var) = &step.output {
-                    state.vars.insert(output_var.clone(), tip_val.clone());
+                    state.vars.lock().unwrap().insert(output_var.clone(), tip_val.clone());
                     tracer.emit(TraceEvent::new(EventKind::VariableSet, Direction::Internal,
                         json!({ "name": output_var, "shape": "tip{point,block_number}" }))).await?;
                     info!(var = output_var.as_str(), "Stored tip");
@@ -439,8 +522,8 @@ fn execute_step<'a>(
 
             StepKind::ChainSync => {
                 let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
-                let conn = state.connections.get_mut(&conn_name)
-                    .ok_or_else(|| anyhow::anyhow!("chain_sync: connection \"{conn_name}\" not found"))?;
+                let mut co = CheckedOut::take(&state.connections, &conn_name)?;
+                let conn = co.get_mut();
                 let channel = conn.cs_channel.take()
                     .ok_or_else(|| anyhow::anyhow!("chain_sync: no channel (already used?)"))?;
 
@@ -460,17 +543,17 @@ fn execute_step<'a>(
                 if let Some(output_var) = &step.output {
                     let pts_json: Vec<Value> = summary.collected_points.iter()
                         .map(|p| Value::String(point_to_str(p))).collect();
-                    state.vars.insert(output_var.clone(), Value::Array(pts_json));
+                    state.vars.lock().unwrap().insert(output_var.clone(), Value::Array(pts_json));
                     tracer.emit(TraceEvent::new(EventKind::VariableSet, Direction::Internal,
                         json!({ "name": output_var, "shape": format!("array[{n}]") }))).await?;
                     info!(var = output_var.as_str(), points = n, "Stored chain-sync points");
                 }
 
-                if let Some(ref fixture_path) = state.capture_fixture {
+                if let Some(ref fixture_path) = state.capture_fixture_path {
                     if !summary.captured_headers.is_empty() {
-                        if !state.fixture_anchor_written {
+                        if !state.fixture_anchor_written.load(Ordering::SeqCst) {
                             fixture::write_anchor(fixture_path, &Point::Origin)?;
-                            state.fixture_anchor_written = true;
+                            state.fixture_anchor_written.store(true, Ordering::SeqCst);
                         }
                         for h in &summary.captured_headers {
                             let entry = fixture::FixtureEntry {
@@ -489,8 +572,8 @@ fn execute_step<'a>(
 
             StepKind::BlockFetch => {
                 let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
-                let conn = state.connections.get_mut(&conn_name)
-                    .ok_or_else(|| anyhow::anyhow!("block_fetch: connection \"{conn_name}\" not found"))?;
+                let mut co = CheckedOut::take(&state.connections, &conn_name)?;
+                let conn = co.get_mut();
                 let channel = conn.bf_channel.take()
                     .ok_or_else(|| anyhow::anyhow!("block_fetch: no channel (already used?)"))?;
 
@@ -508,11 +591,11 @@ fn execute_step<'a>(
                 let batch_size = params.batch_size.unwrap_or(1);
                 let summary = run_block_fetch(channel, points.clone(), batch_size, tracer).await?;
 
-                if let Some(ref bfp) = state.capture_block_fixture {
+                if let Some(ref bfp) = state.capture_block_fixture_path {
                     if !summary.captured_blocks.is_empty() {
-                        if !state.block_fixture_anchor_written {
+                        if !state.block_fixture_anchor_written.load(Ordering::SeqCst) {
                             block_fixture::write_anchor(bfp)?;
-                            state.block_fixture_anchor_written = true;
+                            state.block_fixture_anchor_written.store(true, Ordering::SeqCst);
                         }
                         for cb in &summary.captured_blocks {
                             let entry = block_fixture::BlockFixtureEntry {
@@ -596,7 +679,7 @@ fn execute_step<'a>(
 
             StepKind::Disconnect => {
                 let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
-                let mut conn = state.connections.remove(&conn_name)
+                let mut conn = state.connections.lock().unwrap().remove(&conn_name)
                     .ok_or_else(|| anyhow::anyhow!("disconnect: connection \"{conn_name}\" not found"))?;
                 conn.ka_channel.take();
                 conn.ts_channel.take();
@@ -630,7 +713,7 @@ fn execute_step<'a>(
                         json!({ "bind_address": addr })))
                     .await?;
                 info!(%addr, listener = listener_name, "Listener started");
-                state.listeners.insert(listener_name, ServerListener { listener });
+                state.listeners.lock().unwrap().insert(listener_name, ServerListener { listener: Arc::new(listener) });
                 Ok(())
             }
 
@@ -638,10 +721,13 @@ fn execute_step<'a>(
                 let listener_name = step.on_name.as_deref().unwrap_or("default");
                 let conn_name = step.as_name.as_deref().unwrap_or("default").to_string();
 
-                let sl = state.listeners.get(&listener_name.to_string())
-                    .ok_or_else(|| anyhow::anyhow!("accept_handshake: listener \"{listener_name}\" not found"))?;
-
-                let (bearer, peer_addr) = Bearer::accept_tcp(&sl.listener)
+                let listener_arc = {
+                    let guard = state.listeners.lock().unwrap();
+                    let sl = guard.get(listener_name)
+                        .ok_or_else(|| anyhow::anyhow!("accept_handshake: listener \"{listener_name}\" not found"))?;
+                    Arc::clone(&sl.listener)
+                };
+                let (bearer, peer_addr) = Bearer::accept_tcp(&listener_arc)
                     .await
                     .context("accept_handshake: Bearer::accept_tcp failed")?;
 
@@ -712,7 +798,7 @@ fn execute_step<'a>(
                     .await?;
 
                 info!(version, %peer_addr, conn = conn_name, "Handshake accepted as server");
-                state.server_connections.insert(conn_name, ServerConnection {
+                state.server_connections.lock().unwrap().insert(conn_name, ServerConnection {
                     plexer: server_plexer,
                     cs_channel: Some(cs_channel),
                     bf_channel: Some(bf_server_channel),
@@ -724,8 +810,8 @@ fn execute_step<'a>(
 
             StepKind::ServeChainSync => {
                 let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
-                let sc = state.server_connections.get_mut(&conn_name)
-                    .ok_or_else(|| anyhow::anyhow!("serve_chain_sync: server connection \"{conn_name}\" not found"))?;
+                let mut co = CheckedOut::take(&state.server_connections, &conn_name)?;
+                let sc = co.get_mut();
                 let mut cs_channel = sc.cs_channel.take()
                     .ok_or_else(|| anyhow::anyhow!("serve_chain_sync: no chain-sync channel"))?;
 
@@ -787,8 +873,8 @@ fn execute_step<'a>(
 
             StepKind::ServeBlockFetch => {
                 let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
-                let sc = state.server_connections.get_mut(&conn_name)
-                    .ok_or_else(|| anyhow::anyhow!("serve_block_fetch: server connection \"{conn_name}\" not found"))?;
+                let mut co = CheckedOut::take(&state.server_connections, &conn_name)?;
+                let sc = co.get_mut();
                 let mut bf_channel = sc.bf_channel.take()
                     .ok_or_else(|| anyhow::anyhow!("serve_block_fetch: no block-fetch channel"))?;
 
@@ -839,7 +925,7 @@ fn execute_step<'a>(
 
             StepKind::CloseListener => {
                 let listener_name = step.on_name.as_deref().unwrap_or("default").to_string();
-                state.listeners.remove(&listener_name);
+                state.listeners.lock().unwrap().remove(&listener_name);
                 // Server connections created via this listener remain open until
                 // explicitly disconnected or until cleanup runs.
                 tracer
@@ -847,6 +933,85 @@ fn execute_step<'a>(
                     .await?;
                 info!(listener = listener_name, "Listener stopped");
                 Ok(())
+            }
+
+            StepKind::Parallel => {
+                let branches_val = step
+                    .raw_params
+                    .get("branches")
+                    .ok_or_else(|| anyhow::anyhow!("parallel step requires branches"))?;
+                let branches: Vec<Vec<StepDef>> = serde_json::from_value(branches_val.clone())
+                    .context("parallel: invalid branches")?;
+
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::ParallelStarted,
+                        Direction::Internal,
+                        json!({ "branch_count": branches.len() }),
+                    ))
+                    .await?;
+
+                // Build one future per branch. Each branch gets its own RunnerState
+                // clone (O(1) — just bumps Arc ref-counts) and the shared Tracer.
+                let branch_futs: Vec<_> = branches
+                    .into_iter()
+                    .enumerate()
+                    .map(|(bi, branch_steps)| {
+                        let mut branch_state = state.clone();
+                        let branch_tracer = tracer.clone();
+                        let addr = target_address.to_string();
+                        async move {
+                            branch_tracer
+                                .emit(TraceEvent::new(
+                                    EventKind::ParallelBranchStarted,
+                                    Direction::Internal,
+                                    json!({ "branch": bi }),
+                                ))
+                                .await?;
+                            for (si, step) in branch_steps.iter().enumerate() {
+                                if let Err(e) = run_step(
+                                    step,
+                                    si,
+                                    &addr,
+                                    network_magic,
+                                    &mut branch_state,
+                                    &branch_tracer,
+                                )
+                                .await
+                                {
+                                    let _ = branch_tracer
+                                        .emit(TraceEvent::new(
+                                            EventKind::ParallelBranchFailed,
+                                            Direction::Internal,
+                                            json!({ "branch": bi, "step": si, "error": e.to_string() }),
+                                        ))
+                                        .await;
+                                    return Err(e);
+                                }
+                            }
+                            branch_tracer
+                                .emit(TraceEvent::new(
+                                    EventKind::ParallelBranchCompleted,
+                                    Direction::Internal,
+                                    json!({ "branch": bi }),
+                                ))
+                                .await?;
+                            Ok::<(), anyhow::Error>(())
+                        }
+                    })
+                    .collect();
+
+                let result: anyhow::Result<Vec<()>> = try_join_all(branch_futs).await;
+
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::ParallelCompleted,
+                        Direction::Internal,
+                        json!({ "outcome": if result.is_ok() { "ok" } else { "error" } }),
+                    ))
+                    .await?;
+
+                result.map(|_| ())
             }
         }
     })
@@ -890,17 +1055,21 @@ async fn fetch_tip(target_address: &str, network_magic: u64, tracer: &Tracer) ->
 /// Close all open connections and listeners. Called on error/assertion-failure
 /// paths before returning from `run`.
 async fn cleanup(state: &mut RunnerState, tracer: &Tracer) {
-    // Close all accepted server connections.
-    for (name, mut sc) in state.server_connections.drain() {
+    // Drain under a brief lock, then release before async work.
+    let server_conns: Vec<(String, ServerConnection)> =
+        state.server_connections.lock().unwrap().drain().collect();
+    for (name, mut sc) in server_conns {
         if let Some(h) = sc.ka_handle.take() { h.abort(); }
         sc.plexer.abort().await;
         let _ = tracer.emit(TraceEvent::new(EventKind::ConnectionClosed, Direction::Internal,
             json!({ "reason": "scenario_aborted" })).with_connection(&name)).await;
     }
     // Drop all listeners.
-    state.listeners.clear();
+    state.listeners.lock().unwrap().clear();
     // Close all outgoing connections.
-    for (name, mut cc) in state.connections.drain() {
+    let conns: Vec<(String, ClientConnection)> =
+        state.connections.lock().unwrap().drain().collect();
+    for (name, mut cc) in conns {
         cc.ka_channel.take();
         cc.ts_channel.take();
         if let Some(h) = cc.ka_handle.take() { h.abort(); }
@@ -1122,9 +1291,9 @@ mod tests {
         // With the HashMap-based state, an empty RunnerState has no connections at all.
         // Workers are stored inside ClientConnection entries which don't exist until connect.
         let state = RunnerState::default();
-        assert!(state.connections.is_empty(), "no connections before connect");
-        assert!(state.listeners.is_empty(),   "no listeners before listen");
-        assert!(state.server_connections.is_empty(), "no server connections before accept_handshake");
+        assert!(state.connections.lock().unwrap().is_empty(), "no connections before connect");
+        assert!(state.listeners.lock().unwrap().is_empty(),   "no listeners before listen");
+        assert!(state.server_connections.lock().unwrap().is_empty(), "no server connections before accept_handshake");
     }
 
     /// After Connect, channels are allocated but workers are not yet running.
@@ -1153,11 +1322,14 @@ mod tests {
             .await
             .expect("connect should succeed");
 
-        let conn = state.connections.get("default").expect("default connection");
-        assert!(conn.ka_handle.is_none(),  "ka_handle must be None after Connect");
-        assert!(conn.ts_handle.is_none(),  "ts_handle must be None after Connect");
-        assert!(conn.ka_channel.is_some(), "ka_channel must be Some after Connect");
-        assert!(conn.ts_channel.is_some(), "ts_channel must be Some after Connect");
+        {
+            let guard = state.connections.lock().unwrap();
+            let conn = guard.get("default").expect("default connection");
+            assert!(conn.ka_handle.is_none(),  "ka_handle must be None after Connect");
+            assert!(conn.ts_handle.is_none(),  "ts_handle must be None after Connect");
+            assert!(conn.ka_channel.is_some(), "ka_channel must be Some after Connect");
+            assert!(conn.ts_channel.is_some(), "ts_channel must be Some after Connect");
+        }
 
         let handshake = StepDef {
             kind: StepKind::Handshake,
@@ -1171,14 +1343,17 @@ mod tests {
             .await
             .expect("handshake should succeed");
 
-        let conn = state.connections.get("default").expect("default connection");
-        assert!(conn.ka_handle.is_some(),  "ka_handle must be Some after Handshake");
-        assert!(conn.ts_handle.is_some(),  "ts_handle must be Some after Handshake");
-        assert!(conn.ka_channel.is_none(), "ka_channel must be None after Handshake (consumed)");
-        assert!(conn.ts_channel.is_none(), "ts_channel must be None after Handshake (consumed)");
+        {
+            let guard = state.connections.lock().unwrap();
+            let conn = guard.get("default").expect("default connection");
+            assert!(conn.ka_handle.is_some(),  "ka_handle must be Some after Handshake");
+            assert!(conn.ts_handle.is_some(),  "ts_handle must be Some after Handshake");
+            assert!(conn.ka_channel.is_none(), "ka_channel must be None after Handshake (consumed)");
+            assert!(conn.ts_channel.is_none(), "ts_channel must be None after Handshake (consumed)");
+        }
 
         // Cleanup.
-        let mut conn = state.connections.remove("default").unwrap();
+        let mut conn = state.connections.lock().unwrap().remove("default").unwrap();
         if let Some(h) = conn.ka_handle.take() { h.abort(); }
         if let Some(h) = conn.ts_handle.take() { h.abort(); }
         conn.plexer.abort().await;

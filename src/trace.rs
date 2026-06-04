@@ -77,6 +77,14 @@ pub enum EventKind {
     ServerBlockFetchStarted,
     ServerBlockFetchCompleted,
 
+    // Parallel step execution
+    ParallelStarted,
+    ParallelBranchStarted,
+    ParallelBranchCompleted,
+    ParallelBranchAborted,
+    ParallelBranchFailed,
+    ParallelCompleted,
+
     // Server-side lifecycle
     ServerBearerAccepted,
     ServerListenStarted,

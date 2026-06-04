@@ -1,0 +1,35 @@
+{
+  "name": "parallel_server_two_chains",
+  "description": "Listens for two incoming connections and serves each a Chain-Sync session in parallel, rather than sequentially. Validates that the server-side harness can handle concurrent clients on the same listener.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_parallel_server_two_chains.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "as": "listener_1", "bind_address": "0.0.0.0:3001" },
+    {
+      "kind": "parallel",
+      "branches": [
+        [
+          { "kind": "accept_handshake", "on": "listener_1", "as": "peer_a" },
+          {
+            "kind": "serve_chain_sync",
+            "on": "peer_a",
+            "fixture_path": "fixtures/devnet_genesis.jsonl",
+            "await_at_tip_secs": 5
+          }
+        ],
+        [
+          { "kind": "accept_handshake", "on": "listener_1", "as": "peer_b" },
+          {
+            "kind": "serve_chain_sync",
+            "on": "peer_b",
+            "fixture_path": "fixtures/devnet_genesis.jsonl",
+            "await_at_tip_secs": 5
+          }
+        ]
+      ]
+    },
+    { "kind": "close_listener", "on": "listener_1" }
+  ]
+}
