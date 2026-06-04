@@ -3,7 +3,7 @@
   "description": "Fetch 3 headers and their block bodies, repeated 4 times",
   "target_address": "localhost:3001",
   "network_magic": 42,
-  "trace_output_path": "trace.jsonl",
+  "trace_output_path": "trace_client.jsonl",
   "expected_outcome": "success",
   "steps": [
     { "kind": "connect" },

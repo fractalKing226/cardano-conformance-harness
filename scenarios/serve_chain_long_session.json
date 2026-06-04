@@ -1,0 +1,18 @@
+{
+  "name": "serve_chain_long_session",
+  "description": "Serve a fixture chain and hold in MustReply (tip) for 60 seconds before closing. Tests that the harness correctly handles the 'caught up, no more blocks' code path — the client will send MsgRequestNext, receive MsgAwaitReply, and wait. After 60 seconds the harness drops the connection.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3001" },
+    { "kind": "accept_handshake" },
+    {
+      "kind": "serve_chain_sync",
+      "fixture_path": "fixtures/devnet_genesis.jsonl",
+      "await_at_tip_secs": 60
+    },
+    { "kind": "close_listener" }
+  ]
+}

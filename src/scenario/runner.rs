@@ -3,18 +3,24 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use pallas_network::facades::PeerServer;
 use pallas_network::miniprotocols::chainsync::{N2NClient, Tip};
+use pallas_network::miniprotocols::handshake::n2n::VersionTable;
+use pallas_network::miniprotocols::handshake::RefuseReason;
 use pallas_network::miniprotocols::{Point, PROTOCOL_N2N_HANDSHAKE};
 use pallas_network::multiplexer::{AgentChannel, Bearer, Plexer, RunningPlexer};
 use serde_json::{json, Value};
+use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::miniprotocols::blockfetch::{run_block_fetch, BLOCK_FETCH_PROTOCOL};
 use crate::miniprotocols::chainsync::{run_chain_sync, CHAIN_SYNC_PROTOCOL};
+use crate::miniprotocols::chainsync_server::run_chain_sync_server;
 use crate::miniprotocols::handshake::handshake_on_channel;
 use crate::miniprotocols::keepalive::{run_keepalive, KEEP_ALIVE_INTERVAL, KEEP_ALIVE_PROTOCOL};
 use crate::miniprotocols::txsubmission::{run_tx_submission, TX_SUBMISSION_PROTOCOL};
+use crate::scenario::fixture;
 use crate::scenario::vars::{point_to_str, substitute_in_value, VarStore};
 use crate::scenario::{BlockFetchPoints, Scenario, StepDef, StepKind, StepParams};
 use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
@@ -40,11 +46,18 @@ pub fn subscribed_protocols(_negotiated_version: u64) -> Vec<u16> {
 
 pub struct ScenarioRunner {
     scenario: Scenario,
+    /// If set, every RollForward header is appended to this file as a fixture entry.
+    capture_fixture: Option<std::path::PathBuf>,
 }
 
 impl ScenarioRunner {
     pub fn new(scenario: Scenario) -> Self {
-        Self { scenario }
+        Self { scenario, capture_fixture: None }
+    }
+
+    pub fn with_capture_fixture(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.capture_fixture = path;
+        self
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
@@ -66,7 +79,10 @@ impl ScenarioRunner {
             ))
             .await?;
 
-        let mut state = RunnerState::default();
+        let mut state = RunnerState {
+            capture_fixture: self.capture_fixture.clone(),
+            ..Default::default()
+        };
         let mut steps_passed: u64 = 0;
         let mut steps_failed: u64 = 0;
 
@@ -133,6 +149,14 @@ struct RunnerState {
     last_chain_sync_points: Vec<Point>,
     /// Flat variable namespace populated by steps with `output` fields.
     vars: VarStore,
+
+    // ── Server-side state ─────────────────────────────────────────────────────
+    /// TCP listener bound by the `listen` step.
+    listener: Option<TcpListener>,
+    /// Accepted peer connection (after `accept_handshake`).
+    peer_server: Option<PeerServer>,
+    /// Path to write fixture entries to (from `--capture-fixture` CLI flag).
+    capture_fixture: Option<std::path::PathBuf>,
 }
 
 // ── Step execution with bookkeeping ───────────────────────────────────────────
@@ -434,6 +458,28 @@ fn execute_step<'a>(
                     info!(var = output_var.as_str(), points = n, "Stored chain-sync points");
                 }
 
+                // Write fixture if --capture-fixture was set.
+                if let Some(ref fixture_path) = state.capture_fixture {
+                    if summary.captured_headers.is_empty() {
+                        // First time: write the anchor line.
+                        fixture::write_anchor(fixture_path, &Point::Origin)?;
+                    }
+                    for h in &summary.captured_headers {
+                        let entry = fixture::FixtureEntry {
+                            slot: h.slot,
+                            block_hash: fixture::encode_hex(&h.block_hash),
+                            block_number: h.block_number,
+                            cbor_hex: fixture::encode_hex(&h.cbor),
+                        };
+                        fixture::append_entry(fixture_path, &entry)?;
+                    }
+                    info!(
+                        headers = summary.captured_headers.len(),
+                        path = %fixture_path.display(),
+                        "Wrote fixture entries"
+                    );
+                }
+
                 info!(headers = summary.headers_received, points = n, "Chain-sync step complete");
                 Ok(())
             }
@@ -561,6 +607,175 @@ fn execute_step<'a>(
                 tokio::time::sleep(Duration::from_secs(secs)).await;
                 Ok(())
             }
+
+            // ── Server-side steps ─────────────────────────────────────────────
+
+            StepKind::Listen => {
+                let addr = params.bind_address.as_deref().unwrap_or("0.0.0.0:3001");
+                let listener = TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("listen: failed to bind {addr}"))?;
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::ServerListenStarted,
+                        Direction::Internal,
+                        json!({ "bind_address": addr }),
+                    ))
+                    .await?;
+                info!(%addr, "Listener started");
+                state.listener = Some(listener);
+                Ok(())
+            }
+
+            StepKind::AcceptHandshake => {
+                let listener = state
+                    .listener
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("accept_handshake: no listener (missing listen step?)"))?;
+
+                let (bearer, peer_addr) = Bearer::accept_tcp(listener)
+                    .await
+                    .context("accept_handshake: Bearer::accept_tcp failed")?;
+
+                // Emit ServerBearerAccepted — TCP landed, multiplexer ready,
+                // awaiting handshake initiation from the peer.
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::ServerBearerAccepted,
+                        Direction::Internal,
+                        json!({ "peer_address": peer_addr.to_string() }),
+                    ))
+                    .await?;
+
+                let mut peer_server = PeerServer::new(bearer);
+
+                // Receive the peer's proposed versions.
+                let client_table = peer_server
+                    .handshake()
+                    .receive_proposed_versions()
+                    .await
+                    .context("accept_handshake: receive_proposed_versions failed")?;
+
+                let mut proposed_versions: Vec<u64> =
+                    client_table.values.keys().cloned().collect();
+                proposed_versions.sort();
+
+                // direction: received — the version proposal came from the peer.
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::HandshakeVersionProposed,
+                        Direction::Received,
+                        json!({ "versions": proposed_versions, "magic": network_magic }),
+                    ))
+                    .await?;
+
+                // Find highest common version. Use client's VersionData to pass
+                // the equality check in Pallas's state machine.
+                let server_supported: Vec<u64> = (7u64..=14).collect();
+                let mut client_pairs: Vec<(u64, _)> =
+                    client_table.values.into_iter().collect();
+                client_pairs.sort_by(|a, b| b.0.cmp(&a.0)); // highest first
+
+                let best = client_pairs
+                    .into_iter()
+                    .find(|(v, _)| server_supported.contains(v));
+
+                let (version, client_data) = match best {
+                    Some(pair) => pair,
+                    None => {
+                        let _ = peer_server
+                            .handshake()
+                            .refuse(RefuseReason::VersionMismatch(server_supported))
+                            .await;
+                        anyhow::bail!(
+                            "accept_handshake: no common version with peer (proposed: {:?})",
+                            proposed_versions
+                        );
+                    }
+                };
+
+                peer_server
+                    .handshake()
+                    .accept_version(version, client_data.clone())
+                    .await
+                    .context("accept_handshake: accept_version failed")?;
+
+                // direction: sent — the version acceptance goes from harness to peer.
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::HandshakeVersionAccepted,
+                        Direction::Sent,
+                        json!({
+                            "version":   version,
+                            "peer_data": format!("{client_data:?}"),
+                        }),
+                    ))
+                    .await?;
+
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::ServerHandshakeAccepted,
+                        Direction::Internal,
+                        json!({
+                            "peer_address":      peer_addr.to_string(),
+                            "negotiated_version": version,
+                        }),
+                    ))
+                    .await?;
+
+                info!(version, %peer_addr, "Handshake accepted as server");
+                state.peer_server = Some(peer_server);
+                Ok(())
+            }
+
+            StepKind::ServeChainSync => {
+                let fixture_path = params
+                    .fixture_path
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("serve_chain_sync: fixture_path is required"))?;
+
+                let chain = fixture::load(std::path::Path::new(fixture_path))
+                    .with_context(|| format!("serve_chain_sync: loading fixture \"{fixture_path}\""))?;
+
+                let await_secs = params.await_at_tip_secs.unwrap_or(30).min(300);
+
+                let peer_server = state
+                    .peer_server
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("serve_chain_sync: no accepted connection (missing accept_handshake?)"))?;
+
+                let summary = run_chain_sync_server(
+                    &mut peer_server.chainsync,
+                    &chain,
+                    Duration::from_secs(await_secs),
+                    tracer,
+                )
+                .await?;
+
+                info!(
+                    headers_served = summary.headers_served,
+                    duration_ms = summary.duration_ms,
+                    "serve_chain_sync step complete"
+                );
+                Ok(())
+            }
+
+            StepKind::CloseListener => {
+                // Abort the peer server before dropping the listener.
+                if let Some(ps) = state.peer_server.take() {
+                    ps.abort().await;
+                }
+                state.listener.take(); // Drop closes the socket.
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::ServerListenStopped,
+                        Direction::Internal,
+                        json!({}),
+                    ))
+                    .await?;
+                info!("Listener stopped");
+                Ok(())
+            }
         }
     })
 }
@@ -603,6 +818,13 @@ async fn fetch_tip(target_address: &str, network_magic: u64, tracer: &Tracer) ->
 /// Abort the keep-alive loop and plexer, emit ConnectionClosed if still
 /// connected. Called on error/assertion-failure paths before returning.
 async fn cleanup(state: &mut RunnerState, tracer: &Tracer) {
+    // Server-side cleanup.
+    if let Some(ps) = state.peer_server.take() {
+        ps.abort().await;
+    }
+    state.listener.take();
+
+    // Client-side cleanup.
     state.ka_channel.take();
     state.ts_channel.take();
     if let Some(handle) = state.ka_handle.take() { handle.abort(); }

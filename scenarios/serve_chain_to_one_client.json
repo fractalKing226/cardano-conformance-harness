@@ -1,0 +1,18 @@
+{
+  "name": "serve_chain_to_one_client",
+  "description": "Listen for one incoming connection, serve a pre-captured fixture chain via Chain-Sync, then close. The client receives headers and sends MsgDone to terminate cleanly.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3001" },
+    { "kind": "accept_handshake" },
+    {
+      "kind": "serve_chain_sync",
+      "fixture_path": "fixtures/devnet_genesis.jsonl",
+      "await_at_tip_secs": 30
+    },
+    { "kind": "close_listener" }
+  ]
+}

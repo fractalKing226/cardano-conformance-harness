@@ -15,6 +15,16 @@ pub use pallas_network::miniprotocols::PROTOCOL_N2N_CHAIN_SYNC as CHAIN_SYNC_PRO
 
 const MINI_PROTOCOL: &str = "chain-sync";
 
+/// A captured header as it arrives from a RollForward message.
+/// Used to populate fixture files for server-side replay.
+#[derive(Clone)]
+pub struct CapturedHeader {
+    pub slot: u64,
+    pub block_hash: Vec<u8>,
+    pub block_number: u64,
+    pub cbor: Vec<u8>,
+}
+
 pub struct ChainSyncSummary {
     pub headers_received: u64,
     pub rollbacks: u64,
@@ -26,6 +36,8 @@ pub struct ChainSyncSummary {
     /// Points (slot + block hash) collected from RollForward messages, in order.
     /// Used to drive Block-Fetch after Chain-Sync completes.
     pub collected_points: Vec<Point>,
+    /// Full header captures for fixture file writing (`--capture-fixture`).
+    pub captured_headers: Vec<CapturedHeader>,
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -54,29 +66,32 @@ fn state_str(client: &N2NClient) -> String {
     format!("{:?}", client.state())
 }
 
-/// Extracts (slot, block_hash) from a Shelley+ header and returns a Point.
+/// Extracts (slot, block_number, block_hash) from a Shelley+ header.
 ///
-/// The block hash is blake2b-256 of the raw header bytes. The slot is decoded
-/// from the CBOR structure: array(2)[array(N)[block_number, slot, ...], sig].
+/// The block hash is blake2b-256 of the raw header bytes. The block_number and
+/// slot are decoded from the CBOR structure:
+///   array(2)[array(N)[block_number, slot, ...], signature]
 ///
-/// Byron headers (variant 0) are not supported here — they use a different
-/// CBOR layout and are not expected on the devnet or preprod testnet.
-fn extract_point(header: &HeaderContent) -> anyhow::Result<Point> {
-    // Block hash = blake2b-256 of the header bytes as serialised on the wire.
+/// Byron headers (variant 0) are not supported here.
+pub fn extract_header_fields(header: &HeaderContent) -> anyhow::Result<(u64, u64, Vec<u8>)> {
     let hash: Vec<u8> = Hasher::<256>::hash(&header.cbor).as_ref().to_vec();
-
-    // Decode slot from CBOR: array(2)[array(N)[block_number, slot, ...], ...]
     let mut d = minicbor::Decoder::new(&header.cbor);
     d.array()
         .map_err(|e| anyhow::anyhow!("header cbor: expected outer array: {e}"))?;
     d.array()
         .map_err(|e| anyhow::anyhow!("header cbor: expected inner array: {e}"))?;
-    d.skip()
-        .map_err(|e| anyhow::anyhow!("header cbor: skip block_number: {e}"))?;
+    let block_number = d
+        .u64()
+        .map_err(|e| anyhow::anyhow!("header cbor: expected block_number u64: {e}"))?;
     let slot = d
         .u64()
         .map_err(|e| anyhow::anyhow!("header cbor: expected slot u64: {e}"))?;
+    Ok((block_number, slot, hash))
+}
 
+#[allow(dead_code)]
+fn extract_point(header: &HeaderContent) -> anyhow::Result<Point> {
+    let (_, slot, hash) = extract_header_fields(header)?;
     Ok(Point::Specific(slot, hash))
 }
 
@@ -104,6 +119,7 @@ pub async fn run_chain_sync(
     let mut messages_sent: u64 = 0;
     let mut messages_received: u64 = 0;
     let mut collected_points: Vec<Point> = Vec::new();
+    let mut captured_headers: Vec<CapturedHeader> = Vec::new();
 
     tracer
         .emit(
@@ -220,6 +236,7 @@ pub async fn run_chain_sync(
                     messages_sent,
                     messages_received,
                     collected_points,
+                    captured_headers.clone(),
                     started_at,
                     "error",
                 );
@@ -233,9 +250,17 @@ pub async fn run_chain_sync(
                 messages_received += 1;
                 headers_received += 1;
                 debug!(headers_received, "RollForward");
-                match extract_point(&header) {
-                    Ok(point) => collected_points.push(point),
-                    Err(e) => warn!("Could not extract point from header: {e}"),
+                match extract_header_fields(&header) {
+                    Ok((block_number, slot, hash)) => {
+                        collected_points.push(Point::Specific(slot, hash.clone()));
+                        captured_headers.push(CapturedHeader {
+                            slot,
+                            block_hash: hash,
+                            block_number,
+                            cbor: header.cbor.clone(),
+                        });
+                    }
+                    Err(e) => warn!("Could not extract fields from header: {e}"),
                 }
                 tracer
                     .emit(
@@ -301,6 +326,7 @@ pub async fn run_chain_sync(
                             messages_sent,
                             messages_received,
                             collected_points,
+                            captured_headers.clone(),
                             started_at,
                             "error",
                         );
@@ -329,6 +355,7 @@ pub async fn run_chain_sync(
                             messages_sent,
                             messages_received,
                             collected_points,
+                            captured_headers.clone(),
                             started_at,
                             "timeout",
                         );
@@ -345,9 +372,17 @@ pub async fn run_chain_sync(
                         messages_received += 1;
                         headers_received += 1;
                         debug!(headers_received, "RollForward (after await)");
-                        match extract_point(&header) {
-                            Ok(point) => collected_points.push(point),
-                            Err(e) => warn!("Could not extract point from header: {e}"),
+                        match extract_header_fields(&header) {
+                            Ok((block_number, slot, hash)) => {
+                                collected_points.push(Point::Specific(slot, hash.clone()));
+                                captured_headers.push(CapturedHeader {
+                                    slot,
+                                    block_hash: hash,
+                                    block_number,
+                                    cbor: header.cbor.clone(),
+                                });
+                            }
+                            Err(e) => warn!("Could not extract fields from header: {e}"),
                         }
                         tracer
                             .emit(
@@ -417,6 +452,7 @@ pub async fn run_chain_sync(
         messages_sent,
         messages_received,
         collected_points,
+        captured_headers.clone(),
         started_at,
         "completed",
     );
@@ -451,6 +487,7 @@ fn build_summary(
     messages_sent: u64,
     messages_received: u64,
     collected_points: Vec<Point>,
+    captured_headers: Vec<CapturedHeader>,
     started_at: Instant,
     exit_reason: &str,
 ) -> ChainSyncSummary {
@@ -463,6 +500,7 @@ fn build_summary(
         exit_reason: exit_reason.to_string(),
         duration_ms: started_at.elapsed().as_millis() as u64,
         collected_points,
+        captured_headers,
     }
 }
 
@@ -563,7 +601,7 @@ mod tests {
 
     #[test]
     fn build_summary_fields() {
-        let summary = build_summary(5, 1, true, 12, 10, vec![], Instant::now(), "completed");
+        let summary = build_summary(5, 1, true, 12, 10, vec![], vec![], Instant::now(), "completed");
         assert_eq!(summary.headers_received, 5);
         assert_eq!(summary.rollbacks, 1);
         assert!(summary.must_reply_triggered);

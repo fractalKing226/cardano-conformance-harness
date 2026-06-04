@@ -1,6 +1,6 @@
 {
-  "name": "chain_sync_only",
-  "description": "Sync 5 headers from genesis and exit cleanly",
+  "name": "capture_chain_for_fixture",
+  "description": "Capture 20 headers from genesis into a fixture file. Run with: cargo run -- --scenario scenarios/capture_chain_for_fixture.json --capture-fixture fixtures/devnet_genesis.jsonl",
   "target_address": "localhost:3001",
   "network_magic": 42,
   "trace_output_path": "trace_client.jsonl",
@@ -10,7 +10,7 @@
     { "kind": "handshake" },
     {
       "kind": "chain_sync",
-      "count": 5
+      "count": 20
     },
     { "kind": "disconnect" }
   ]

@@ -11,6 +11,12 @@ struct Cli {
     /// Path to the scenario JSON file to execute
     #[arg(long, default_value = "scenarios/default.json")]
     scenario: PathBuf,
+
+    /// When set, every RollForward header received by chain_sync steps is
+    /// also written to this file as a fixture entry (JSONL format). The
+    /// resulting file can be used as fixture_path in serve_chain_sync steps.
+    #[arg(long)]
+    capture_fixture: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -26,5 +32,8 @@ async fn main() -> anyhow::Result<()> {
     let parsed = scenario::load(&cli.scenario)?;
     tracing::info!(name = %parsed.name, steps = parsed.steps.len(), "Running scenario");
 
-    ScenarioRunner::new(parsed).run().await
+    ScenarioRunner::new(parsed)
+        .with_capture_fixture(cli.capture_fixture)
+        .run()
+        .await
 }

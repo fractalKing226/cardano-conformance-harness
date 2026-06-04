@@ -3,7 +3,7 @@
   "description": "Demonstrates variables, query_tip, and repeat. Each repeat iteration opens a fresh connection so chain_sync's channel is available (channel reuse across sessions on one connection is a future improvement).",
   "target_address": "localhost:3001",
   "network_magic": 42,
-  "trace_output_path": "trace.jsonl",
+  "trace_output_path": "trace_client.jsonl",
   "expected_outcome": "success",
   "steps": [
     { "kind": "connect" },

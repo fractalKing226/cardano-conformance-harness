@@ -64,6 +64,7 @@ cardano-conformance-harness --scenario <PATH>
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--scenario` | `scenarios/default.json` | Path to the scenario JSON file |
+| `--capture-fixture` | — | Write every RollForward header from `chain_sync` steps to this JSONL file for later use as a `serve_chain_sync` fixture |
 
 ### Logging
 
@@ -233,6 +234,94 @@ and the repeat step fails, aborting the scenario at that point.
 
 Closes the TCP connection cleanly. No parameters.
 
+---
+
+### Server-side step kinds
+
+A scenario is either **client-mode** (uses `connect`/`handshake`/…) or **server-mode** (uses `listen`/`accept_handshake`/…). The two must not appear in the same scenario — the validator rejects mixed scenarios at load time.
+
+#### `listen`
+
+Binds a TCP listener. The harness becomes the responder for the next incoming connection.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `bind_address` | `"0.0.0.0:3001"` | Address and port to bind |
+
+#### `accept_handshake`
+
+Accepts the next TCP connection and completes the NodeToNode Handshake as the **responder**. Emits `ServerBearerAccepted` immediately after the TCP accept succeeds (before handshake begins — the server-side mirror of `connection_opened`), then wire-level `HandshakeVersionProposed` (received, peer→harness) and `HandshakeVersionAccepted` (sent, harness→peer) events with their directions reversed from client-side convention. No parameters.
+
+#### `serve_chain_sync`
+
+Serves a pre-captured chain fixture to the connected client via Chain-Sync. The harness responds to `MsgFindIntersect` and `MsgRequestNext` faithfully from the fixture data. When the fixture is exhausted it sends `MsgAwaitReply` and holds for `await_at_tip_secs` seconds, then closes the session.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `fixture_path` | yes | Path to the JSONL fixture file |
+| `await_at_tip_secs` | no (default 30, max 300) | How long to hold in MustReply at tip before closing |
+
+#### `close_listener`
+
+Stops the TCP listener and closes any active accepted connection. No parameters.
+
+---
+
+### Chain fixture format
+
+Fixture files are JSONL (one JSON object per line). The first line is the **anchor** — the point before the first served header. Remaining lines are block headers in chain order.
+
+```jsonl
+{"anchor": true}
+{"slot":62,"block_hash":"5a3d778e76741a009e29d23093cfe046131808d34d7c864967b515e98dfc358","block_number":1,"cbor_hex":"828a00183ef658..."}
+{"slot":63,"block_hash":"14051e8b3d14cd58b7a16e76716cd9eb002c569d0a7273096c0c9069da3d4b4","block_number":2,"cbor_hex":"828a01183f5820..."}
+```
+
+`{"anchor": true}` means genesis (`Point::Origin`). A mid-chain anchor can include `slot` and `block_hash` fields.
+
+**Capture a fixture** from a real or devnet node:
+
+```sh
+cargo run -- \
+  --scenario scenarios/capture_chain_for_fixture.json \
+  --capture-fixture fixtures/devnet_genesis.jsonl
+```
+
+---
+
+### Pointing a real cardano-node at the harness
+
+To use a real `cardano-node` as the client under test against the harness in server mode, add the harness to the node's topology with an outgoing connection:
+
+```json
+{
+  "localRoots": [
+    {
+      "accessPoints": [
+        { "address": "127.0.0.1", "port": 3001 }
+      ],
+      "advertise": false,
+      "trustable": true,
+      "valency": 1
+    }
+  ],
+  "publicRoots": [],
+  "useLedgerAfterSlot": -1
+}
+```
+
+Set the node's `--host-addr 127.0.0.1` so it initiates outbound connections. The harness must be running in server mode (`serve_chain_to_one_client.json` or similar) before the node starts.
+
+---
+
+### Known limitations (this slice)
+
+- **Single client per session.** One incoming connection per `listen`/`close_listener` cycle. Multi-client serving is a future slice.
+- **No rollback support.** The fixture is a linear chain. The server never sends `MsgRollBackward`. Rollback-testing scenarios are a future slice.
+- **No adversarial behavior.** The server serves the fixture faithfully. Stalling, malformed responses, and out-of-order messages are a future slice.
+- **Chain-Sync only.** Block-Fetch server is a future slice; clients can fetch blocks from a real node directly.
+- **Channel reuse.** A connection's Chain-Sync channel is consumed after one session. Multiple `serve_chain_sync` steps on the same connection are not yet supported.
+
 #### `sleep`
 
 | Parameter | Required | Description |
@@ -284,6 +373,9 @@ scenario with a non-zero exit code.
 | `scenarios/query_tip_chain_sync.json` | Query tip, then Chain-Sync from that tip |
 | `scenarios/repeat_demo.json` | Repeat 4×: sync 3 headers + fetch bodies |
 | `scenarios/combined_variables.json` | All features: variables, query_tip, repeat |
+| `scenarios/capture_chain_for_fixture.json` | Capture 20 headers to a fixture file |
+| `scenarios/serve_chain_to_one_client.json` | Server-mode: accept one client, serve fixture |
+| `scenarios/serve_chain_long_session.json` | Server-mode: serve fixture, hold 60 s at tip |
 
 ## Trace file format
 
@@ -394,6 +486,7 @@ cargo test
 
 - `trace::tests` — serialisation, `Direction::Internal`, `with_protocol`/`with_states`
 - `scenario::tests` — parsing, validation, `parse_point`
+- `scenario::fixture::tests` — load/save round-trip, cursor `find_intersect` (all cases), cursor advance
 - `scenario::vars::tests` — `resolve_ref` (all forms, error cases), `substitute_in_value`, `point_to_str`
 - `scenario::tests` — step parsing (variables, query_tip, repeat), validate constraints
 - `scenario::runner::tests` — assertion evaluator, `subscribed_protocols` suite check

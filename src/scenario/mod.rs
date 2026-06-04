@@ -1,3 +1,4 @@
+pub mod fixture;
 pub mod runner;
 pub mod vars;
 
@@ -65,6 +66,7 @@ impl<'de> Deserialize<'de> for StepDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepKind {
+    // ── Client-side ───────────────────────────────────────────────────────────
     Connect,
     Handshake,
     ChainSync,
@@ -73,6 +75,16 @@ pub enum StepKind {
     Repeat,
     Disconnect,
     Sleep,
+    // ── Server-side ───────────────────────────────────────────────────────────
+    /// Bind a TCP listener socket. Params: `bind_address` (default `"0.0.0.0:3001"`).
+    Listen,
+    /// Accept the next TCP connection and complete the N2N Handshake as responder.
+    AcceptHandshake,
+    /// Serve a pre-captured chain fixture to the connected client via Chain-Sync.
+    /// Params: `fixture_path` (required), `await_at_tip_secs` (default 30, max 300).
+    ServeChainSync,
+    /// Stop the listener and close any active server connections.
+    CloseListener,
 }
 
 impl StepKind {
@@ -86,7 +98,33 @@ impl StepKind {
             StepKind::Repeat => "repeat",
             StepKind::Disconnect => "disconnect",
             StepKind::Sleep => "sleep",
+            StepKind::Listen => "listen",
+            StepKind::AcceptHandshake => "accept_handshake",
+            StepKind::ServeChainSync => "serve_chain_sync",
+            StepKind::CloseListener => "close_listener",
         }
+    }
+
+    pub fn is_client_side(self) -> bool {
+        matches!(
+            self,
+            StepKind::Connect
+                | StepKind::Handshake
+                | StepKind::ChainSync
+                | StepKind::BlockFetch
+                | StepKind::QueryTip
+                | StepKind::Disconnect
+        )
+    }
+
+    pub fn is_server_side(self) -> bool {
+        matches!(
+            self,
+            StepKind::Listen
+                | StepKind::AcceptHandshake
+                | StepKind::ServeChainSync
+                | StepKind::CloseListener
+        )
     }
 }
 
@@ -120,6 +158,18 @@ pub struct StepParams {
     /// Repeat: inner steps to execute each iteration. Parsed eagerly at load
     /// time so the validator can recurse into the body.
     pub body: Option<Vec<StepDef>>,
+
+    // ── Server-side params ────────────────────────────────────────────────────
+
+    /// Listen: address to bind. Default `"0.0.0.0:3001"`.
+    pub bind_address: Option<String>,
+
+    /// ServeChainSync: path to the fixture JSONL file (required).
+    pub fixture_path: Option<String>,
+
+    /// ServeChainSync: seconds to hold in MustReply at tip before closing.
+    /// Default 30, max 300.
+    pub await_at_tip_secs: Option<u64>,
 }
 
 /// How Block-Fetch obtains its point list.
@@ -171,6 +221,18 @@ pub fn load(path: &std::path::Path) -> anyhow::Result<Scenario> {
 /// Validate scenario-level constraints that serde cannot enforce.
 pub fn validate(scenario: &Scenario) -> anyhow::Result<()> {
     let mut errors: Vec<String> = Vec::new();
+
+    // A scenario is either client-mode or server-mode — the two must not mix.
+    let has_client = scenario.steps.iter().any(|s| s.kind.is_client_side());
+    let has_server = scenario.steps.iter().any(|s| s.kind.is_server_side());
+    if has_client && has_server {
+        errors.push(
+            "scenario mixes client-side steps (connect/handshake/…) and server-side \
+             steps (listen/accept_handshake/…) — these must not appear in the same scenario"
+                .into(),
+        );
+    }
+
     validate_steps(&scenario.steps, &mut errors, &mut false);
     if !errors.is_empty() {
         anyhow::bail!(
@@ -264,6 +326,21 @@ fn validate_step(
                     }
                     Err(e) => errors.push(format!("{pos}: invalid body: {e}")),
                 },
+            }
+        }
+
+        StepKind::Listen | StepKind::AcceptHandshake | StepKind::CloseListener => {
+            // No required params for these steps.
+        }
+
+        StepKind::ServeChainSync => {
+            if step.raw_params.get("fixture_path").is_none() {
+                errors.push(format!("{pos}: serve_chain_sync requires fixture_path"));
+            }
+            if let Some(secs) = step.raw_params.get("await_at_tip_secs").and_then(|v| v.as_u64()) {
+                if secs > 300 {
+                    errors.push(format!("{pos}: await_at_tip_secs {secs} exceeds maximum of 300"));
+                }
             }
         }
     }
