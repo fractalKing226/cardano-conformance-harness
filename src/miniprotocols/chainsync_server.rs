@@ -1,41 +1,135 @@
 use std::time::{Duration, Instant};
 
-use pallas_network::miniprotocols::chainsync::{ClientRequest, N2NServer, Tip};
+use pallas_codec::minicbor;
+use pallas_network::miniprotocols::chainsync::{HeaderContent, Message, Tip};
 use pallas_network::miniprotocols::Point;
+use pallas_network::multiplexer::{AgentChannel, Error as PlexerError, MAX_SEGMENT_PAYLOAD_LENGTH};
 use serde_json::json;
 use tracing::{debug, info, warn};
 
-use crate::scenario::fixture::{Cursor, FixtureChain};
+use crate::scenario::fixture::{Cursor, FixtureChain, encode_hex};
+use crate::scenario::response_rules::{HeaderSource, On, ScriptRule, ScriptSend, TipSpec};
 use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
 
 const MINI_PROTOCOL: &str = "chain-sync";
+
+// ── Protocol state tracker ────────────────────────────────────────────────────
+
+/// Independent protocol state tracker for trace annotation.
+///
+/// The serve loop maintains this explicitly because `enqueue_chunk` bypasses
+/// Pallas's typed state machine. If a rule sends a message that is illegal in
+/// the tracked state, the annotation reflects that — which is exactly the
+/// diagnostic information a verifier needs to detect protocol violations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerCsState {
+    Idle,
+    Intersect,
+    CanAwait,
+    MustReply,
+    Done,
+}
+
+impl ServerCsState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServerCsState::Idle      => "Idle",
+            ServerCsState::Intersect => "Intersect",
+            ServerCsState::CanAwait  => "CanAwait",
+            ServerCsState::MustReply => "MustReply",
+            ServerCsState::Done      => "Done",
+        }
+    }
+
+    fn after_receive(self, msg: &ReceivedRequest) -> Self {
+        match msg {
+            ReceivedRequest::FindIntersect(_) => ServerCsState::Intersect,
+            ReceivedRequest::RequestNext       => ServerCsState::CanAwait,
+            ReceivedRequest::Done              => ServerCsState::Done,
+        }
+    }
+
+    fn after_send(self, send: &ScriptSend) -> Self {
+        match send {
+            ScriptSend::IntersectFound { .. }
+            | ScriptSend::IntersectNotFound { .. }
+            | ScriptSend::RollForward { .. }
+            | ScriptSend::RollBackward { .. }
+            | ScriptSend::CursorFindIntersect
+            | ScriptSend::CursorAdvance         => ServerCsState::Idle,
+            ScriptSend::AwaitReply { .. }        => ServerCsState::MustReply,
+            ScriptSend::Disconnect               => ServerCsState::Done,
+            // Wait and RawBytes don't change the tracked state.
+            ScriptSend::Wait { .. }
+            | ScriptSend::RawBytes { .. }        => self,
+        }
+    }
+}
+
+// ── Incoming request ──────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum ReceivedRequest {
+    FindIntersect(Vec<Point>),
+    RequestNext,
+    Done,
+}
+
+impl ReceivedRequest {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            ReceivedRequest::FindIntersect(_) => "find_intersect",
+            ReceivedRequest::RequestNext       => "request_next",
+            ReceivedRequest::Done              => "done",
+        }
+    }
+
+    fn matches_on(&self, on: &On) -> bool {
+        matches!(on, On::Any) || match (self, on) {
+            (ReceivedRequest::FindIntersect(_), On::FindIntersect) => true,
+            (ReceivedRequest::RequestNext, On::RequestNext)         => true,
+            (ReceivedRequest::Done, On::Done)                       => true,
+            _ => false,
+        }
+    }
+}
+
+// ── Summary ───────────────────────────────────────────────────────────────────
 
 pub struct ChainSyncServerSummary {
     pub headers_served: u64,
     pub intersects_handled: u64,
     pub await_triggered: bool,
+    pub rules_applied: u64,
     pub exit_reason: String,
     pub duration_ms: u64,
 }
 
-/// Serve a fixture chain to one connected Chain-Sync client.
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+/// Execute a response script on a raw Chain-Sync channel.
 ///
-/// The caller passes the already-constructed `N2NServer` (obtained from
-/// `PeerServer.chainsync` after a successful handshake). The server reads its
-/// entire behavioral contract — fixture content and tip-hold duration — from
-/// the `chain` and `await_timeout` arguments. No chain content or timing is
-/// hard-coded here.
-pub async fn run_chain_sync_server(
-    server: &mut N2NServer,
-    chain: &FixtureChain,
-    await_timeout: Duration,
+/// This is the single execution path for both fixture-generated honest scripts
+/// and user-specified adversarial scripts. The `rules` slice is consumed in
+/// order; `cursor` and `fixture` are only consulted by `CursorFindIntersect`
+/// and `CursorAdvance` rules.
+///
+/// All sends use `enqueue_chunk` directly, bypassing Pallas's typed state
+/// machine. The harness has no opinion on whether a rule is spec-correct.
+pub async fn execute_response_script(
+    channel: &mut AgentChannel,
+    rules: &[ScriptRule],
+    fixture: Option<&FixtureChain>,
     tracer: &Tracer,
 ) -> anyhow::Result<ChainSyncServerSummary> {
     let started_at = Instant::now();
-    let mut cursor = Cursor::new(chain);
+    let mut state = ServerCsState::Idle;
     let mut headers_served: u64 = 0;
     let mut intersects_handled: u64 = 0;
     let mut await_triggered = false;
+    let mut rules_applied: u64 = 0;
+    let mut rule_idx = 0usize;
+    let mut cursor = fixture.map(Cursor::new);
 
     tracer
         .emit(
@@ -43,8 +137,8 @@ pub async fn run_chain_sync_server(
                 EventKind::ServerChainSyncStarted,
                 Direction::Internal,
                 json!({
-                    "fixture_entries": chain.entries.len(),
-                    "await_timeout_secs": await_timeout.as_secs(),
+                    "script_rules": rules.len(),
+                    "fixture_entries": fixture.map(|f| f.entries.len()),
                 }),
             )
             .with_protocol(MINI_PROTOCOL),
@@ -52,236 +146,94 @@ pub async fn run_chain_sync_server(
         .await?;
 
     loop {
-        // `recv_while_idle` returns Ok(None) when client sends MsgDone.
-        let request = match server.recv_while_idle().await {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                // Client sent MsgDone — clean close.
-                debug!("Chain-Sync client sent Done");
-                break;
-            }
+        // Receive the next message from the client.
+        let request = match recv_request(channel).await {
+            Ok(r) => r,
             Err(e) => {
-                warn!("Chain-Sync recv_while_idle error: {e}");
-                let summary = build_summary(
-                    headers_served, intersects_handled, await_triggered,
-                    started_at, "recv_error",
-                );
-                emit_server_summary(tracer, &summary).await;
-                return Err(anyhow::anyhow!("recv_while_idle failed: {e}"));
+                warn!("Chain-Sync server recv error: {e}");
+                break;
             }
         };
 
-        match request {
-            ClientRequest::Intersect(points) => {
-                intersects_handled += 1;
-                let tip = cursor.tip();
+        let state_before = state;
+        state = state.after_receive(&request);
 
-                // Log the received FindIntersect (direction: received — peer sent it to us).
-                let point_values: Vec<serde_json::Value> = points
-                    .iter()
-                    .map(|p| format_point(p))
-                    .collect();
-                tracer
-                    .emit(
-                        TraceEvent::new(
-                            EventKind::ChainSyncFindIntersect,
-                            Direction::Received,
-                            json!({ "points": point_values }),
-                        )
-                        .with_states(MINI_PROTOCOL, "Idle", "Intersect"),
-                    )
-                    .await?;
+        // Emit receive event with direction: received.
+        emit_receive_event(tracer, &request, state_before, state).await?;
 
-                match cursor.find_intersect(&points) {
-                    Some(pos) => {
-                        cursor.set_pos(pos);
-                        let found_point = cursor.current_point();
-                        info!("IntersectFound at pos {pos}");
-                        server
-                            .send_intersect_found(found_point.clone(), tip.clone())
-                            .await
-                            .map_err(|e| anyhow::anyhow!("send_intersect_found failed: {e}"))?;
-                        tracer
-                            .emit(
-                                TraceEvent::new(
-                                    EventKind::ChainSyncIntersectFound,
-                                    Direction::Sent,
-                                    json!({
-                                        "point": format_point(&found_point),
-                                        "tip":   format_tip(&tip),
-                                    }),
-                                )
-                                .with_states(MINI_PROTOCOL, "Intersect", "Idle"),
-                            )
-                            .await?;
-                    }
-                    None => {
-                        info!("IntersectNotFound — no match in fixture");
-                        server
-                            .send_intersect_not_found(tip.clone())
-                            .await
-                            .map_err(|e| anyhow::anyhow!("send_intersect_not_found failed: {e}"))?;
-                        tracer
-                            .emit(
-                                TraceEvent::new(
-                                    EventKind::ChainSyncIntersectNotFound,
-                                    Direction::Sent,
-                                    json!({ "tip": format_tip(&tip) }),
-                                )
-                                .with_states(MINI_PROTOCOL, "Intersect", "Idle"),
-                            )
-                            .await?;
-                    }
-                }
+        // MsgDone — client closed session cleanly.
+        if matches!(request, ReceivedRequest::Done) {
+            break;
+        }
+
+        // Find the next unconsumed matching rule.
+        let rule_pos = rules[rule_idx..]
+            .iter()
+            .position(|r| request.matches_on(&r.on))
+            .map(|p| p + rule_idx);
+
+        let rule = match rule_pos {
+            Some(pos) => {
+                rule_idx = pos + 1;
+                &rules[pos]
             }
-
-            ClientRequest::RequestNext => {
-                // Log the received RequestNext (direction: received — peer sent it).
-                tracer
-                    .emit(
-                        TraceEvent::new(
-                            EventKind::ChainSyncRequestNext,
-                            Direction::Received,
-                            json!({ "headers_served_so_far": headers_served }),
-                        )
-                        .with_states(MINI_PROTOCOL, "Idle", "CanAwait"),
-                    )
-                    .await?;
-
-                let tip = cursor.tip();
-
-                match cursor.advance() {
-                    Some(entry) => {
-                        // Send the next header.
-                        let point = Point::Specific(
-                            entry.slot,
-                            decode_hex(&entry.block_hash),
-                        );
-                        let header_content = make_header_content(&entry.cbor_hex);
-                        server
-                            .send_roll_forward(header_content, tip.clone())
-                            .await
-                            .map_err(|e| anyhow::anyhow!("send_roll_forward failed: {e}"))?;
-                        headers_served += 1;
-                        tracer
-                            .emit(
-                                TraceEvent::new(
-                                    EventKind::ChainSyncRollForward,
-                                    Direction::Sent,
-                                    json!({
-                                        "slot":         entry.slot,
-                                        "block_hash":   entry.block_hash,
-                                        "block_number": entry.block_number,
-                                        "cbor_len":     entry.cbor_hex.len() / 2,
-                                        "tip":          format_tip(&tip),
-                                    }),
-                                )
-                                .with_states(MINI_PROTOCOL, "CanAwait", "Idle"),
-                            )
-                            .await?;
-                        debug!(headers_served, slot = entry.slot, "Served header");
-                    }
-                    None => {
-                        // At tip — send AwaitReply, hold, then close.
-                        await_triggered = true;
-                        info!(
-                            timeout_secs = await_timeout.as_secs(),
-                            "At fixture tip — sending AwaitReply"
-                        );
-                        server
-                            .send_await_reply()
-                            .await
-                            .map_err(|e| anyhow::anyhow!("send_await_reply failed: {e}"))?;
-                        tracer
-                            .emit(
-                                TraceEvent::new(
-                                    EventKind::ChainSyncAwaitReply,
-                                    Direction::Sent,
-                                    json!({ "hold_secs": await_timeout.as_secs() }),
-                                )
-                                .with_states(MINI_PROTOCOL, "CanAwait", "MustReply"),
-                            )
-                            .await?;
-
-                        // Hold in MustReply for the configured duration, then close.
-                        tokio::time::sleep(await_timeout).await;
-                        info!("Await timeout reached — closing session");
-                        break;
-                    }
-                }
+            None => {
+                anyhow::bail!(
+                    "serve_chain_sync: no matching rule for {:?} (exhausted {} rules)",
+                    request.kind_str(),
+                    rules.len()
+                );
             }
+        };
+
+        // Emit ResponseRuleApplied before executing.
+        tracer
+            .emit(TraceEvent::new(
+                EventKind::ResponseRuleApplied,
+                Direction::Internal,
+                json!({
+                    "rule_index":  rule_pos.unwrap_or(0),
+                    "on":          rule.on_str(),
+                    "send":        rule.send.kind_str(),
+                }),
+            ))
+            .await?;
+        rules_applied += 1;
+
+        let state_before_send = state;
+
+        // Execute the rule.
+        let done = execute_send(
+            rule,
+            &request,
+            channel,
+            cursor.as_mut(),
+            fixture,
+            tracer,
+            state_before_send,
+            &mut headers_served,
+            &mut intersects_handled,
+            &mut await_triggered,
+        )
+        .await?;
+
+        state = state.after_send(&rule.send);
+
+        if done {
+            break;
         }
     }
 
-    let summary = build_summary(
-        headers_served, intersects_handled, await_triggered,
-        started_at, "completed",
-    );
-    emit_server_summary(tracer, &summary).await;
-
-    info!(
-        headers_served = summary.headers_served,
-        duration_ms = summary.duration_ms,
-        "Chain-Sync server session complete"
-    );
-
-    Ok(summary)
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn format_point(point: &Point) -> serde_json::Value {
-    match point {
-        Point::Origin => serde_json::json!("origin"),
-        Point::Specific(slot, hash) => serde_json::json!({
-            "slot": slot,
-            "hash": encode_hex(hash),
-        }),
-    }
-}
-
-fn format_tip(tip: &Tip) -> serde_json::Value {
-    let Tip(point, block_number) = tip;
-    serde_json::json!({ "point": format_point(point), "block_number": block_number })
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn decode_hex(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .filter_map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
-}
-
-fn make_header_content(cbor_hex: &str) -> pallas_network::miniprotocols::chainsync::HeaderContent {
-    pallas_network::miniprotocols::chainsync::HeaderContent {
-        variant: 6, // Conway — appropriate for fixture-replayed headers
-        byron_prefix: None,
-        cbor: decode_hex(cbor_hex),
-    }
-}
-
-fn build_summary(
-    headers_served: u64,
-    intersects_handled: u64,
-    await_triggered: bool,
-    started_at: Instant,
-    exit_reason: &str,
-) -> ChainSyncServerSummary {
-    ChainSyncServerSummary {
+    let summary = ChainSyncServerSummary {
         headers_served,
         intersects_handled,
         await_triggered,
-        exit_reason: exit_reason.to_string(),
+        rules_applied,
+        exit_reason: "completed".into(),
         duration_ms: started_at.elapsed().as_millis() as u64,
-    }
-}
+    };
 
-async fn emit_server_summary(tracer: &Tracer, summary: &ChainSyncServerSummary) {
-    let _ = tracer
+    tracer
         .emit(
             TraceEvent::new(
                 EventKind::ServerChainSyncCompleted,
@@ -290,11 +242,430 @@ async fn emit_server_summary(tracer: &Tracer, summary: &ChainSyncServerSummary) 
                     "headers_served":     summary.headers_served,
                     "intersects_handled": summary.intersects_handled,
                     "await_triggered":    summary.await_triggered,
+                    "rules_applied":      summary.rules_applied,
                     "exit_reason":        summary.exit_reason,
                     "duration_ms":        summary.duration_ms,
                 }),
             )
             .with_protocol(MINI_PROTOCOL),
         )
-        .await;
+        .await?;
+
+    info!(
+        headers_served,
+        rules_applied,
+        duration_ms = summary.duration_ms,
+        "Chain-Sync server session complete"
+    );
+
+    Ok(summary)
+}
+
+// ── Send execution ────────────────────────────────────────────────────────────
+
+/// Execute one scripted send. Returns `true` if the session should end.
+#[allow(clippy::too_many_arguments)]
+async fn execute_send(
+    rule: &ScriptRule,
+    request: &ReceivedRequest,
+    channel: &mut AgentChannel,
+    cursor: Option<&mut Cursor<'_>>,
+    fixture: Option<&FixtureChain>,
+    tracer: &Tracer,
+    state_before: ServerCsState,
+    headers_served: &mut u64,
+    intersects_handled: &mut u64,
+    await_triggered: &mut bool,
+) -> anyhow::Result<bool> {
+    match &rule.send {
+        ScriptSend::CursorFindIntersect => {
+            let cursor = cursor.ok_or_else(|| anyhow::anyhow!("CursorFindIntersect with no fixture"))?;
+            *intersects_handled += 1;
+            let tip = cursor.tip();
+            let points = match request {
+                ReceivedRequest::FindIntersect(pts) => pts.as_slice(),
+                _ => &[],
+            };
+            match cursor.find_intersect(points) {
+                Some(pos) => {
+                    cursor.set_pos(pos);
+                    let found_pt = cursor.current_point();
+                    let msg = Message::<HeaderContent>::IntersectFound(found_pt.clone(), tip.clone());
+                    send_message(channel, &msg).await?;
+                    tracer
+                        .emit(
+                            TraceEvent::new(
+                                EventKind::ChainSyncIntersectFound,
+                                Direction::Sent,
+                                json!({
+                                    "point": crate::miniprotocols::chainsync::format_point(&found_pt),
+                                    "tip":   format_tip(&tip),
+                                }),
+                            )
+                            .with_states(MINI_PROTOCOL, state_before.as_str(), "Idle"),
+                        )
+                        .await?;
+                }
+                None => {
+                    let msg = Message::<HeaderContent>::IntersectNotFound(tip.clone());
+                    send_message(channel, &msg).await?;
+                    tracer
+                        .emit(
+                            TraceEvent::new(
+                                EventKind::ChainSyncIntersectNotFound,
+                                Direction::Sent,
+                                json!({ "tip": format_tip(&tip) }),
+                            )
+                            .with_states(MINI_PROTOCOL, state_before.as_str(), "Idle"),
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        ScriptSend::CursorAdvance => {
+            let cursor = cursor.ok_or_else(|| anyhow::anyhow!("CursorAdvance with no fixture"))?;
+            let tip = cursor.tip();
+            match cursor.advance() {
+                Some(entry) => {
+                    let hc = entry_to_header_content(entry);
+                    let msg = Message::RollForward(hc, tip.clone());
+                    send_message(channel, &msg).await?;
+                    *headers_served += 1;
+                    debug!(slot = entry.slot, "Served header via CursorAdvance");
+                    tracer
+                        .emit(
+                            TraceEvent::new(
+                                EventKind::ChainSyncRollForward,
+                                Direction::Sent,
+                                json!({
+                                    "slot":         entry.slot,
+                                    "block_hash":   entry.block_hash,
+                                    "block_number": entry.block_number,
+                                    "cbor_len":     entry.cbor_hex.len() / 2,
+                                    "tip":          format_tip(&tip),
+                                }),
+                            )
+                            .with_states(MINI_PROTOCOL, state_before.as_str(), "Idle"),
+                        )
+                        .await?;
+                }
+                None => {
+                    // Cursor at tip — send AwaitReply (same as AwaitReply with hold=0).
+                    *await_triggered = true;
+                    let msg = Message::<HeaderContent>::AwaitReply;
+                    send_message(channel, &msg).await?;
+                    tracer
+                        .emit(
+                            TraceEvent::new(
+                                EventKind::ChainSyncAwaitReply,
+                                Direction::Sent,
+                                json!({ "hold_secs": 0 }),
+                            )
+                            .with_states(MINI_PROTOCOL, state_before.as_str(), "MustReply"),
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        ScriptSend::RollForward { source, tip } => {
+            let fixture_tip = fixture.map(|f| f.tip());
+            let wire_tip = tip_spec_to_tip(tip.as_ref(), fixture_tip.as_ref());
+            let hc = header_source_to_content(source);
+            let (slot, hash, block_number) = extract_header_info(source);
+            let msg = Message::RollForward(hc, wire_tip.clone());
+            send_message(channel, &msg).await?;
+            *headers_served += 1;
+            tracer
+                .emit(
+                    TraceEvent::new(
+                        EventKind::ChainSyncRollForward,
+                        Direction::Sent,
+                        json!({
+                            "slot":         slot,
+                            "block_hash":   hash,
+                            "block_number": block_number,
+                            "tip":          format_tip(&wire_tip),
+                        }),
+                    )
+                    .with_states(MINI_PROTOCOL, state_before.as_str(), "Idle"),
+                )
+                .await?;
+        }
+
+        ScriptSend::RollBackward { point, tip } => {
+            let fixture_tip = fixture.map(|f| f.tip());
+            let wire_tip = tip_spec_to_tip(tip.as_ref(), fixture_tip.as_ref());
+            let pt = parse_point_str(point)?;
+            let msg = Message::<HeaderContent>::RollBackward(pt.clone(), wire_tip.clone());
+            send_message(channel, &msg).await?;
+            tracer
+                .emit(
+                    TraceEvent::new(
+                        EventKind::ChainSyncRollBackward,
+                        Direction::Sent,
+                        json!({
+                            "rollback_to": crate::miniprotocols::chainsync::format_point(&pt),
+                            "tip":         format_tip(&wire_tip),
+                        }),
+                    )
+                    .with_states(MINI_PROTOCOL, state_before.as_str(), "Idle"),
+                )
+                .await?;
+        }
+
+        ScriptSend::IntersectFound { point, tip } => {
+            let fixture_tip = fixture.map(|f| f.tip());
+            let wire_tip = tip_spec_to_tip(tip.as_ref(), fixture_tip.as_ref());
+            let pt = parse_point_str(point)?;
+            let msg = Message::<HeaderContent>::IntersectFound(pt.clone(), wire_tip.clone());
+            send_message(channel, &msg).await?;
+            *intersects_handled += 1;
+            tracer
+                .emit(
+                    TraceEvent::new(
+                        EventKind::ChainSyncIntersectFound,
+                        Direction::Sent,
+                        json!({
+                            "point": crate::miniprotocols::chainsync::format_point(&pt),
+                            "tip":   format_tip(&wire_tip),
+                        }),
+                    )
+                    .with_states(MINI_PROTOCOL, state_before.as_str(), "Idle"),
+                )
+                .await?;
+        }
+
+        ScriptSend::IntersectNotFound { tip } => {
+            let fixture_tip = fixture.map(|f| f.tip());
+            let wire_tip = tip_spec_to_tip(tip.as_ref(), fixture_tip.as_ref());
+            let msg = Message::<HeaderContent>::IntersectNotFound(wire_tip.clone());
+            send_message(channel, &msg).await?;
+            tracer
+                .emit(
+                    TraceEvent::new(
+                        EventKind::ChainSyncIntersectNotFound,
+                        Direction::Sent,
+                        json!({ "tip": format_tip(&wire_tip) }),
+                    )
+                    .with_states(MINI_PROTOCOL, state_before.as_str(), "Idle"),
+                )
+                .await?;
+        }
+
+        ScriptSend::AwaitReply { hold_secs } => {
+            *await_triggered = true;
+            let msg = Message::<HeaderContent>::AwaitReply;
+            send_message(channel, &msg).await?;
+            tracer
+                .emit(
+                    TraceEvent::new(
+                        EventKind::ChainSyncAwaitReply,
+                        Direction::Sent,
+                        json!({ "hold_secs": hold_secs }),
+                    )
+                    .with_states(MINI_PROTOCOL, state_before.as_str(), "MustReply"),
+                )
+                .await?;
+            if *hold_secs > 0 {
+                tokio::time::sleep(Duration::from_secs(*hold_secs)).await;
+            }
+        }
+
+        ScriptSend::Wait { duration_secs } => {
+            info!(secs = duration_secs, "Script wait");
+            tokio::time::sleep(Duration::from_secs(*duration_secs)).await;
+            // No wire event emitted; no state change.
+            return Ok(false);
+        }
+
+        ScriptSend::Disconnect => {
+            info!("Script disconnect — closing channel");
+            return Ok(true);
+        }
+
+        ScriptSend::RawBytes { bytes } => {
+            send_raw(channel, bytes).await?;
+            tracer
+                .emit(TraceEvent::new(
+                    EventKind::Error, // reuse Error kind as "unexpected wire bytes"
+                    Direction::Sent,
+                    json!({
+                        "phase":    "raw_bytes",
+                        "hex":      encode_hex(bytes),
+                        "byte_len": bytes.len(),
+                    }),
+                ))
+                .await?;
+        }
+    }
+    Ok(false)
+}
+
+// ── Raw channel I/O ───────────────────────────────────────────────────────────
+
+/// Receive one complete Chain-Sync message from the raw channel.
+async fn recv_request(channel: &mut AgentChannel) -> anyhow::Result<ReceivedRequest> {
+    let mut buf = Vec::new();
+    loop {
+        let chunk = channel.dequeue_chunk().await
+            .map_err(|e: PlexerError| anyhow::anyhow!("channel recv: {e}"))?;
+        buf.extend_from_slice(&chunk);
+        let mut decoder = minicbor::Decoder::new(&buf);
+        match decoder.decode::<Message<HeaderContent>>() {
+            Ok(msg) => {
+                return Ok(match msg {
+                    Message::FindIntersect(pts) => ReceivedRequest::FindIntersect(pts),
+                    Message::RequestNext        => ReceivedRequest::RequestNext,
+                    Message::Done               => ReceivedRequest::Done,
+                    other => anyhow::bail!(
+                        "unexpected Chain-Sync client message in server loop: {other:?}"
+                    ),
+                });
+            }
+            Err(ref e) if e.is_end_of_input() => {
+                // Incomplete — wait for more chunks.
+                continue;
+            }
+            Err(e) => anyhow::bail!("Chain-Sync decode error: {e}"),
+        }
+    }
+}
+
+/// CBOR-encode a Chain-Sync message and send it as one or more chunks.
+async fn send_message(
+    channel: &mut AgentChannel,
+    msg: &Message<HeaderContent>,
+) -> anyhow::Result<()> {
+    let bytes = minicbor::to_vec(msg)
+        .map_err(|e| anyhow::anyhow!("CBOR encode: {e}"))?;
+    send_raw(channel, &bytes).await
+}
+
+/// Send arbitrary bytes, chunking at the multiplexer segment limit.
+pub async fn send_raw(channel: &mut AgentChannel, bytes: &[u8]) -> anyhow::Result<()> {
+    for chunk in bytes.chunks(MAX_SEGMENT_PAYLOAD_LENGTH) {
+        channel
+            .enqueue_chunk(chunk.to_vec())
+            .await
+            .map_err(|e: PlexerError| anyhow::anyhow!("channel send: {e}"))?;
+    }
+    Ok(())
+}
+
+// ── Receive event emission ────────────────────────────────────────────────────
+
+async fn emit_receive_event(
+    tracer: &Tracer,
+    request: &ReceivedRequest,
+    state_before: ServerCsState,
+    state_after: ServerCsState,
+) -> anyhow::Result<()> {
+    match request {
+        ReceivedRequest::FindIntersect(pts) => {
+            let point_values: Vec<serde_json::Value> = pts
+                .iter()
+                .map(|p| crate::miniprotocols::chainsync::format_point(p))
+                .collect();
+            tracer
+                .emit(
+                    TraceEvent::new(
+                        EventKind::ChainSyncFindIntersect,
+                        Direction::Received,
+                        json!({ "points": point_values }),
+                    )
+                    .with_states(MINI_PROTOCOL, state_before.as_str(), state_after.as_str()),
+                )
+                .await?;
+        }
+        ReceivedRequest::RequestNext => {
+            tracer
+                .emit(
+                    TraceEvent::new(
+                        EventKind::ChainSyncRequestNext,
+                        Direction::Received,
+                        json!({}),
+                    )
+                    .with_states(MINI_PROTOCOL, state_before.as_str(), state_after.as_str()),
+                )
+                .await?;
+        }
+        ReceivedRequest::Done => {
+            tracer
+                .emit(
+                    TraceEvent::new(
+                        EventKind::ChainSyncDone,
+                        Direction::Received,
+                        json!({}),
+                    )
+                    .with_states(MINI_PROTOCOL, state_before.as_str(), state_after.as_str()),
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn format_tip(tip: &Tip) -> serde_json::Value {
+    let Tip(point, block_number) = tip;
+    json!({
+        "point":        crate::miniprotocols::chainsync::format_point(point),
+        "block_number": block_number,
+    })
+}
+
+fn zero_tip() -> Tip {
+    Tip(Point::Origin, 0)
+}
+
+fn tip_spec_to_tip(spec: Option<&TipSpec>, fixture_tip: Option<&Tip>) -> Tip {
+    match spec {
+        Some(s) => {
+            let pt = parse_point_str(&s.point).unwrap_or(Point::Origin);
+            Tip(pt, s.block_number)
+        }
+        None => fixture_tip.cloned().unwrap_or_else(zero_tip),
+    }
+}
+
+fn parse_point_str(s: &str) -> anyhow::Result<Point> {
+    crate::scenario::parse_point(s)
+}
+
+fn entry_to_header_content(
+    entry: &crate::scenario::fixture::FixtureEntry,
+) -> HeaderContent {
+    HeaderContent {
+        variant: entry.variant,
+        byron_prefix: None,
+        cbor: decode_hex_str(&entry.cbor_hex),
+    }
+}
+
+fn header_source_to_content(source: &HeaderSource) -> HeaderContent {
+    match source {
+        HeaderSource::FixtureEntry(entry) => entry_to_header_content(entry),
+        HeaderSource::Literal { cbor, variant } => HeaderContent {
+            variant: *variant,
+            byron_prefix: None,
+            cbor: cbor.clone(),
+        },
+    }
+}
+
+fn extract_header_info(source: &HeaderSource) -> (u64, String, u64) {
+    match source {
+        HeaderSource::FixtureEntry(e) => (e.slot, e.block_hash.clone(), e.block_number),
+        HeaderSource::Literal { .. }  => (0, String::new(), 0),
+    }
+}
+
+fn decode_hex_str(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }

@@ -1,4 +1,5 @@
 pub mod fixture;
+pub mod response_rules;
 pub mod runner;
 pub mod vars;
 
@@ -164,11 +165,18 @@ pub struct StepParams {
     /// Listen: address to bind. Default `"0.0.0.0:3001"`.
     pub bind_address: Option<String>,
 
-    /// ServeChainSync: path to the fixture JSONL file (required).
+    /// ServeChainSync: path to the fixture JSONL file.
+    /// Mutually exclusive with `responses`.
     pub fixture_path: Option<String>,
 
+    /// ServeChainSync: explicit response rule list.
+    /// Mutually exclusive with `fixture_path`.
+    /// Each element is a JSON object matching the `ResponseRuleDef` schema.
+    pub responses: Option<Vec<serde_json::Value>>,
+
     /// ServeChainSync: seconds to hold in MustReply at tip before closing.
-    /// Default 30, max 300.
+    /// Default 30, max 300. Only used when `fixture_path` is set (the auto-
+    /// generated script uses this for its AwaitReply rule).
     pub await_at_tip_secs: Option<u64>,
 }
 
@@ -334,9 +342,15 @@ fn validate_step(
         }
 
         StepKind::ServeChainSync => {
-            if step.raw_params.get("fixture_path").is_none() {
-                errors.push(format!("{pos}: serve_chain_sync requires fixture_path"));
+            let has_fixture   = step.raw_params.get("fixture_path").is_some();
+            let has_responses = step.raw_params.get("responses").is_some();
+            if !has_fixture && !has_responses {
+                errors.push(format!(
+                    "{pos}: serve_chain_sync requires fixture_path, responses, or both"
+                ));
             }
+            // fixture_path + responses is allowed: responses drives the script,
+            // fixture_path is loaded to resolve header_from_fixture references.
             if let Some(secs) = step.raw_params.get("await_at_tip_secs").and_then(|v| v.as_u64()) {
                 if secs > 300 {
                     errors.push(format!("{pos}: await_at_tip_secs {secs} exceeds maximum of 300"));

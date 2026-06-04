@@ -70,6 +70,9 @@ pub enum EventKind {
     // Peer-Sharing mini-protocol (not yet supported in pallas-network 0.36.0)
     PeerSharingMessage,
 
+    // Scripted response execution
+    ResponseRuleApplied,
+
     // Server-side lifecycle
     ServerBearerAccepted,
     ServerListenStarted,

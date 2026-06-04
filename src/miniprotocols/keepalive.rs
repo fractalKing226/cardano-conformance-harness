@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use pallas_network::miniprotocols::keepalive;
+use pallas_network::miniprotocols::keepalive::{self, Server as KaServer};
 use serde_json::json;
 
 use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
@@ -62,5 +62,20 @@ pub async fn run_keepalive(mut client: keepalive::Client, tracer: Tracer, interv
                 .with_protocol(MINI_PROTOCOL),
             )
             .await;
+    }
+}
+
+/// Server-side keep-alive: respond to MsgKeepAlive pings from the peer.
+/// As the TCP acceptor (responder), we echo cookies back.
+pub async fn run_keepalive_server(mut server: KaServer) {
+    loop {
+        if let Err(e) = server.recv_keepalive_request().await {
+            tracing::debug!("keepalive server recv failed (connection closed): {e}");
+            break;
+        }
+        if let Err(e) = server.send_keepalive_response().await {
+            tracing::debug!("keepalive server send failed (connection closed): {e}");
+            break;
+        }
     }
 }

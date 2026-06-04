@@ -1,0 +1,42 @@
+{
+  "name": "scripted_out_of_state_intersect",
+  "description": "Explicit responses list with an out-of-state send: after 2 RollForwards, the harness sends IntersectFound in response to a RequestNext — illegal from CanAwait state. The harness sends it anyway; the verifier reading both traces can detect the violation.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3001" },
+    { "kind": "accept_handshake" },
+    {
+      "kind": "serve_chain_sync",
+      "fixture_path": "fixtures/devnet_genesis.jsonl",
+      "responses": [
+        {
+          "on": "find_intersect",
+          "send": { "kind": "intersect_found", "point": "origin" }
+        },
+        {
+          "on": "request_next",
+          "send": { "kind": "roll_forward", "header_from_fixture": 0 }
+        },
+        {
+          "on": "request_next",
+          "send": { "kind": "roll_forward", "header_from_fixture": 1 }
+        },
+        {
+          "on": "request_next",
+          "send": {
+            "kind": "intersect_found",
+            "point": "origin"
+          }
+        },
+        {
+          "on": "any",
+          "send": { "kind": "disconnect" }
+        }
+      ]
+    },
+    { "kind": "close_listener" }
+  ]
+}

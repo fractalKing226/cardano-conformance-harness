@@ -21,6 +21,14 @@ use serde::{Deserialize, Serialize};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+/// Era variant byte used when no `variant` field is present in a legacy fixture.
+/// Update this constant when Cardano introduces a new era.
+pub const DEFAULT_HEADER_VARIANT: u8 = 6; // Conway
+
+fn default_header_variant() -> u8 {
+    DEFAULT_HEADER_VARIANT
+}
+
 /// One captured block header — the wire-level record in a fixture file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FixtureEntry {
@@ -28,6 +36,10 @@ pub struct FixtureEntry {
     pub block_hash: String,  // lowercase hex, 64 chars for a 32-byte hash
     pub block_number: u64,
     pub cbor_hex: String,
+    /// Era variant byte (0=Byron, 6=Conway). Defaults to `DEFAULT_HEADER_VARIANT`
+    /// when loading older fixtures that predate this field.
+    #[serde(default = "default_header_variant")]
+    pub variant: u8,
 }
 
 /// Internal representation of one fixture line during load/save.
@@ -279,18 +291,21 @@ mod tests {
                     block_hash: "aa".repeat(32),
                     block_number: 1,
                     cbor_hex: "deadbeef".into(),
+                    variant: DEFAULT_HEADER_VARIANT,
                 },
                 FixtureEntry {
                     slot: 20,
                     block_hash: "bb".repeat(32),
                     block_number: 2,
                     cbor_hex: "cafebabe".into(),
+                    variant: DEFAULT_HEADER_VARIANT,
                 },
                 FixtureEntry {
                     slot: 30,
                     block_hash: "cc".repeat(32),
                     block_number: 3,
                     cbor_hex: "f00df00d".into(),
+                    variant: DEFAULT_HEADER_VARIANT,
                 },
             ],
         }
@@ -334,7 +349,7 @@ mod tests {
         // same path produces a well-formed file (one anchor, M entries) not a
         // concatenation of two runs (two anchors, N+M entries).
         let tmp = NamedTempFile::new().unwrap();
-        let entry = FixtureEntry { slot: 1, block_hash: "aa".repeat(32), block_number: 1, cbor_hex: "deadbeef".into() };
+        let entry = FixtureEntry { slot: 1, block_hash: "aa".repeat(32), block_number: 1, cbor_hex: "deadbeef".into(), variant: DEFAULT_HEADER_VARIANT };
 
         write_anchor(tmp.path(), &Point::Origin).unwrap();
         append_entry(tmp.path(), &entry).unwrap(); // first run: 1 anchor + 1 entry

@@ -3,11 +3,10 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use pallas_network::facades::PeerServer;
 use pallas_network::miniprotocols::chainsync::{N2NClient, Tip};
 use pallas_network::miniprotocols::handshake::n2n::VersionTable;
-use pallas_network::miniprotocols::handshake::RefuseReason;
-use pallas_network::miniprotocols::{Point, PROTOCOL_N2N_HANDSHAKE};
+use pallas_network::miniprotocols::handshake::{RefuseReason, Server as HandshakeServer};
+use pallas_network::miniprotocols::{Point, PROTOCOL_N2N_HANDSHAKE, PROTOCOL_N2N_KEEP_ALIVE as PROTOCOL_N2N_KEEP_ALIVE_SERVER};
 use pallas_network::multiplexer::{AgentChannel, Bearer, Plexer, RunningPlexer};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -16,9 +15,10 @@ use tracing::info;
 
 use crate::miniprotocols::blockfetch::{run_block_fetch, BLOCK_FETCH_PROTOCOL};
 use crate::miniprotocols::chainsync::{run_chain_sync, CHAIN_SYNC_PROTOCOL};
-use crate::miniprotocols::chainsync_server::run_chain_sync_server;
+use crate::miniprotocols::chainsync_server::execute_response_script;
 use crate::miniprotocols::handshake::handshake_on_channel;
-use crate::miniprotocols::keepalive::{run_keepalive, KEEP_ALIVE_INTERVAL, KEEP_ALIVE_PROTOCOL};
+use crate::scenario::response_rules::{generate_from_fixture, rule_def_to_script};
+use crate::miniprotocols::keepalive::{run_keepalive, run_keepalive_server, KEEP_ALIVE_INTERVAL, KEEP_ALIVE_PROTOCOL};
 use crate::miniprotocols::txsubmission::{run_tx_submission, TX_SUBMISSION_PROTOCOL};
 use crate::scenario::fixture;
 use crate::scenario::vars::{point_to_str, substitute_in_value, VarStore};
@@ -153,8 +153,15 @@ struct RunnerState {
     // ── Server-side state ─────────────────────────────────────────────────────
     /// TCP listener bound by the `listen` step.
     listener: Option<TcpListener>,
-    /// Accepted peer connection (after `accept_handshake`).
-    peer_server: Option<PeerServer>,
+    /// Plexer for the accepted server connection.
+    server_plexer_handle: Option<RunningPlexer>,
+    /// Raw Chain-Sync channel for the accepted connection (consumed by serve_chain_sync).
+    server_cs_channel: Option<AgentChannel>,
+    /// TX_SUBMISSION channel — idle but must stay alive so the demuxer doesn't
+    /// exit when the client sends MsgInit on that channel.
+    server_ts_channel: Option<AgentChannel>,
+    /// Server-side keep-alive background task handle.
+    server_ka_handle: Option<JoinHandle<()>>,
     /// Path to write fixture entries to (from `--capture-fixture` CLI flag).
     capture_fixture: Option<std::path::PathBuf>,
     /// True once the anchor line has been written to the fixture file this run.
@@ -477,6 +484,7 @@ fn execute_step<'a>(
                                 block_hash: fixture::encode_hex(&h.block_hash),
                                 block_number: h.block_number,
                                 cbor_hex: fixture::encode_hex(&h.cbor),
+                                variant: h.variant,
                             };
                             fixture::append_entry(fixture_path, &entry)?;
                         }
@@ -655,11 +663,22 @@ fn execute_step<'a>(
                     ))
                     .await?;
 
-                let mut peer_server = PeerServer::new(bearer);
+                // Phase 1: subscribe all server-side channels, spawn plexer.
+                // We subscribe manually (not via PeerServer) so we retain the raw
+                // AgentChannel for chain-sync, which is needed for execute_response_script.
+                let mut plexer = Plexer::new(bearer);
+                let hs_channel = plexer.subscribe_server(PROTOCOL_N2N_HANDSHAKE);
+                let cs_channel = plexer.subscribe_server(CHAIN_SYNC_PROTOCOL);
+                let ka_channel = plexer.subscribe_server(PROTOCOL_N2N_KEEP_ALIVE_SERVER);
+                // Subscribe TX_SUBMISSION so the demuxer can route frames from the peer.
+                // Must be stored in state — if the AgentChannel is dropped, the demuxer's
+                // send() fails and the entire demuxer task exits, killing all channels.
+                let ts_server_channel = plexer.subscribe_server(TX_SUBMISSION_PROTOCOL);
+                let server_plexer = plexer.spawn();
 
-                // Receive the peer's proposed versions.
-                let client_table = peer_server
-                    .handshake()
+                // Phase 2: complete the handshake as responder.
+                let mut hs = HandshakeServer::<pallas_network::miniprotocols::handshake::n2n::VersionData>::new(hs_channel);
+                let client_table = hs
                     .receive_proposed_versions()
                     .await
                     .context("accept_handshake: receive_proposed_versions failed")?;
@@ -677,34 +696,26 @@ fn execute_step<'a>(
                     ))
                     .await?;
 
-                // Find highest common version. Use client's VersionData to pass
-                // the equality check in Pallas's state machine.
                 let server_supported: Vec<u64> = (7u64..=14).collect();
                 let mut client_pairs: Vec<(u64, _)> =
                     client_table.values.into_iter().collect();
-                client_pairs.sort_by(|a, b| b.0.cmp(&a.0)); // highest first
+                client_pairs.sort_by(|a, b| b.0.cmp(&a.0));
 
-                let best = client_pairs
+                let (version, client_data): (u64, pallas_network::miniprotocols::handshake::n2n::VersionData)
+                    = match client_pairs
                     .into_iter()
-                    .find(|(v, _)| server_supported.contains(v));
-
-                let (version, client_data) = match best {
+                    .find(|(v, _)| server_supported.contains(v))
+                {
                     Some(pair) => pair,
                     None => {
-                        let _ = peer_server
-                            .handshake()
-                            .refuse(RefuseReason::VersionMismatch(server_supported))
-                            .await;
+                        let _ = hs.refuse(RefuseReason::VersionMismatch(server_supported)).await;
                         anyhow::bail!(
-                            "accept_handshake: no common version with peer (proposed: {:?})",
-                            proposed_versions
+                            "accept_handshake: no common version (proposed: {proposed_versions:?})"
                         );
                     }
                 };
 
-                peer_server
-                    .handshake()
-                    .accept_version(version, client_data.clone())
+                hs.accept_version(version, client_data.clone())
                     .await
                     .context("accept_handshake: accept_version failed")?;
 
@@ -713,10 +724,7 @@ fn execute_step<'a>(
                     .emit(TraceEvent::new(
                         EventKind::HandshakeVersionAccepted,
                         Direction::Sent,
-                        json!({
-                            "version":   version,
-                            "peer_data": format!("{client_data:?}"),
-                        }),
+                        json!({ "version": version, "peer_data": format!("{client_data:?}") }),
                     ))
                     .await?;
 
@@ -724,56 +732,98 @@ fn execute_step<'a>(
                     .emit(TraceEvent::new(
                         EventKind::ServerHandshakeAccepted,
                         Direction::Internal,
-                        json!({
-                            "peer_address":      peer_addr.to_string(),
-                            "negotiated_version": version,
-                        }),
+                        json!({ "peer_address": peer_addr.to_string(), "negotiated_version": version }),
+                    ))
+                    .await?;
+
+                // Spawn server-side keep-alive (respond to pings from the peer).
+                let ka_server = pallas_network::miniprotocols::keepalive::Server::new(ka_channel);
+                let ka_handle = tokio::spawn(run_keepalive_server(ka_server));
+
+                tracer
+                    .emit(TraceEvent::new(
+                        EventKind::ProtocolWorkersStarted,
+                        Direction::Internal,
+                        json!({ "protocols": ["keep-alive"] }),
                     ))
                     .await?;
 
                 info!(version, %peer_addr, "Handshake accepted as server");
-                state.peer_server = Some(peer_server);
+                state.server_plexer_handle = Some(server_plexer);
+                state.server_cs_channel = Some(cs_channel);
+                state.server_ts_channel = Some(ts_server_channel);
+                state.server_ka_handle = Some(ka_handle);
                 Ok(())
             }
 
             StepKind::ServeChainSync => {
-                let fixture_path = params
-                    .fixture_path
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("serve_chain_sync: fixture_path is required"))?;
-
-                let chain = fixture::load(std::path::Path::new(fixture_path))
-                    .with_context(|| format!("serve_chain_sync: loading fixture \"{fixture_path}\""))?;
+                let mut cs_channel = state
+                    .server_cs_channel
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("serve_chain_sync: no chain-sync channel (missing accept_handshake?)"))?;
 
                 let await_secs = params.await_at_tip_secs.unwrap_or(30).min(300);
 
-                let peer_server = state
-                    .peer_server
-                    .as_mut()
-                    .ok_or_else(|| anyhow::anyhow!("serve_chain_sync: no accepted connection (missing accept_handshake?)"))?;
+                // Load fixture if fixture_path is set (used for auto-generation OR
+                // as a header source for header_from_fixture in explicit responses).
+                let fixture_opt = if let Some(path) = &params.fixture_path {
+                    let chain = fixture::load(std::path::Path::new(path.as_str()))
+                        .with_context(|| format!("serve_chain_sync: loading fixture \"{path}\""))?;
+                    Some(chain)
+                } else {
+                    None
+                };
 
-                let summary = run_chain_sync_server(
-                    &mut peer_server.chainsync,
-                    &chain,
-                    Duration::from_secs(await_secs),
+                // Build the response script.
+                let script = match step.raw_params.get("responses") {
+                    Some(responses_val) => {
+                        // Explicit responses list — fixture (if present) only provides
+                        // header sources for header_from_fixture references.
+                        let defs: Vec<crate::scenario::response_rules::ResponseRuleDef> =
+                            serde_json::from_value((*responses_val).clone())
+                                .context("serve_chain_sync: parsing responses")?;
+                        defs.iter()
+                            .enumerate()
+                            .map(|(i, d)| {
+                                rule_def_to_script(d, fixture_opt.as_ref()).with_context(|| {
+                                    format!("serve_chain_sync: responses[{i}]")
+                                })
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()?
+                    }
+                    None => {
+                        // Auto-generate from fixture (fixture_path must be set;
+                        // validation guarantees at least one of the two is present).
+                        let chain = fixture_opt.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("serve_chain_sync: fixture_path is required when responses is not set")
+                        })?;
+                        generate_from_fixture(chain, await_secs)
+                    }
+                };
+
+                let summary = execute_response_script(
+                    &mut cs_channel,
+                    &script,
+                    fixture_opt.as_ref(),
                     tracer,
                 )
                 .await?;
 
                 info!(
                     headers_served = summary.headers_served,
-                    duration_ms = summary.duration_ms,
+                    rules_applied  = summary.rules_applied,
+                    duration_ms    = summary.duration_ms,
                     "serve_chain_sync step complete"
                 );
                 Ok(())
             }
 
             StepKind::CloseListener => {
-                // Abort the peer server before dropping the listener.
-                if let Some(ps) = state.peer_server.take() {
-                    ps.abort().await;
-                }
-                state.listener.take(); // Drop closes the socket.
+                if let Some(h) = state.server_ka_handle.take() { h.abort(); }
+                if let Some(h) = state.server_plexer_handle.take() { h.abort().await; }
+                state.server_cs_channel.take();
+                state.server_ts_channel.take();
+                state.listener.take();
                 tracer
                     .emit(TraceEvent::new(
                         EventKind::ServerListenStopped,
@@ -827,9 +877,10 @@ async fn fetch_tip(target_address: &str, network_magic: u64, tracer: &Tracer) ->
 /// connected. Called on error/assertion-failure paths before returning.
 async fn cleanup(state: &mut RunnerState, tracer: &Tracer) {
     // Server-side cleanup.
-    if let Some(ps) = state.peer_server.take() {
-        ps.abort().await;
-    }
+    if let Some(h) = state.server_ka_handle.take() { h.abort(); }
+    if let Some(h) = state.server_plexer_handle.take() { h.abort().await; }
+    state.server_cs_channel.take();
+    state.server_ts_channel.take();
     state.listener.take();
 
     // Client-side cleanup.

@@ -1,0 +1,43 @@
+{
+  "name": "scripted_stall_at_tip",
+  "description": "Serve 3 headers from the fixture using an explicit responses list, then send AwaitReply and hold for 60 seconds before disconnecting. Uses fixture_path to resolve header_from_fixture references; responses drives the script.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3001" },
+    { "kind": "accept_handshake" },
+    {
+      "kind": "serve_chain_sync",
+      "fixture_path": "fixtures/devnet_genesis.jsonl",
+      "responses": [
+        {
+          "on": "find_intersect",
+          "send": { "kind": "intersect_found", "point": "origin" }
+        },
+        {
+          "on": "request_next",
+          "send": { "kind": "roll_forward", "header_from_fixture": 0 }
+        },
+        {
+          "on": "request_next",
+          "send": { "kind": "roll_forward", "header_from_fixture": 1 }
+        },
+        {
+          "on": "request_next",
+          "send": { "kind": "roll_forward", "header_from_fixture": 2 }
+        },
+        {
+          "on": "request_next",
+          "send": { "kind": "await_reply", "hold_secs": 60 }
+        },
+        {
+          "on": "any",
+          "send": { "kind": "disconnect" }
+        }
+      ]
+    },
+    { "kind": "close_listener" }
+  ]
+}

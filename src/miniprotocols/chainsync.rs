@@ -23,6 +23,8 @@ pub struct CapturedHeader {
     pub block_hash: Vec<u8>,
     pub block_number: u64,
     pub cbor: Vec<u8>,
+    /// Era variant byte from `HeaderContent.variant` (0=Byron, 6=Conway, …).
+    pub variant: u8,
 }
 
 pub struct ChainSyncSummary {
@@ -258,6 +260,7 @@ pub async fn run_chain_sync(
                             block_hash: hash,
                             block_number,
                             cbor: header.cbor.clone(),
+                            variant: header.variant,
                         });
                     }
                     Err(e) => warn!("Could not extract fields from header: {e}"),
@@ -380,6 +383,7 @@ pub async fn run_chain_sync(
                                     block_hash: hash,
                                     block_number,
                                     cbor: header.cbor.clone(),
+                                    variant: header.variant,
                                 });
                             }
                             Err(e) => warn!("Could not extract fields from header: {e}"),
