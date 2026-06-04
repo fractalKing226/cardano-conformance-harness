@@ -254,12 +254,74 @@ Accepts the next TCP connection and completes the NodeToNode Handshake as the **
 
 #### `serve_chain_sync`
 
-Serves a pre-captured chain fixture to the connected client via Chain-Sync. The harness responds to `MsgFindIntersect` and `MsgRequestNext` faithfully from the fixture data. When the fixture is exhausted it sends `MsgAwaitReply` and holds for `await_at_tip_secs` seconds, then closes the session.
+Executes a **response script** against the connected client's Chain-Sync session.
+The script is either auto-generated from a fixture or specified explicitly as a
+`responses` list. Both forms use the same execution path; the harness has no
+opinion about whether the responses are spec-correct.
 
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `fixture_path` | yes | Path to the JSONL fixture file |
-| `await_at_tip_secs` | no (default 30, max 300) | How long to hold in MustReply at tip before closing |
+| Parameter | Form | Description |
+|-----------|------|-------------|
+| `fixture_path` | auto | Path to a JSONL fixture. Generates an honest script: `FindIntersect` → cursor search, `RequestNext` × N → `RollForward` per entry, then `AwaitReply`, then disconnect. |
+| `responses` | explicit | Ordered list of response rules (see below). |
+| `fixture_path` + `responses` | hybrid | `responses` drives the script; `fixture_path` is loaded so `header_from_fixture` references can resolve headers. |
+| `await_at_tip_secs` | auto only | Seconds to hold in MustReply at tip before disconnecting (default 30, max 300). Only used when `fixture_path` auto-generates the script. |
+
+At least one of `fixture_path` or `responses` is required.
+
+##### Response rules
+
+Each rule in `responses` has an `on` field (which incoming message it matches)
+and a `send` field (what the harness sends back). Rules are consumed in order;
+the first unconsumed rule whose `on` matches the incoming message is executed.
+
+**`on` values:** `request_next`, `find_intersect`, `done`, `any`
+
+**`send` kinds:**
+
+| Kind | Key fields | Notes |
+|------|-----------|-------|
+| `roll_forward` | `header_from_fixture: N` or `header_cbor: <hex>` + optional `variant: u8` | `variant` defaults to `DEFAULT_HEADER_VARIANT` (6, Conway) when using literal CBOR |
+| `roll_backward` | `point: "origin"` or `"slot:hash"` | |
+| `intersect_found` | `point` | Can be sent from any state — harness does not enforce |
+| `intersect_not_found` | | |
+| `await_reply` | `hold_secs: N` (default 0) | Puts client in MustReply; harness sleeps `hold_secs` then continues |
+| `wait` | `duration_secs: N` | Pause without sending anything |
+| `disconnect` | | Drop the TCP connection immediately |
+| `raw_bytes` | `hex: <hex>` | Send arbitrary bytes — malformed CBOR, garbage, anything |
+
+Optional `tip` object (`{ "point": "slot:hash", "block_number": N }`) on any
+send kind overrides the tip included in the response. Omitting it uses the
+fixture tip (if a fixture is loaded) or a zero tip.
+
+##### Adversarial use
+
+The execution loop never validates responses against the current protocol state.
+`intersect_found` sent from `CanAwait`, `raw_bytes` at any point — whatever the
+scenario says goes out on the wire. The trace records the state the harness
+*tracked* before and after each send, so the verifier can see exactly which
+state the violation occurred in.
+
+##### Example: out-of-state IntersectFound
+
+```json
+{
+  "kind": "serve_chain_sync",
+  "fixture_path": "fixtures/devnet_genesis.jsonl",
+  "responses": [
+    { "on": "find_intersect", "send": { "kind": "intersect_found", "point": "origin" } },
+    { "on": "request_next",   "send": { "kind": "roll_forward", "header_from_fixture": 0 } },
+    { "on": "request_next",   "send": { "kind": "roll_forward", "header_from_fixture": 1 } },
+    { "on": "request_next",   "send": { "kind": "intersect_found", "point": "origin" } },
+    { "on": "any",            "send": { "kind": "disconnect" } }
+  ]
+}
+```
+
+When a spec-conformant client receives `IntersectFound` from `CanAwait` state,
+Pallas returns `"inbound message is not valid for current state"` and the client
+disconnects. The client trace carries the error event; the server trace shows the
+violation was sent as scripted. This is the harness performing adversarial
+conformance testing.
 
 #### `close_listener`
 
@@ -314,12 +376,11 @@ Set the node's `--host-addr 127.0.0.1` so it initiates outbound connections. The
 
 ---
 
-### Known limitations (this slice)
+### Known limitations
 
-- **Single client per session.** One incoming connection per `listen`/`close_listener` cycle. Multi-client serving is a future slice.
-- **No rollback support.** The fixture is a linear chain. The server never sends `MsgRollBackward`. Rollback-testing scenarios are a future slice.
-- **No adversarial behavior.** The server serves the fixture faithfully. Stalling, malformed responses, and out-of-order messages are a future slice.
-- **Chain-Sync only.** Block-Fetch server is a future slice; clients can fetch blocks from a real node directly.
+- **Single client per session.** One incoming connection per `listen`/`close_listener` cycle.
+- **No rollback in auto-generated scripts.** Fixture-driven serving never sends `MsgRollBackward`. Explicit `responses` rules can include `roll_backward` if needed.
+- **Chain-Sync only.** Block-Fetch server is a future slice.
 - **Channel reuse.** A connection's Chain-Sync channel is consumed after one session. Multiple `serve_chain_sync` steps on the same connection are not yet supported.
 
 #### `sleep`
@@ -374,8 +435,11 @@ scenario with a non-zero exit code.
 | `scenarios/repeat_demo.json` | Repeat 4×: sync 3 headers + fetch bodies |
 | `scenarios/combined_variables.json` | All features: variables, query_tip, repeat |
 | `scenarios/capture_chain_for_fixture.json` | Capture 20 headers to a fixture file |
-| `scenarios/serve_chain_to_one_client.json` | Server-mode: accept one client, serve fixture |
-| `scenarios/serve_chain_long_session.json` | Server-mode: serve fixture, hold 60 s at tip |
+| `scenarios/serve_chain_to_one_client.json` | Server-mode: fixture auto-script, serve until client sends Done |
+| `scenarios/serve_chain_long_session.json` | Server-mode: fixture auto-script, hold 60 s at tip |
+| `scenarios/scripted_honest_serve.json` | Server-mode: explicit responses, honest behaviour |
+| `scenarios/scripted_stall_at_tip.json` | Server-mode: serve 3 headers then stall 60 s (AwaitReply) |
+| `scenarios/scripted_out_of_state_intersect.json` | Server-mode: adversarial — IntersectFound sent from CanAwait |
 
 ## Trace file format
 
