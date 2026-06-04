@@ -1,0 +1,35 @@
+{
+  "name": "scripted_block_fetch_disconnect_mid_batch",
+  "description": "Start streaming a batch (StartBatch + 2 blocks), then disconnect without sending BatchDone. Tests client behavior on a broken stream. The client should record a channel error rather than clean completion.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3001" },
+    { "kind": "accept_handshake" },
+    {
+      "kind": "serve_block_fetch",
+      "block_fetch_fixture_path": "fixtures/devnet_blocks.jsonl",
+      "responses": [
+        {
+          "on": "request_range",
+          "send": { "kind": "start_batch" }
+        },
+        {
+          "on": "any",
+          "send": { "kind": "block", "block_from_fixture": 0 }
+        },
+        {
+          "on": "any",
+          "send": { "kind": "block", "block_from_fixture": 1 }
+        },
+        {
+          "on": "any",
+          "send": { "kind": "disconnect" }
+        }
+      ]
+    },
+    { "kind": "close_listener" }
+  ]
+}

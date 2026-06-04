@@ -1,0 +1,17 @@
+{
+  "name": "scripted_honest_block_fetch",
+  "description": "Serve block bodies from a fixture using the auto-generated honest script. The client sends RequestRange and the harness streams StartBatch + Block + BatchDone from the fixture.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3001" },
+    { "kind": "accept_handshake" },
+    {
+      "kind": "serve_block_fetch",
+      "block_fetch_fixture_path": "fixtures/devnet_blocks.jsonl"
+    },
+    { "kind": "close_listener" }
+  ]
+}

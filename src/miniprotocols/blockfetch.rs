@@ -13,6 +13,15 @@ pub use pallas_network::miniprotocols::PROTOCOL_N2N_BLOCK_FETCH as BLOCK_FETCH_P
 
 const MINI_PROTOCOL: &str = "block-fetch";
 
+/// A captured block body as received from a RollForward-equivalent Block-Fetch response.
+/// Used to populate Block-Fetch fixture files (`--capture-block-fixture`).
+#[derive(Clone)]
+pub struct CapturedBlock {
+    pub slot: u64,
+    pub block_hash: Vec<u8>,
+    pub cbor: Vec<u8>,
+}
+
 pub struct BlockFetchSummary {
     pub range_requests: u64,
     pub blocks_received: u64,
@@ -20,6 +29,8 @@ pub struct BlockFetchSummary {
     pub total_bytes: u64,
     pub exit_reason: String,
     pub duration_ms: u64,
+    /// Block bodies captured for fixture writing (`--capture-block-fixture`).
+    pub captured_blocks: Vec<CapturedBlock>,
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -104,6 +115,7 @@ pub async fn run_block_fetch(
                     blocks_received,
                     no_blocks_responses,
                     total_bytes,
+                    vec![],
                     started_at,
                     "error",
                 );
@@ -201,6 +213,7 @@ pub async fn run_block_fetch(
                                 blocks_received,
                                 no_blocks_responses,
                                 total_bytes,
+                                vec![],
                                 started_at,
                                 "error",
                             );
@@ -240,6 +253,7 @@ pub async fn run_block_fetch(
         blocks_received,
         no_blocks_responses,
         total_bytes,
+        vec![],
         started_at,
         "completed",
     );
@@ -260,6 +274,7 @@ fn build_summary(
     blocks_received: u64,
     no_blocks_responses: u64,
     total_bytes: u64,
+    captured_blocks: Vec<CapturedBlock>,
     started_at: Instant,
     exit_reason: &str,
 ) -> BlockFetchSummary {
@@ -270,6 +285,7 @@ fn build_summary(
         total_bytes,
         exit_reason: exit_reason.to_string(),
         duration_ms: started_at.elapsed().as_millis() as u64,
+        captured_blocks,
     }
 }
 
@@ -304,7 +320,7 @@ mod tests {
 
     #[test]
     fn build_summary_fields() {
-        let s = build_summary(3, 10, 1, 4096, Instant::now(), "completed");
+        let s = build_summary(3, 10, 1, 4096, vec![], Instant::now(), "completed");
         assert_eq!(s.range_requests, 3);
         assert_eq!(s.blocks_received, 10);
         assert_eq!(s.no_blocks_responses, 1);

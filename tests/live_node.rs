@@ -30,7 +30,7 @@ fn make_scenario(name: &str, trace_path: &std::path::Path, steps: Vec<StepDef>) 
 }
 
 fn simple_step(kind: StepKind) -> StepDef {
-    StepDef { kind, raw_params: serde_json::json!({}), output: None, expect: None }
+    StepDef { kind, raw_params: serde_json::json!({}), output: None, as_name: None, on_name: None, expect: None }
 }
 
 fn chain_sync_step(count: u64) -> StepDef {
@@ -38,6 +38,8 @@ fn chain_sync_step(count: u64) -> StepDef {
         kind: StepKind::ChainSync,
         raw_params: serde_json::json!({ "count": count }),
         output: None,
+        as_name: None,
+        on_name: None,
         expect: None,
     }
 }
@@ -47,12 +49,14 @@ fn sleep_step(secs: u64) -> StepDef {
         kind: StepKind::Sleep,
         raw_params: serde_json::json!({ "duration_secs": secs }),
         output: None,
+        as_name: None,
+        on_name: None,
         expect: None,
     }
 }
 
 fn step_with_expect(kind: StepKind, expect: Assertions) -> StepDef {
-    StepDef { kind, raw_params: serde_json::json!({}), output: None, expect: Some(expect) }
+    StepDef { kind, raw_params: serde_json::json!({}), output: None, as_name: None, on_name: None, expect: Some(expect) }
 }
 
 const DEVNET_ADDR: &str = "localhost:3001";
@@ -670,6 +674,8 @@ async fn repeat_all_iterations_complete_successfully() {
                 "body": [{ "kind": "sleep", "duration_secs": 0 }]
             }),
             output: None,
+            as_name: None,
+            on_name: None,
             expect: None,
         }],
     );
@@ -714,6 +720,8 @@ async fn repeat_error_path_emits_correct_trace_events() {
                 }]
             }),
             output: None,
+            as_name: None,
+            on_name: None,
             expect: None,
         }],
     );
@@ -773,6 +781,8 @@ async fn repeat_body_variables_visible_within_same_iteration() {
                     ]
                 }),
                 output: None,
+                as_name: None,
+                on_name: None,
                 expect: None,
             },
             simple_step(StepKind::Disconnect),

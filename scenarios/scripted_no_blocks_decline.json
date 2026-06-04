@@ -1,0 +1,18 @@
+{
+  "name": "scripted_no_blocks_decline",
+  "description": "Decline every Block-Fetch range request with MsgNoBlocks. Tests how Pallas's block-fetch client handles a peer that claims to have nothing. The client should receive NoBlocks for each range and complete without error.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3001" },
+    { "kind": "accept_handshake" },
+    {
+      "kind": "serve_block_fetch",
+      "block_fetch_fixture_path": "fixtures/devnet_blocks.jsonl",
+      "no_blocks_default": true
+    },
+    { "kind": "close_listener" }
+  ]
+}

@@ -73,6 +73,10 @@ pub enum EventKind {
     // Scripted response execution
     ResponseRuleApplied,
 
+    // Server-side Block-Fetch session lifecycle
+    ServerBlockFetchStarted,
+    ServerBlockFetchCompleted,
+
     // Server-side lifecycle
     ServerBearerAccepted,
     ServerListenStarted,
@@ -101,6 +105,11 @@ pub struct TraceEvent {
     pub timestamp: String,
     pub kind: EventKind,
     pub direction: Direction,
+    /// Name of the connection this event belongs to (e.g. `"default"`, `"peer_a"`).
+    /// Present on all wire events and connection-lifecycle events; absent on
+    /// scenario-level meta-events (ScenarioStarted, VariableSet, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mini_protocol: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,6 +125,7 @@ impl TraceEvent {
             timestamp: Utc::now().to_rfc3339(),
             kind,
             direction,
+            connection: None,
             mini_protocol: None,
             state_before: None,
             state_after: None,
@@ -142,6 +152,14 @@ impl TraceEvent {
     /// state-before/after fields are not meaningful.
     pub fn with_protocol(mut self, mini_protocol: &'static str) -> Self {
         self.mini_protocol = Some(mini_protocol);
+        self
+    }
+
+    /// Tags a wire or connection-lifecycle event with the name of the connection
+    /// it belongs to. Use for all events that are attributed to a specific
+    /// named connection (both `"default"` and explicitly-named connections).
+    pub fn with_connection(mut self, connection: impl Into<String>) -> Self {
+        self.connection = Some(connection.into());
         self
     }
 }

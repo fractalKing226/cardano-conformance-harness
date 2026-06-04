@@ -62,6 +62,14 @@ impl ServerCsState {
             // Wait and RawBytes don't change the tracked state.
             ScriptSend::Wait { .. }
             | ScriptSend::RawBytes { .. }        => self,
+            // Block-Fetch sends are never executed by the Chain-Sync loop;
+            // treat them as no-ops for state tracking.
+            ScriptSend::StartBatch
+            | ScriptSend::Block { .. }
+            | ScriptSend::BatchDone
+            | ScriptSend::NoBlocks
+            | ScriptSend::StreamBatch { .. }
+            | ScriptSend::CursorRange            => self,
         }
     }
 }
@@ -90,6 +98,7 @@ impl ReceivedRequest {
             (ReceivedRequest::RequestNext, On::RequestNext)         => true,
             (ReceivedRequest::Done, On::Done)                       => true,
             _ => false,
+            // On::RequestRange never matches a Chain-Sync request.
         }
     }
 }
@@ -174,7 +183,10 @@ pub async fn execute_response_script(
 
         let rule = match rule_pos {
             Some(pos) => {
-                rule_idx = pos + 1;
+                // Only advance past the rule if it is not marked repeatable.
+                if !rules[pos].repeatable {
+                    rule_idx = pos + 1;
+                }
                 &rules[pos]
             }
             None => {
@@ -489,15 +501,16 @@ async fn execute_send(
             send_raw(channel, bytes).await?;
             tracer
                 .emit(TraceEvent::new(
-                    EventKind::Error, // reuse Error kind as "unexpected wire bytes"
+                    EventKind::Error,
                     Direction::Sent,
-                    json!({
-                        "phase":    "raw_bytes",
-                        "hex":      encode_hex(bytes),
-                        "byte_len": bytes.len(),
-                    }),
+                    json!({ "phase": "raw_bytes", "hex": encode_hex(bytes), "byte_len": bytes.len() }),
                 ))
                 .await?;
+        }
+        // Block-Fetch sends are only executed by blockfetch_server.rs — error if reached here.
+        ScriptSend::StartBatch | ScriptSend::Block { .. } | ScriptSend::BatchDone
+        | ScriptSend::NoBlocks | ScriptSend::StreamBatch { .. } | ScriptSend::CursorRange => {
+            anyhow::bail!("Block-Fetch send rule {:?} reached Chain-Sync execution loop", rule.send.kind_str());
         }
     }
     Ok(false)

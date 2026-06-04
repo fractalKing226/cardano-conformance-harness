@@ -1,0 +1,26 @@
+{
+  "name": "multi_peer_server_two_clients",
+  "description": "Opens a single listener, accepts two incoming connections sequentially (client_1 then client_2), serves each a Chain-Sync session from the same fixture, then closes the listener. Demonstrates that the server can handle multiple sequential clients on one listener.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "as": "listener_1", "bind_address": "0.0.0.0:3001" },
+    { "kind": "accept_handshake", "on": "listener_1", "as": "client_1" },
+    {
+      "kind": "serve_chain_sync",
+      "on": "client_1",
+      "fixture_path": "fixtures/devnet_genesis.jsonl",
+      "await_at_tip_secs": 5
+    },
+    { "kind": "accept_handshake", "on": "listener_1", "as": "client_2" },
+    {
+      "kind": "serve_chain_sync",
+      "on": "client_2",
+      "fixture_path": "fixtures/devnet_genesis.jsonl",
+      "await_at_tip_secs": 5
+    },
+    { "kind": "close_listener", "on": "listener_1" }
+  ]
+}

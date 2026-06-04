@@ -12,11 +12,15 @@ struct Cli {
     #[arg(long, default_value = "scenarios/default.json")]
     scenario: PathBuf,
 
-    /// When set, every RollForward header received by chain_sync steps is
-    /// also written to this file as a fixture entry (JSONL format). The
-    /// resulting file can be used as fixture_path in serve_chain_sync steps.
+    /// Write Chain-Sync headers received during chain_sync steps to this JSONL
+    /// fixture file (for use as fixture_path in serve_chain_sync steps).
     #[arg(long)]
     capture_fixture: Option<PathBuf>,
+
+    /// Write block bodies received during block_fetch steps to this JSONL
+    /// fixture file (for use as block_fetch_fixture_path in serve_block_fetch steps).
+    #[arg(long)]
+    capture_block_fixture: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -34,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
 
     ScenarioRunner::new(parsed)
         .with_capture_fixture(cli.capture_fixture)
+        .with_capture_block_fixture(cli.capture_block_fixture)
         .run()
         .await
 }

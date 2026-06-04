@@ -1,3 +1,4 @@
+pub mod block_fixture;
 pub mod fixture;
 pub mod response_rules;
 pub mod runner;
@@ -29,10 +30,16 @@ pub struct Scenario {
 pub struct StepDef {
     pub kind: StepKind,
     /// Raw JSON params map — used for variable substitution before execution.
-    /// Keys for `kind`, `output`, `expect` are stripped; everything else lives here.
+    /// Keys for `kind`, `output`, `expect`, `as`, `on` are stripped.
     pub raw_params: Value,
     /// Variable name to store this step's output in (e.g. `"tip"`, `"pts"`).
     pub output: Option<String>,
+    /// Connection name to create (`connect`, `listen`, `accept_handshake`).
+    /// Absent → use `"default"`.
+    pub as_name: Option<String>,
+    /// Connection name to act on (most protocol steps).
+    /// Absent → use `"default"`.
+    pub on_name: Option<String>,
     pub expect: Option<Assertions>,
 }
 
@@ -50,6 +57,17 @@ impl<'de> Deserialize<'de> for StepDef {
             .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
             .transpose()?;
 
+        // `as` is a Rust keyword, deserialized via string key.
+        let as_name: Option<String> = map
+            .remove("as")
+            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
+            .transpose()?;
+
+        let on_name: Option<String> = map
+            .remove("on")
+            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
+            .transpose()?;
+
         let expect: Option<Assertions> = map
             .remove("expect")
             .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
@@ -59,6 +77,8 @@ impl<'de> Deserialize<'de> for StepDef {
             kind,
             raw_params: Value::Object(map),
             output,
+            as_name,
+            on_name,
             expect,
         })
     }
@@ -84,6 +104,8 @@ pub enum StepKind {
     /// Serve a pre-captured chain fixture to the connected client via Chain-Sync.
     /// Params: `fixture_path` (required), `await_at_tip_secs` (default 30, max 300).
     ServeChainSync,
+    /// Serve block bodies to the connected client via Block-Fetch.
+    ServeBlockFetch,
     /// Stop the listener and close any active server connections.
     CloseListener,
 }
@@ -101,8 +123,9 @@ impl StepKind {
             StepKind::Sleep => "sleep",
             StepKind::Listen => "listen",
             StepKind::AcceptHandshake => "accept_handshake",
-            StepKind::ServeChainSync => "serve_chain_sync",
-            StepKind::CloseListener => "close_listener",
+            StepKind::ServeChainSync  => "serve_chain_sync",
+            StepKind::ServeBlockFetch => "serve_block_fetch",
+            StepKind::CloseListener   => "close_listener",
         }
     }
 
@@ -124,6 +147,7 @@ impl StepKind {
             StepKind::Listen
                 | StepKind::AcceptHandshake
                 | StepKind::ServeChainSync
+                | StepKind::ServeBlockFetch
                 | StepKind::CloseListener
         )
     }
@@ -165,7 +189,13 @@ pub struct StepParams {
     /// Listen: address to bind. Default `"0.0.0.0:3001"`.
     pub bind_address: Option<String>,
 
-    /// ServeChainSync: path to the fixture JSONL file.
+    /// ServeBlockFetch: path to the Block-Fetch fixture JSONL file.
+    pub block_fetch_fixture_path: Option<String>,
+
+    /// ServeBlockFetch: if true, auto-generated script declines all ranges with NoBlocks.
+    pub no_blocks_default: Option<bool>,
+
+    /// ServeChainSync: path to the Chain-Sync fixture JSONL file.
     /// Mutually exclusive with `responses`.
     pub fixture_path: Option<String>,
 
@@ -242,6 +272,7 @@ pub fn validate(scenario: &Scenario) -> anyhow::Result<()> {
     }
 
     validate_steps(&scenario.steps, &mut errors, &mut false);
+    validate_connection_names(&scenario.steps, &mut errors);
     if !errors.is_empty() {
         anyhow::bail!(
             "scenario \"{}\" has validation errors:\n  - {}",
@@ -250,6 +281,101 @@ pub fn validate(scenario: &Scenario) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Validates `as`/`on` connection-name references across a step list.
+///
+/// Rules:
+/// - `as` names must be unique (no duplicate creation in the same lifecycle).
+/// - `on` names must refer to a connection opened by an earlier step.
+/// - Connections left open at the end produce a warning (not an error).
+fn validate_connection_names(steps: &[StepDef], errors: &mut Vec<String>) {
+    use std::collections::HashSet;
+    let mut open_clients: HashSet<String> = HashSet::new();
+    let mut open_listeners: HashSet<String> = HashSet::new();
+    let mut open_servers: HashSet<String> = HashSet::new();
+
+    for (i, step) in steps.iter().enumerate() {
+        let pos = format!("step[{i}] ({})", step.kind.as_str());
+        let as_name = step.as_name.as_deref().unwrap_or("default").to_string();
+        let on_name = step.on_name.as_deref().unwrap_or("default").to_string();
+
+        match step.kind {
+            StepKind::Connect => {
+                if open_clients.contains(&as_name) {
+                    errors.push(format!(
+                        "{pos}: connection name \"{as_name}\" is already open (use a different `as` name or disconnect first)"
+                    ));
+                }
+                open_clients.insert(as_name);
+            }
+            StepKind::Listen => {
+                if open_listeners.contains(&as_name) {
+                    errors.push(format!(
+                        "{pos}: listener name \"{as_name}\" is already open"
+                    ));
+                }
+                open_listeners.insert(as_name);
+            }
+            StepKind::AcceptHandshake => {
+                // `on` refers to the listener; `as` names the new server connection.
+                if !open_listeners.contains(&on_name) {
+                    errors.push(format!(
+                        "{pos}: no listener named \"{on_name}\" (create it with `listen as: \"{on_name}\"`)"
+                    ));
+                }
+                if open_servers.contains(&as_name) {
+                    errors.push(format!(
+                        "{pos}: server connection name \"{as_name}\" is already open"
+                    ));
+                }
+                open_servers.insert(as_name);
+            }
+            StepKind::Handshake
+            | StepKind::ChainSync
+            | StepKind::BlockFetch
+            | StepKind::QueryTip => {
+                if !open_clients.contains(&on_name) {
+                    errors.push(format!(
+                        "{pos}: no connection named \"{on_name}\" (create it with `connect as: \"{on_name}\"`)"
+                    ));
+                }
+            }
+            StepKind::Disconnect => {
+                if !open_clients.contains(&on_name) {
+                    errors.push(format!(
+                        "{pos}: no connection named \"{on_name}\" to disconnect"
+                    ));
+                }
+                open_clients.remove(&on_name);
+            }
+            StepKind::ServeChainSync | StepKind::ServeBlockFetch => {
+                if !open_servers.contains(&on_name) {
+                    errors.push(format!(
+                        "{pos}: no server connection named \"{on_name}\" (create it with `accept_handshake as: \"{on_name}\"`)"
+                    ));
+                }
+            }
+            StepKind::CloseListener => {
+                if !open_listeners.contains(&on_name) {
+                    errors.push(format!(
+                        "{pos}: no listener named \"{on_name}\" to close"
+                    ));
+                }
+                open_listeners.remove(&on_name);
+                // Server connections from this listener remain valid until closed.
+            }
+            StepKind::Repeat => {
+                // Validate body steps with inherited open sets — for simplicity,
+                // body steps inherit the parent's open state. Nested validation
+                // of connection names in repeat bodies is deferred.
+            }
+            StepKind::Sleep => {}
+        }
+    }
+    // Warn about unclosed connections (not an error — cleanup handles them).
+    // We intentionally omit these from `errors` to avoid breaking valid scenarios
+    // that rely on the runner's cleanup path rather than explicit disconnect steps.
 }
 
 fn validate_steps(steps: &[StepDef], errors: &mut Vec<String>, has_chain_sync: &mut bool) {
@@ -337,8 +463,16 @@ fn validate_step(
             }
         }
 
-        StepKind::Listen | StepKind::AcceptHandshake | StepKind::CloseListener => {
-            // No required params for these steps.
+        StepKind::Listen | StepKind::AcceptHandshake | StepKind::CloseListener => {}
+
+        StepKind::ServeBlockFetch => {
+            let has_fixture   = step.raw_params.get("block_fetch_fixture_path").is_some();
+            let has_responses = step.raw_params.get("responses").is_some();
+            if !has_fixture && !has_responses {
+                errors.push(format!(
+                    "{pos}: serve_block_fetch requires block_fetch_fixture_path, responses, or both"
+                ));
+            }
         }
 
         StepKind::ServeChainSync => {

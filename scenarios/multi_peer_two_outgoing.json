@@ -1,0 +1,18 @@
+{
+  "name": "multi_peer_two_outgoing",
+  "description": "Opens two outgoing connections named peer_a and peer_b, runs chain_sync independently on each with different header counts, then disconnects both. Each connection produces trace events labelled with its connection name.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_client.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "connect",    "as": "peer_a" },
+    { "kind": "connect",    "as": "peer_b" },
+    { "kind": "handshake",  "on": "peer_a" },
+    { "kind": "handshake",  "on": "peer_b" },
+    { "kind": "chain_sync", "on": "peer_a", "count": 5  },
+    { "kind": "chain_sync", "on": "peer_b", "count": 10 },
+    { "kind": "disconnect", "on": "peer_a" },
+    { "kind": "disconnect", "on": "peer_b" }
+  ]
+}

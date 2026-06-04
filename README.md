@@ -106,6 +106,30 @@ A scenario is a JSON file that describes a sequence of steps to execute.
 | `trace_output_path` | yes | Path for the JSON-lines trace output |
 | `expected_outcome` | no | Informational string logged in `scenario_completed` (e.g. `"success"`) |
 
+### Named connections (`as` and `on`)
+
+Steps that open a connection or listener accept an optional **`as: <name>`** field to give it a name. Steps that act on an existing connection accept an optional **`on: <name>`** field to select which connection to use. Both default to `"default"` for backwards compatibility — existing single-connection scenarios work unchanged.
+
+```json
+{ "kind": "connect",    "as": "peer_a" }
+{ "kind": "connect",    "as": "peer_b" }
+{ "kind": "handshake",  "on": "peer_a" }
+{ "kind": "handshake",  "on": "peer_b" }
+{ "kind": "chain_sync", "on": "peer_a", "count": 5  }
+{ "kind": "chain_sync", "on": "peer_b", "count": 10 }
+{ "kind": "disconnect", "on": "peer_a" }
+{ "kind": "disconnect", "on": "peer_b" }
+```
+
+Every wire event in the trace includes a `"connection": "<name>"` field so each event is clearly attributed to its connection.
+
+**Validation rules:**
+- `as` names must be unique within a scenario (no duplicate connections with the same name).
+- `on` must refer to a connection that was opened by an earlier step in the scenario.
+- The validator reports forward references and duplicates at parse time.
+
+**Note on `from_chain_sync` scoping:** When using `points: "from_chain_sync"` with named connections, the points come from the most-recent `chain_sync` step on the *same connection* (`on` name). For clarity in multi-connection scenarios, prefer explicit variables: `chain_sync output: "pts"` then `block_fetch points: "$pts"`. `from_chain_sync` is convenient for simple single-connection scenarios but becomes ambiguous when multiple connections are active.
+
 ### Variables
 
 Steps that produce data can store it in a named variable using the `output` field.
@@ -440,6 +464,9 @@ scenario with a non-zero exit code.
 | `scenarios/scripted_honest_serve.json` | Server-mode: explicit responses, honest behaviour |
 | `scenarios/scripted_stall_at_tip.json` | Server-mode: serve 3 headers then stall 60 s (AwaitReply) |
 | `scenarios/scripted_out_of_state_intersect.json` | Server-mode: adversarial — IntersectFound sent from CanAwait |
+| `scenarios/multi_peer_two_outgoing.json` | Two named outgoing connections, chain_sync on each |
+| `scenarios/multi_peer_consistency_check.json` | Same range synced from two connections, output to named variables |
+| `scenarios/multi_peer_server_two_clients.json` | One listener, two sequential clients served from the same fixture |
 
 ## Trace file format
 

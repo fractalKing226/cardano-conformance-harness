@@ -1,4 +1,5 @@
 pub mod blockfetch;
+pub mod blockfetch_server;
 pub mod chainsync;
 pub mod chainsync_server;
 pub mod handshake;

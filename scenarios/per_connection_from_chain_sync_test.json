@@ -1,0 +1,17 @@
+{
+  "name": "per_connection_from_chain_sync_test",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_per_conn.jsonl",
+  "steps": [
+    { "kind": "connect", "as": "a" },
+    { "kind": "handshake", "on": "a" },
+    { "kind": "chain_sync", "on": "a", "count": 5 },
+    { "kind": "connect", "as": "b" },
+    { "kind": "handshake", "on": "b" },
+    { "kind": "chain_sync", "on": "b", "count": 3 },
+    { "kind": "block_fetch", "on": "a", "points": "from_chain_sync" },
+    { "kind": "disconnect", "on": "a" },
+    { "kind": "disconnect", "on": "b" }
+  ]
+}

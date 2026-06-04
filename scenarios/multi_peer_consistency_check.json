@@ -1,0 +1,28 @@
+{
+  "name": "multi_peer_consistency_check",
+  "description": "Opens two connections to the same node, syncs the same 5 headers from genesis on each, and stores both sets as named variables. A verifier can compare headers_a and headers_b in the trace to check that the same block hashes are served by both connections — a basic determinism check.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_client.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "connect",    "as": "source_a" },
+    { "kind": "connect",    "as": "source_b" },
+    { "kind": "handshake",  "on": "source_a" },
+    { "kind": "handshake",  "on": "source_b" },
+    {
+      "kind": "chain_sync",
+      "on": "source_a",
+      "count": 5,
+      "output": "headers_a"
+    },
+    {
+      "kind": "chain_sync",
+      "on": "source_b",
+      "count": 5,
+      "output": "headers_b"
+    },
+    { "kind": "disconnect", "on": "source_a" },
+    { "kind": "disconnect", "on": "source_b" }
+  ]
+}
