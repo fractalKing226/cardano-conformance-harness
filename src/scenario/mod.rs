@@ -17,7 +17,7 @@ use serde_json::Value;
 pub struct Scenario {
     pub name: String,
     pub description: Option<String>,
-    pub target_address: String,
+    pub target_address: Option<String>,
     pub network_magic: u64,
     pub trace_output_path: PathBuf,
     pub expected_outcome: Option<String>,
@@ -111,6 +111,10 @@ pub enum StepKind {
     /// Run multiple step branches concurrently. Completes when all branches
     /// complete, or aborts remaining branches if one fails.
     Parallel,
+    /// Emit a peer-identity event into the trace without touching any
+    /// connection. Models imaginary-network state changes (a peer produced a
+    /// block, cast a vote, etc.) as first-class trace entries.
+    EmitPeerEvent,
 }
 
 impl StepKind {
@@ -130,6 +134,7 @@ impl StepKind {
             StepKind::ServeBlockFetch => "serve_block_fetch",
             StepKind::CloseListener   => "close_listener",
             StepKind::Parallel        => "parallel",
+            StepKind::EmitPeerEvent   => "emit_peer_event",
         }
     }
 
@@ -212,6 +217,17 @@ pub struct StepParams {
     /// Default 30, max 300. Only used when `fixture_path` is set (the auto-
     /// generated script uses this for its AwaitReply rule).
     pub await_at_tip_secs: Option<u64>,
+
+    /// Connect: override the scenario-level target address for this connection only.
+    pub target_address: Option<String>,
+
+    /// connect / accept_handshake / listen: peer identity label for trace
+    /// attribution. Stored on the connection and propagated to all wire events.
+    /// emit_peer_event: the peer this event describes.
+    pub peer_id: Option<String>,
+
+    /// emit_peer_event: the kind of network event (e.g. "peer_produced_block").
+    pub event_kind: Option<String>,
 }
 
 /// How Block-Fetch obtains its point list.
@@ -277,6 +293,7 @@ pub fn validate(scenario: &Scenario) -> anyhow::Result<()> {
 
     validate_steps(&scenario.steps, &mut errors, &mut false);
     validate_connection_names(&scenario.steps, &mut errors);
+    validate_connect_addresses(scenario, &mut errors);
     if !errors.is_empty() {
         anyhow::bail!(
             "scenario \"{}\" has validation errors:\n  - {}",
@@ -373,12 +390,51 @@ fn validate_connection_names(steps: &[StepDef], errors: &mut Vec<String>) {
                 // Body/branch validation is deferred; connection-name tracking
                 // across nested step lists is not enforced here.
             }
-            StepKind::Sleep => {}
+            StepKind::Sleep | StepKind::EmitPeerEvent => {}
         }
     }
     // Warn about unclosed connections (not an error — cleanup handles them).
     // We intentionally omit these from `errors` to avoid breaking valid scenarios
     // that rely on the runner's cleanup path rather than explicit disconnect steps.
+}
+
+/// Checks that every `connect` step has a usable target address: either its own
+/// `target_address` param or the scenario-level `target_address` field.
+fn validate_connect_addresses(scenario: &Scenario, errors: &mut Vec<String>) {
+    let mut connect_steps: Vec<(usize, bool)> = Vec::new(); // (flat index, has per-step addr)
+    collect_connect_steps(&scenario.steps, &mut 0, &mut connect_steps);
+    let needs_default = connect_steps.iter().any(|(_, has_own)| !has_own);
+    if needs_default && scenario.target_address.is_none() {
+        errors.push(
+            "scenario-level target_address is required because at least one connect step \
+             does not specify its own target_address — either add target_address to the \
+             scenario or add target_address to every connect step"
+                .into(),
+        );
+    }
+}
+
+fn collect_connect_steps(steps: &[StepDef], counter: &mut usize, out: &mut Vec<(usize, bool)>) {
+    for step in steps {
+        let idx = *counter;
+        *counter += 1;
+        if step.kind == StepKind::Connect {
+            let has_own = step.raw_params.get("target_address").is_some();
+            out.push((idx, has_own));
+        }
+        if let Some(body_val) = step.raw_params.get("body") {
+            if let Ok(body) = serde_json::from_value::<Vec<StepDef>>(body_val.clone()) {
+                collect_connect_steps(&body, counter, out);
+            }
+        }
+        if let Some(branches_val) = step.raw_params.get("branches") {
+            if let Ok(branches) = serde_json::from_value::<Vec<Vec<StepDef>>>(branches_val.clone()) {
+                for branch in &branches {
+                    collect_connect_steps(branch, counter, out);
+                }
+            }
+        }
+    }
 }
 
 fn validate_steps(steps: &[StepDef], errors: &mut Vec<String>, has_chain_sync: &mut bool) {
@@ -394,6 +450,20 @@ fn validate_step(
     errors: &mut Vec<String>,
     has_chain_sync: &mut bool,
 ) {
+    if step.raw_params.get("target_address").is_some() && !matches!(step.kind, StepKind::Connect) {
+        errors.push(format!("{pos}: target_address is only valid on connect steps"));
+    }
+    if step.raw_params.get("peer_id").is_some()
+        && !matches!(
+            step.kind,
+            StepKind::Connect | StepKind::AcceptHandshake | StepKind::EmitPeerEvent
+        )
+    {
+        errors.push(format!(
+            "{pos}: peer_id is only valid on connect, accept_handshake, and emit_peer_event steps"
+        ));
+    }
+
     match step.kind {
         StepKind::Connect | StepKind::Disconnect | StepKind::Handshake | StepKind::QueryTip => {}
 
@@ -492,6 +562,15 @@ fn validate_step(
                 errors.push(format!(
                     "{pos}: serve_block_fetch requires block_fetch_fixture_path, responses, or both"
                 ));
+            }
+        }
+
+        StepKind::EmitPeerEvent => {
+            if step.raw_params.get("peer_id").is_none() {
+                errors.push(format!("{pos}: emit_peer_event requires peer_id"));
+            }
+            if step.raw_params.get("event_kind").is_none() {
+                errors.push(format!("{pos}: emit_peer_event requires event_kind"));
             }
         }
 
@@ -770,6 +849,50 @@ mod tests {
         }"#;
         let s: Scenario = serde_json::from_str(json).unwrap();
         assert!(validate(&s).is_err());
+    }
+
+    #[test]
+    fn connect_per_step_target_address_overrides_scenario_level() {
+        // All connect steps have their own target_address — scenario-level field may be absent.
+        let json = r#"{
+            "name":"t","network_magic":1,"trace_output_path":"t.jsonl",
+            "steps":[
+                {"kind":"connect","target_address":"host-a:3001"},
+                {"kind":"handshake"},
+                {"kind":"disconnect"}
+            ]
+        }"#;
+        let s: Scenario = serde_json::from_str(json).unwrap();
+        assert!(validate(&s).is_ok(), "should accept absent scenario-level target_address when all connects override");
+        assert!(s.target_address.is_none());
+        assert_eq!(s.steps[0].raw_params["target_address"], "host-a:3001");
+    }
+
+    #[test]
+    fn connect_without_per_step_address_requires_scenario_level() {
+        // A connect step with no per-step target_address and no scenario-level field.
+        let json = r#"{
+            "name":"t","network_magic":1,"trace_output_path":"t.jsonl",
+            "steps":[{"kind":"connect"},{"kind":"disconnect"}]
+        }"#;
+        let s: Scenario = serde_json::from_str(json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("target_address"), "error should mention target_address: {err}");
+    }
+
+    #[test]
+    fn target_address_on_non_connect_step_is_rejected() {
+        let json = r#"{
+            "name":"t","target_address":"x","network_magic":1,"trace_output_path":"t.jsonl",
+            "steps":[
+                {"kind":"connect"},
+                {"kind":"handshake","target_address":"sneaky:9999"},
+                {"kind":"disconnect"}
+            ]
+        }"#;
+        let s: Scenario = serde_json::from_str(json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("target_address is only valid on connect steps"), "{err}");
     }
 
     #[test]

@@ -1,0 +1,19 @@
+{
+  "name": "peer_identity_with_emit",
+  "description": "Connects with peer_id 'honest_peer', emits a peer_produced_block network-state event before running Chain-Sync. The trace contains both the imaginary-network event and the wire events, all attributed to 'honest_peer', interleaved by timestamp.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_peer_identity_with_emit.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "connect",   "as": "conn", "peer_id": "honest_peer" },
+    { "kind": "handshake", "on": "conn" },
+    {
+      "kind": "emit_peer_event",
+      "peer_id": "honest_peer",
+      "event_kind": "peer_produced_block",
+      "payload": { "slot": 1234, "block_hash": "deadbeef" }
+    },
+    { "kind": "chain_sync", "on": "conn", "count": 5 }
+  ]
+}

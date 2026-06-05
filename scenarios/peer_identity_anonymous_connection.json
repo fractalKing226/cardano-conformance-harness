@@ -1,0 +1,13 @@
+{
+  "name": "peer_identity_anonymous_connection",
+  "description": "Connection without peer_id. Wire events omit the peer_id field entirely. Confirms that the peer_id feature is purely additive and existing scenarios are unaffected.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_peer_identity_anonymous.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "connect" },
+    { "kind": "handshake" },
+    { "kind": "chain_sync", "count": 3 }
+  ]
+}

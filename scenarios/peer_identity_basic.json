@@ -1,0 +1,16 @@
+{
+  "name": "peer_identity_basic",
+  "description": "Two outgoing connections, each with a distinct peer_id. Both run Handshake and Chain-Sync in sequence. Trace events carry the peer_id of the connection they belong to, making them attributable to specific imaginary peers.",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_peer_identity_basic.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "connect",   "as": "conn_a", "peer_id": "alice" },
+    { "kind": "handshake", "on": "conn_a" },
+    { "kind": "chain_sync","on": "conn_a", "count": 3 },
+    { "kind": "connect",   "as": "conn_b", "peer_id": "bob" },
+    { "kind": "handshake", "on": "conn_b" },
+    { "kind": "chain_sync","on": "conn_b", "count": 3 }
+  ]
+}

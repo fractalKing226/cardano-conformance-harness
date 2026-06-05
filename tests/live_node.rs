@@ -21,7 +21,7 @@ fn make_scenario(name: &str, trace_path: &std::path::Path, steps: Vec<StepDef>) 
     Scenario {
         name: name.to_string(),
         description: None,
-        target_address: DEVNET_ADDR.to_string(),
+        target_address: Some(DEVNET_ADDR.to_string()),
         network_magic: DEVNET_MAGIC,
         trace_output_path: trace_path.to_path_buf(),
         expected_outcome: None,

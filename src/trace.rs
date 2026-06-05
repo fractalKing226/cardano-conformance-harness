@@ -93,6 +93,15 @@ pub enum EventKind {
     ServerHandshakeAccepted,
     ServerChainSyncStarted,
     ServerChainSyncCompleted,
+
+    // Peer-identity / imaginary-network events (emitted by emit_peer_event step)
+    PeerProducedBlock,
+    PeerCastVote,
+    PeerForkedChain,
+    PeerJoinedNetwork,
+    PeerLeftNetwork,
+    /// Catch-all for unknown event_kind strings passed to emit_peer_event.
+    PeerNetworkEvent,
 }
 
 /// Direction of a trace event relative to the harness.
@@ -118,6 +127,12 @@ pub struct TraceEvent {
     /// scenario-level meta-events (ScenarioStarted, VariableSet, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection: Option<String>,
+    /// Peer identity label for trace attribution. Set when the connection (or
+    /// emit_peer_event step) carries a peer_id. Independent of `connection` —
+    /// the connection name is an internal handle; the peer_id is for downstream
+    /// verifiers of the imaginary-network model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mini_protocol: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,6 +149,7 @@ impl TraceEvent {
             kind,
             direction,
             connection: None,
+            peer_id: None,
             mini_protocol: None,
             state_before: None,
             state_after: None,
@@ -170,6 +186,12 @@ impl TraceEvent {
         self.connection = Some(connection.into());
         self
     }
+
+    /// Tags an event with a peer identity label for downstream trace verifiers.
+    pub fn with_peer_id(mut self, peer_id: impl Into<String>) -> Self {
+        self.peer_id = Some(peer_id.into());
+        self
+    }
 }
 
 // ── Tracer ────────────────────────────────────────────────────────────────────
@@ -185,8 +207,19 @@ struct TracerInner {
 ///
 /// Multiple tasks may hold a `Tracer` clone and emit events concurrently.
 /// The async mutex ensures each event is a single coherent JSON-lines write.
+///
+/// Each clone may carry an independent `peer_id` context (set via
+/// `for_peer_opt`). When `emit` is called on a tracer with `peer_id` set,
+/// that label is automatically propagated to every outgoing event unless the
+/// event already has an explicit `peer_id`.
 #[derive(Clone)]
-pub struct Tracer(Arc<Mutex<TracerInner>>);
+pub struct Tracer {
+    inner:   Arc<Mutex<TracerInner>>,
+    /// Per-clone peer identity. Not inside the Arc so different clones
+    /// (e.g. parallel branches or different connections) carry distinct labels
+    /// while sharing the same underlying file handle.
+    peer_id: Option<String>,
+}
 
 impl Tracer {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
@@ -196,18 +229,35 @@ impl Tracer {
             .truncate(true)
             .open(path)
             .await?;
-        Ok(Self(Arc::new(Mutex::new(TracerInner {
-            file,
-            event_buffer: Vec::new(),
-        }))))
+        Ok(Self {
+            inner: Arc::new(Mutex::new(TracerInner {
+                file,
+                event_buffer: Vec::new(),
+            })),
+            peer_id: None,
+        })
     }
 
-    pub async fn emit(&self, event: TraceEvent) -> anyhow::Result<()> {
+    /// Returns a clone of this tracer tagged with `peer_id`.
+    /// Passing `None` is a no-op: returns an untagged clone.
+    pub fn for_peer_opt(&self, peer_id: Option<String>) -> Self {
+        Self {
+            inner:   Arc::clone(&self.inner),
+            peer_id: peer_id.or_else(|| self.peer_id.clone()),
+        }
+    }
+
+    pub async fn emit(&self, mut event: TraceEvent) -> anyhow::Result<()> {
+        // Propagate the tracer's peer_id context onto events that don't
+        // already carry an explicit peer_id.
+        if event.peer_id.is_none() {
+            event.peer_id = self.peer_id.clone();
+        }
         // Serialise outside the lock to minimise hold time.
         let v = serde_json::to_value(&event)?;
         let mut line = serde_json::to_string(&v)?;
         line.push('\n');
-        let mut inner = self.0.lock().await;
+        let mut inner = self.inner.lock().await;
         inner.event_buffer.push(v);
         inner.file.write_all(line.as_bytes()).await?;
         inner.file.flush().await?;
@@ -216,7 +266,7 @@ impl Tracer {
 
     /// Returns all events buffered since the last call, clearing the buffer.
     pub async fn drain_buffer(&self) -> Vec<Value> {
-        std::mem::take(&mut self.0.lock().await.event_buffer)
+        std::mem::take(&mut self.inner.lock().await.event_buffer)
     }
 }
 

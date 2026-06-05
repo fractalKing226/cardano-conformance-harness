@@ -81,7 +81,7 @@ impl ScenarioRunner {
                 json!({
                     "name":             self.scenario.name,
                     "description":      self.scenario.description,
-                    "target_address":   self.scenario.target_address,
+                    "target_address":   self.scenario.target_address.as_deref().unwrap_or(""),
                     "network_magic":    self.scenario.network_magic,
                     "steps":            self.scenario.steps.len(),
                     "expected_outcome": self.scenario.expected_outcome,
@@ -101,7 +101,7 @@ impl ScenarioRunner {
             match run_step(
                 step_def,
                 idx,
-                &self.scenario.target_address,
+                self.scenario.target_address.as_deref().unwrap_or(""),
                 self.scenario.network_magic,
                 &mut state,
                 &tracer,
@@ -216,6 +216,10 @@ struct ClientConnection {
     /// Legacy backing for `points: "from_chain_sync"`. Prefer explicit
     /// `output` + `"$varname"` in multi-connection scenarios.
     last_chain_sync_points: Vec<Point>,
+    /// Peer identity label for trace attribution (set by the connect step's
+    /// optional `peer_id` parameter). Propagated to every wire event emitted
+    /// on this connection via `tracer.for_peer_opt(conn.peer_id.clone())`.
+    peer_id: Option<String>,
 }
 
 /// State for one bound TCP listener, indexed by name.
@@ -234,6 +238,7 @@ struct ServerConnection {
     #[allow(dead_code)]
     ts_channel: Option<AgentChannel>,
     ka_handle: Option<JoinHandle<()>>,
+    peer_id: Option<String>,
 }
 
 // ── Runner state ──────────────────────────────────────────────────────────────
@@ -429,14 +434,15 @@ fn execute_step<'a>(
                 // No mini-protocol traffic is sent here — the Cardano N2N spec
                 // requires Handshake to complete before any other protocol can be
                 // used. Background workers are started in the Handshake arm below.
-                let bearer = Bearer::connect_tcp(target_address)
+                let addr = params.target_address.as_deref().unwrap_or(target_address);
+                let bearer = Bearer::connect_tcp(addr)
                     .await
-                    .with_context(|| format!("failed to connect to {target_address}"))?;
+                    .with_context(|| format!("failed to connect to {addr}"))?;
                 tracer
                     .emit(TraceEvent::new(
                         EventKind::ConnectionOpened,
                         Direction::Internal,
-                        json!({ "addr": target_address }),
+                        json!({ "addr": addr }),
                     ).with_connection(&conn_name))
                     .await?;
                 let mut plexer = Plexer::new(bearer);
@@ -457,6 +463,7 @@ fn execute_step<'a>(
                     ts_handle: None,
                     negotiated_version: None,
                     last_chain_sync_points: Vec::new(),
+                    peer_id: params.peer_id.clone(),
                 });
                 Ok(())
             }
@@ -472,7 +479,8 @@ fn execute_step<'a>(
                 let conn = co.get_mut();
                 let channel = conn.hs_channel.take()
                     .ok_or_else(|| anyhow::anyhow!("handshake: no channel (already used?)"))?;
-                let version = handshake_on_channel(channel, network_magic, tracer).await?;
+                let eff_trc = tracer.for_peer_opt(conn.peer_id.clone());
+                let version = handshake_on_channel(channel, network_magic, &eff_trc).await?;
                 conn.negotiated_version = Some(version);
 
                 let mut spawned_protocols: Vec<&str> = Vec::new();
@@ -534,8 +542,9 @@ fn execute_step<'a>(
                 let count = params.count.unwrap_or(10);
                 let await_secs = params.await_timeout_secs.unwrap_or(30);
 
+                let eff_trc = tracer.for_peer_opt(conn.peer_id.clone());
                 let summary = run_chain_sync(channel, intersection_points, count,
-                    Duration::from_secs(await_secs), tracer).await?;
+                    Duration::from_secs(await_secs), &eff_trc).await?;
 
                 let n = summary.collected_points.len();
                 conn.last_chain_sync_points = summary.collected_points.clone();
@@ -589,7 +598,8 @@ fn execute_step<'a>(
                     };
 
                 let batch_size = params.batch_size.unwrap_or(1);
-                let summary = run_block_fetch(channel, points.clone(), batch_size, tracer).await?;
+                let eff_trc = tracer.for_peer_opt(conn.peer_id.clone());
+                let summary = run_block_fetch(channel, points.clone(), batch_size, &eff_trc).await?;
 
                 if let Some(ref bfp) = state.capture_block_fixture_path {
                     if !summary.captured_blocks.is_empty() {
@@ -804,6 +814,7 @@ fn execute_step<'a>(
                     bf_channel: Some(bf_server_channel),
                     ts_channel: Some(ts_server_channel),
                     ka_handle: Some(ka_handle),
+                    peer_id: params.peer_id.clone(),
                 });
                 Ok(())
             }
@@ -854,11 +865,12 @@ fn execute_step<'a>(
                     }
                 };
 
+                let eff_trc = tracer.for_peer_opt(sc.peer_id.clone());
                 let summary = execute_response_script(
                     &mut cs_channel,
                     &script,
                     fixture_opt.as_ref(),
-                    tracer,
+                    &eff_trc,
                 )
                 .await?;
 
@@ -907,11 +919,12 @@ fn execute_step<'a>(
                     }
                 };
 
+                let eff_trc = tracer.for_peer_opt(sc.peer_id.clone());
                 let summary = execute_block_fetch_script(
                     &mut bf_channel,
                     &script,
                     bf_fixture_opt.as_ref(),
-                    tracer,
+                    &eff_trc,
                 )
                 .await?;
 
@@ -932,6 +945,31 @@ fn execute_step<'a>(
                     .emit(TraceEvent::new(EventKind::ServerListenStopped, Direction::Internal, json!({})))
                     .await?;
                 info!(listener = listener_name, "Listener stopped");
+                Ok(())
+            }
+
+            StepKind::EmitPeerEvent => {
+                let peer_id = params.peer_id.clone()
+                    .ok_or_else(|| anyhow::anyhow!("emit_peer_event: peer_id is required"))?;
+                let event_kind_str = params.event_kind.as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("emit_peer_event: event_kind is required"))?;
+                let payload = resolved.get("payload").cloned().unwrap_or(json!({}));
+
+                let kind = match event_kind_str {
+                    "peer_produced_block" => EventKind::PeerProducedBlock,
+                    "peer_cast_vote"      => EventKind::PeerCastVote,
+                    "peer_forked_chain"   => EventKind::PeerForkedChain,
+                    "peer_joined_network" => EventKind::PeerJoinedNetwork,
+                    "peer_left_network"   => EventKind::PeerLeftNetwork,
+                    other => {
+                        tracing::warn!(kind = other, "unknown peer event_kind; emitting as peer_network_event");
+                        EventKind::PeerNetworkEvent
+                    }
+                };
+
+                tracer
+                    .emit(TraceEvent::new(kind, Direction::Internal, payload).with_peer_id(peer_id))
+                    .await?;
                 Ok(())
             }
 

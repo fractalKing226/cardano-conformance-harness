@@ -1,7 +1,6 @@
 {
   "name": "parallel_with_error",
-  "description": "One branch sleeps for 10 seconds; the other immediately errors by referencing a connection name that was never created. The framework should abort the sleeping branch when the other fails, completing the scenario in well under 10 seconds.",
-  "target_address": "localhost:3001",
+  "description": "One branch connects to a real node and then sleeps 10 seconds; the other connects to a port with no listener. The second branch fails immediately, the first is aborted by the parallel step — total runtime should be well under 10 seconds. Also exercises per-step target_address: the scenario-level field is intentionally absent.",
   "network_magic": 42,
   "trace_output_path": "trace_parallel_with_error.jsonl",
   "expected_outcome": "failure",
@@ -10,11 +9,13 @@
       "kind": "parallel",
       "branches": [
         [
-          { "kind": "connect", "as": "slow_branch" },
+          { "kind": "connect", "as": "slow_branch", "target_address": "localhost:3001" },
           { "kind": "handshake", "on": "slow_branch" },
           { "kind": "sleep", "duration_secs": 10 }
         ],
-        [{ "kind": "handshake", "on": "nonexistent_connection" }]
+        [
+          { "kind": "connect", "as": "bad_conn", "target_address": "localhost:19999" }
+        ]
       ]
     }
   ]
