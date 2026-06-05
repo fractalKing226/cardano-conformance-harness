@@ -1,0 +1,28 @@
+{
+  "name": "block_fetch_no_blocks_after_start",
+  "description": "Server sends StartBatch (entering Streaming state) then immediately sends NoBlocks. NoBlocks is only valid from Busy state; after StartBatch the protocol is in Streaming and only Block or BatchDone are valid. Tests whether the client enforces this state invariant. Uses send_sequence so both sends fire for a single RequestRange without returning to the receive loop.",
+  "network_magic": 42,
+  "trace_output_path": "trace_bf_no_blocks_after_start_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3015" },
+    { "kind": "accept_handshake", "as": "client_conn", "peer_id": "no_blocks_mid_stream" },
+    {
+      "kind": "serve_block_fetch",
+      "on": "client_conn",
+      "responses": [
+        {
+          "on": "request_range",
+          "send": {
+            "kind": "send_sequence",
+            "sends": [
+              { "kind": "start_batch" },
+              { "kind": "no_blocks" }
+            ]
+          }
+        }
+      ]
+    },
+    { "kind": "close_listener" }
+  ]
+}

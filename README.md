@@ -8,10 +8,16 @@ separate verifier will check those traces against Agda specifications.
 
 ## What this version does
 
-Reads a scenario JSON file at startup and executes its steps in order. Each step
-corresponds to a protocol action: connect, handshake, chain-sync, block-fetch,
-sleep, or disconnect. Every message sent and received across all mini-protocols
-is appended to a JSON-lines trace file.
+Reads a scenario JSON file at startup and executes its steps in order. Supports:
+
+- **Client mode** — connect, handshake, chain-sync, block-fetch, query-tip, sleep, disconnect
+- **Server mode** — listen, accept incoming connections, serve scripted Chain-Sync and Block-Fetch responses (honest or adversarial)
+- **Parallel execution** — run branches of steps concurrently; abort all if any branch fails
+- **Named connections** — multiple outgoing or accepted connections in the same scenario, each with an explicit name
+- **Peer identity** — connections carry an optional `peer_id` label that propagates to every wire event for trace attribution
+- **Variables** — steps can write outputs to named variables that later steps reference with `$name` syntax
+- **Adversarial serving** — scripted response rules send spec-incorrect messages (wrong state, truncated batches, malformed CBOR) to produce conformance evidence
+- **Fixture capture** — `--capture-fixture` and `--capture-block-fixture` record real-node traffic into replayable JSONL files
 
 ## Prerequisites
 
@@ -58,13 +64,14 @@ cargo run -- --scenario my_preprod_scenario.json
 ## CLI
 
 ```
-cardano-conformance-harness --scenario <PATH>
+cardano-conformance-harness --scenario <PATH> [--capture-fixture <PATH>] [--capture-block-fixture <PATH>]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--scenario` | `scenarios/default.json` | Path to the scenario JSON file |
-| `--capture-fixture` | — | Write every RollForward header from `chain_sync` steps to this JSONL file for later use as a `serve_chain_sync` fixture |
+| `--capture-fixture` | — | Write every `RollForward` header from `chain_sync` steps to this JSONL file for later use as a `serve_chain_sync` fixture |
+| `--capture-block-fixture` | — | Write every block body from `block_fetch` steps (when `batch_size: 1`) to this JSONL file for later use as a `serve_block_fetch` fixture |
 
 ### Logging
 
@@ -76,7 +83,7 @@ RUST_LOG=debug cargo run -- --scenario scenarios/default.json
 
 A scenario is a JSON file that describes a sequence of steps to execute.
 
-### Minimal example (28 lines)
+### Minimal example
 
 ```json
 {
@@ -101,14 +108,14 @@ A scenario is a JSON file that describes a sequence of steps to execute.
 |-------|----------|-------------|
 | `name` | yes | Human-readable name, emitted in `scenario_started` / `scenario_completed` |
 | `description` | no | Free-text description |
-| `target_address` | yes | Node address as `host:port` |
+| `target_address` | conditional | Node address as `host:port`. Required if any `connect` step omits its own `target_address`; may be absent when every `connect` step specifies its own |
 | `network_magic` | yes | Cardano network magic number |
 | `trace_output_path` | yes | Path for the JSON-lines trace output |
 | `expected_outcome` | no | Informational string logged in `scenario_completed` (e.g. `"success"`) |
 
 ### Named connections (`as` and `on`)
 
-Steps that open a connection or listener accept an optional **`as: <name>`** field to give it a name. Steps that act on an existing connection accept an optional **`on: <name>`** field to select which connection to use. Both default to `"default"` for backwards compatibility — existing single-connection scenarios work unchanged.
+Steps that open a connection or listener accept an optional **`as: <name>`** field to give it a name. Steps that act on an existing connection accept an optional **`on: <name>`** field to select which connection to use. Both default to `"default"` — existing single-connection scenarios work unchanged.
 
 ```json
 { "kind": "connect",    "as": "peer_a" }
@@ -117,18 +124,27 @@ Steps that open a connection or listener accept an optional **`as: <name>`** fie
 { "kind": "handshake",  "on": "peer_b" }
 { "kind": "chain_sync", "on": "peer_a", "count": 5  }
 { "kind": "chain_sync", "on": "peer_b", "count": 10 }
-{ "kind": "disconnect", "on": "peer_a" }
-{ "kind": "disconnect", "on": "peer_b" }
 ```
 
-Every wire event in the trace includes a `"connection": "<name>"` field so each event is clearly attributed to its connection.
+Every wire event in the trace includes a `"connection": "<name>"` field.
 
 **Validation rules:**
-- `as` names must be unique within a scenario (no duplicate connections with the same name).
-- `on` must refer to a connection that was opened by an earlier step in the scenario.
+- `as` names must be unique within a scenario.
+- `on` must refer to a connection opened by an earlier step.
 - The validator reports forward references and duplicates at parse time.
 
-**Note on `from_chain_sync` scoping:** When using `points: "from_chain_sync"` with named connections, the points come from the most-recent `chain_sync` step on the *same connection* (`on` name). For clarity in multi-connection scenarios, prefer explicit variables: `chain_sync output: "pts"` then `block_fetch points: "$pts"`. `from_chain_sync` is convenient for simple single-connection scenarios but becomes ambiguous when multiple connections are active.
+### Peer identity (`peer_id`)
+
+`connect` and `accept_handshake` steps accept an optional **`peer_id: <string>`** field. The label propagates to every wire event emitted on that connection as `"peer_id": "<value>"` in the trace, alongside the `connection` name.
+
+`peer_id` is for external attribution (verifiers, imaginary-network models); `as`/`on` names are internal handles. A connection can have either, both, or neither.
+
+```json
+{ "kind": "connect", "as": "conn_a", "peer_id": "alice" }
+{ "kind": "connect", "as": "conn_b", "peer_id": "bob" }
+```
+
+Multiple connections may share the same `peer_id` (e.g. a peer that reconnects).
 
 ### Variables
 
@@ -140,47 +156,36 @@ Later steps reference variables using a `$name` prefix.
 { "kind": "chain_sync", "intersection_points": ["$tip.point"], "count": 5 }
 ```
 
-**Supported reference forms:**
-
 | Form | Meaning |
 |------|---------|
 | `$name` | The whole variable value |
 | `$name.field` | A field of a record variable |
 | `$name[i]` | An element of a list variable |
 
-Variable substitution happens at parameter-binding time, just before each step executes. Any string starting with `$` in any parameter field is treated as a reference. A `VariableReferenced` trace event is emitted for every substitution made, and a `VariableSet` event is emitted when a step stores a result.
-
-Unresolved references produce a clear error: `unknown variable: "foo"` or `"tip" has no field "slut"`.
+Variable substitution happens at parameter-binding time, just before each step executes. A `VariableReferenced` trace event is emitted for every substitution; `VariableSet` is emitted when a step stores a result. Unresolved references produce a clear error at that point.
 
 ### Step kinds and parameters
 
 > **Note on channel reuse.** Each `chain_sync` and `block_fetch` step consumes its
-> multiplexer channel (the channel is passed into the Pallas client by value and is
-> gone after `MsgDone`). A second `chain_sync` step on the same connection will fail
-> with "no channel". Use a `disconnect` / `connect` / `handshake` cycle between
-> sessions if you need multiple chain-sync rounds. Channel reuse across sequential
-> sessions is a planned improvement.
+> multiplexer channel. A second step of the same kind on the same connection will fail
+> with "no channel". Use a `disconnect` / `connect` / `handshake` cycle to open a fresh session.
 
 #### `connect`
 
-Opens a TCP connection to `target_address` and subscribes the full N2N
-mini-protocol suite on the multiplexer before spawning it.
+Opens a TCP connection and subscribes the full N2N mini-protocol suite.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `target_address` | scenario-level `target_address` | Override the scenario-level address for this connection only — useful in parallel scenarios where branches connect to different hosts |
+| `peer_id` | — | Peer identity label propagated to all wire events on this connection |
 
 | Protocol | ID | Status |
 |----------|----|--------|
 | Handshake | 0 | Active — required before any other protocol |
 | Chain-Sync | 2 | Active — `chain_sync` step |
 | Block-Fetch | 3 | Active — `block_fetch` step |
-| Tx-Submission | 4 | Subscribed, idle — no step handler yet |
+| Tx-Submission | 4 | Subscribed, idle |
 | Keep-Alive | 8 | Active — background loop sends periodic pings |
-| Peer-Sharing | — | Not in pallas-network 0.36.0; will be added version-conditionally (≥ v13) |
-
-All subscriptions happen before `plexer.spawn()` (a Pallas requirement). Unused
-channels sit idle at negligible memory cost. The keep-alive client loop starts
-immediately and sends `MsgKeepAlive(cookie)` every 20 s; the node echoes
-`MsgResponseKeepAlive(cookie)`. Without this the node drops the connection.
-
-A scenario may contain multiple `connect` / `disconnect` cycles in any order.
 
 #### `handshake`
 
@@ -194,63 +199,97 @@ Runs the NodeToNode Handshake mini-protocol. No parameters.
 | `count` | `10` | Headers to consume before `MsgDone` |
 | `await_timeout_secs` | `30` | Seconds to wait in MustReply state |
 
-Collects the point of each `RollForward` header (slot + blake2b-256 of header
-bytes). When `output` is set, stores the collected points as a list in the named
-variable so a later `block_fetch` can reference them via `"$varname"`.
+When `output` is set, stores collected points as a list variable for a later `block_fetch`.
 
 #### `block_fetch`
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `points` | `"from_chain_sync"` | `"from_chain_sync"` (deprecated — prefer `output` + `"$varname"`), a `"$varname"` reference, or an array of `"slot:hex_hash"` strings |
+| `points` | `"from_chain_sync"` | `"from_chain_sync"` (deprecated), a `"$varname"` reference, or an array of `"slot:hex_hash"` strings |
 | `batch_size` | `1` | Points per `MsgRequestRange` |
 
-The `"from_chain_sync"` keyword still works for backward compatibility but is deprecated. Prefer the explicit variable pattern:
+Prefer the explicit variable pattern over `from_chain_sync`:
 
 ```json
 { "kind": "chain_sync", "count": 5, "output": "pts" }
 { "kind": "block_fetch", "points": "$pts" }
 ```
 
+**Fixture capture:** when `--capture-block-fixture` is active and `batch_size: 1`, each received block body is appended to the fixture file with its slot and hash taken from the requested point. `batch_size > 1` does not capture (per-block slot/hash is indeterminate without CBOR parsing).
+
 #### `query_tip`
 
-Opens a temporary TCP connection, performs a handshake, and does a minimal
-Chain-Sync round-trip to obtain the current chain tip. The connection is
-closed after the query. All wire events are logged to the trace.
+Opens a temporary TCP connection, performs a handshake, and does a minimal Chain-Sync round-trip to obtain the current chain tip.
 
 | Output variable shape | Fields |
 |-----------------------|--------|
-| `tip` record | `point` (string: `"origin"` or `"slot:hex_hash"`), `block_number` (integer) |
+| `tip` record | `point` (string), `block_number` (integer) |
 
 ```json
 { "kind": "query_tip", "output": "tip" }
 ```
 
-After this step, `$tip.point` is a valid intersection point string and
-`$tip.block_number` is the block number at the time of the query.
+#### `sleep`
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `duration_secs` | yes | Seconds to sleep (literal or `$varname`) |
 
 #### `repeat`
-
-Executes a sequence of body steps a fixed number of times.
 
 | Parameter | Description |
 |-----------|-------------|
 | `times` | Number of iterations — a literal integer or a `$varname` reference |
 | `body` | Array of steps to execute each iteration |
 
-Variables written inside the body (via `output`) persist to the outer scope and
-accumulate across iterations. A `RepeatIterationStarted` and `RepeatIterationCompleted`
-event is emitted around each iteration. If a body step fails, the iteration fails
-and the repeat step fails, aborting the scenario at that point.
+Variables written inside `body` accumulate to the outer scope. `RepeatIterationStarted` / `RepeatIterationCompleted` events bracket each iteration.
+
+#### `parallel`
+
+Runs multiple branches of steps concurrently. All branches share the same connection and variable stores (via Arc-wrapped state). Each branch gets an independent clone of the runner state at the start.
+
+| Parameter | Description |
+|-----------|-------------|
+| `branches` | Array of step arrays; each inner array is one branch |
 
 ```json
 {
-  "kind": "repeat",
-  "times": 4,
-  "body": [
-    { "kind": "chain_sync", "count": 3, "output": "pts" },
-    { "kind": "block_fetch", "points": "$pts" }
+  "kind": "parallel",
+  "branches": [
+    [
+      { "kind": "connect", "as": "conn_a" },
+      { "kind": "handshake", "on": "conn_a" },
+      { "kind": "chain_sync", "on": "conn_a", "count": 5 }
+    ],
+    [
+      { "kind": "connect", "as": "conn_b" },
+      { "kind": "handshake", "on": "conn_b" },
+      { "kind": "chain_sync", "on": "conn_b", "count": 5 }
+    ]
   ]
+}
+```
+
+All branches run concurrently on the same async executor (cooperative, not OS-thread parallel). If any branch fails, the remaining branches are dropped and the `parallel` step fails. Branches must use disjoint connection names.
+
+Trace events: `parallel_started`, `parallel_branch_started`, `parallel_branch_completed` / `parallel_branch_failed` / `parallel_branch_aborted` (with `last_step` index for aborted branches), `parallel_completed`.
+
+#### `emit_peer_event`
+
+Emits a peer-identity network-state event into the trace without using any connection. Models imaginary-network activity (block production, votes, fork choices) as first-class trace entries independent of wire connections.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `peer_id` | yes | Which peer performed this action |
+| `event_kind` | yes | Type of event: `peer_produced_block`, `peer_cast_vote`, `peer_forked_chain`, `peer_joined_network`, `peer_left_network`. Unknown values emit a warning and use `peer_network_event` |
+| `payload` | no | Arbitrary JSON object with event-specific data (slot, block_hash, etc.) — carried verbatim in the trace |
+
+```json
+{
+  "kind": "emit_peer_event",
+  "peer_id": "honest_peer",
+  "event_kind": "peer_produced_block",
+  "payload": { "slot": 1234, "block_hash": "deadbeef" }
 }
 ```
 
@@ -262,70 +301,109 @@ Closes the TCP connection cleanly. No parameters.
 
 ### Server-side step kinds
 
-A scenario is either **client-mode** (uses `connect`/`handshake`/…) or **server-mode** (uses `listen`/`accept_handshake`/…). The two must not appear in the same scenario — the validator rejects mixed scenarios at load time.
+A scenario is either **client-mode** or **server-mode**. The validator rejects scenarios that mix the two at load time.
 
 #### `listen`
 
-Binds a TCP listener. The harness becomes the responder for the next incoming connection.
+Binds a TCP listener.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `bind_address` | `"0.0.0.0:3001"` | Address and port to bind |
 
+The listener's `Arc<TcpListener>` is stored so multiple `accept_handshake` steps in parallel branches can accept concurrently.
+
 #### `accept_handshake`
 
-Accepts the next TCP connection and completes the NodeToNode Handshake as the **responder**. Emits `ServerBearerAccepted` immediately after the TCP accept succeeds (before handshake begins — the server-side mirror of `connection_opened`), then wire-level `HandshakeVersionProposed` (received, peer→harness) and `HandshakeVersionAccepted` (sent, harness→peer) events with their directions reversed from client-side convention. No parameters.
+Accepts the next TCP connection and completes the NodeToNode Handshake as the **responder**.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `peer_id` | — | Peer identity label for the accepted connection; propagated to all subsequent wire events on this connection |
+
+Emits `server_bearer_accepted` immediately after the TCP accept (before handshake begins), then handshake wire events with directions reversed (received = peer→harness, sent = harness→peer).
 
 #### `serve_chain_sync`
 
-Executes a **response script** against the connected client's Chain-Sync session.
-The script is either auto-generated from a fixture or specified explicitly as a
-`responses` list. Both forms use the same execution path; the harness has no
-opinion about whether the responses are spec-correct.
+Executes a response script against the client's Chain-Sync session.
 
 | Parameter | Form | Description |
 |-----------|------|-------------|
-| `fixture_path` | auto | Path to a JSONL fixture. Generates an honest script: `FindIntersect` → cursor search, `RequestNext` × N → `RollForward` per entry, then `AwaitReply`, then disconnect. |
+| `fixture_path` | auto | Path to a chain-sync JSONL fixture. Auto-generates an honest script. |
 | `responses` | explicit | Ordered list of response rules (see below). |
-| `fixture_path` + `responses` | hybrid | `responses` drives the script; `fixture_path` is loaded so `header_from_fixture` references can resolve headers. |
-| `await_at_tip_secs` | auto only | Seconds to hold in MustReply at tip before disconnecting (default 30, max 300). Only used when `fixture_path` auto-generates the script. |
+| `fixture_path` + `responses` | hybrid | `responses` drives; `fixture_path` provides header sources for `header_from_fixture` references. |
+| `await_at_tip_secs` | auto only | Seconds to hold in MustReply at tip (default 30, max 300). |
 
-At least one of `fixture_path` or `responses` is required.
+#### `serve_block_fetch`
 
-##### Response rules
+Executes a response script against the client's Block-Fetch session.
 
-Each rule in `responses` has an `on` field (which incoming message it matches)
-and a `send` field (what the harness sends back). Rules are consumed in order;
-the first unconsumed rule whose `on` matches the incoming message is executed.
+| Parameter | Form | Description |
+|-----------|------|-------------|
+| `block_fetch_fixture_path` | — | Path to a block-fetch JSONL fixture. Required if any rule references `block_from_fixture` or `stream_batch` with `block_count_from_request`. |
+| `responses` | explicit | Ordered list of response rules (see below). |
+| `no_blocks_default` | auto | If `true` and `responses` is absent, auto-generate a script that declines every range with `NoBlocks`. |
 
-**`on` values:** `request_next`, `find_intersect`, `done`, `any`
+At least one of `block_fetch_fixture_path` (with auto-generation) or `responses` is required.
+
+#### `close_listener`
+
+Stops the TCP listener. Active server connections remain open until their `serve_*` step completes. No parameters.
+
+---
+
+### Response rules
+
+Both `serve_chain_sync` and `serve_block_fetch` accept an explicit `responses` list. Each rule has an `on` field and a `send` field. Rules are consumed in order; the first unconsumed rule matching the incoming message fires.
+
+**`on` values:** `request_next`, `find_intersect`, `request_range`, `done`, `any`
 
 **`send` kinds:**
 
 | Kind | Key fields | Notes |
 |------|-----------|-------|
-| `roll_forward` | `header_from_fixture: N` or `header_cbor: <hex>` + optional `variant: u8` | `variant` defaults to `DEFAULT_HEADER_VARIANT` (6, Conway) when using literal CBOR |
-| `roll_backward` | `point: "origin"` or `"slot:hash"` | |
-| `intersect_found` | `point` | Can be sent from any state — harness does not enforce |
-| `intersect_not_found` | | |
-| `await_reply` | `hold_secs: N` (default 0) | Puts client in MustReply; harness sleeps `hold_secs` then continues |
-| `wait` | `duration_secs: N` | Pause without sending anything |
-| `disconnect` | | Drop the TCP connection immediately |
-| `raw_bytes` | `hex: <hex>` | Send arbitrary bytes — malformed CBOR, garbage, anything |
+| `roll_forward` | `header_from_fixture: N` or `header_cbor: <hex>` + optional `variant: u8` | Chain-Sync only |
+| `roll_backward` | `point: "origin"\|"slot:hash"` | Chain-Sync only |
+| `intersect_found` | `point` | Chain-Sync only |
+| `intersect_not_found` | — | Chain-Sync only |
+| `await_reply` | `hold_secs: N` (default 0) | Chain-Sync only; puts client in MustReply |
+| `start_batch` | — | Block-Fetch only; MsgStartBatch |
+| `block` | `block_from_fixture: N` or `block_cbor: <hex>` | Block-Fetch only; MsgBlock |
+| `batch_done` | — | Block-Fetch only; MsgBatchDone |
+| `no_blocks` | — | Block-Fetch only; MsgNoBlocks |
+| `stream_batch` | `block_indices: [N,…]` or `block_count_from_request: true` | Block-Fetch only; convenience — emits StartBatch + N×Block + BatchDone for one RequestRange without returning to the receive loop |
+| `send_sequence` | `sends: [<send>,…]` | Any protocol; emits multiple sends for **one incoming message** without returning to the receive loop between them. Nesting a `send_sequence` inside another is rejected at parse time. |
+| `wait` | `duration_secs: N` | Pause without sending |
+| `disconnect` | — | Drop the TCP connection immediately |
+| `raw_bytes` | `hex: <hex>` | Send arbitrary bytes — malformed CBOR, truncated frames, etc. |
 
-Optional `tip` object (`{ "point": "slot:hash", "block_number": N }`) on any
-send kind overrides the tip included in the response. Omitting it uses the
-fixture tip (if a fixture is loaded) or a zero tip.
+Optional `tip` object on any Chain-Sync send kind overrides the included tip.
+Optional `repeatable: true` on any rule makes it refire on every subsequent matching message (useful for auto-generated scripts).
 
-##### Adversarial use
+The execution loop never validates responses against the current protocol state. The trace records the state the harness *tracked* before and after each send, so a verifier can see exactly which state the violation occurred in.
 
-The execution loop never validates responses against the current protocol state.
-`intersect_found` sent from `CanAwait`, `raw_bytes` at any point — whatever the
-scenario says goes out on the wire. The trace records the state the harness
-*tracked* before and after each send, so the verifier can see exactly which
-state the violation occurred in.
+#### `send_sequence` — producer-driven streaming
 
-##### Example: out-of-state IntersectFound
+Block-Fetch's streaming model is one-way: after `RequestRange`, the server pushes blocks without client acknowledgment. Rules with a single `send` fire once per received message, which means a `start_batch` rule would wait for a second client message that never arrives in Streaming state. `send_sequence` solves this by emitting all its sub-sends for the **same** incoming message:
+
+```json
+{
+  "on": "request_range",
+  "send": {
+    "kind": "send_sequence",
+    "sends": [
+      { "kind": "start_batch" },
+      { "kind": "block", "block_cbor": "a0" },
+      { "kind": "block", "block_cbor": "a0" },
+      { "kind": "disconnect" }
+    ]
+  }
+}
+```
+
+`stream_batch` is the honest variant of this pattern (always ends with `BatchDone`). `send_sequence` covers adversarial variants such as disconnect mid-batch or `NoBlocks` after `StartBatch`.
+
+#### Adversarial example: out-of-state IntersectFound
 
 ```json
 {
@@ -334,38 +412,27 @@ state the violation occurred in.
   "responses": [
     { "on": "find_intersect", "send": { "kind": "intersect_found", "point": "origin" } },
     { "on": "request_next",   "send": { "kind": "roll_forward", "header_from_fixture": 0 } },
-    { "on": "request_next",   "send": { "kind": "roll_forward", "header_from_fixture": 1 } },
     { "on": "request_next",   "send": { "kind": "intersect_found", "point": "origin" } },
     { "on": "any",            "send": { "kind": "disconnect" } }
   ]
 }
 ```
 
-When a spec-conformant client receives `IntersectFound` from `CanAwait` state,
-Pallas returns `"inbound message is not valid for current state"` and the client
-disconnects. The client trace carries the error event; the server trace shows the
-violation was sent as scripted. This is the harness performing adversarial
-conformance testing.
-
-#### `close_listener`
-
-Stops the TCP listener and closes any active accepted connection. No parameters.
-
 ---
 
-### Chain fixture format
+### Fixture formats
 
-Fixture files are JSONL (one JSON object per line). The first line is the **anchor** — the point before the first served header. Remaining lines are block headers in chain order.
+#### Chain-Sync fixture (JSONL)
+
+First line is the **anchor**; remaining lines are block headers in chain order.
 
 ```jsonl
 {"anchor": true}
-{"slot":62,"block_hash":"5a3d778e76741a009e29d23093cfe046131808d34d7c864967b515e98dfc358","block_number":1,"cbor_hex":"828a00183ef658..."}
-{"slot":63,"block_hash":"14051e8b3d14cd58b7a16e76716cd9eb002c569d0a7273096c0c9069da3d4b4","block_number":2,"cbor_hex":"828a01183f5820..."}
+{"slot":62,"block_hash":"5a3d778e...","block_number":1,"cbor_hex":"828a00183e..."}
+{"slot":63,"block_hash":"14051e8b...","block_number":2,"cbor_hex":"828a01183f..."}
 ```
 
-`{"anchor": true}` means genesis (`Point::Origin`). A mid-chain anchor can include `slot` and `block_hash` fields.
-
-**Capture a fixture** from a real or devnet node:
+Capture from a real node:
 
 ```sh
 cargo run -- \
@@ -373,51 +440,47 @@ cargo run -- \
   --capture-fixture fixtures/devnet_genesis.jsonl
 ```
 
+#### Block-Fetch fixture (JSONL)
+
+Same structure. First line is the anchor; remaining lines are block bodies.
+
+```jsonl
+{"anchor": true}
+{"slot":62,"block_hash":"5a3d778e...","block_cbor_hex":"820a82..."}
+{"slot":63,"block_hash":"14051e8b...","block_cbor_hex":"820a83..."}
+```
+
+Capture using `batch_size: 1` so each block's slot and hash are known from the request:
+
+```sh
+cargo run -- \
+  --scenario scenarios/capture_blocks_for_fixture.json \
+  --capture-block-fixture fixtures/devnet_blocks.jsonl
+```
+
 ---
 
 ### Pointing a real cardano-node at the harness
 
-To use a real `cardano-node` as the client under test against the harness in server mode, add the harness to the node's topology with an outgoing connection:
+Add the harness to the node's topology as an outgoing connection:
 
 ```json
 {
-  "localRoots": [
-    {
-      "accessPoints": [
-        { "address": "127.0.0.1", "port": 3001 }
-      ],
-      "advertise": false,
-      "trustable": true,
-      "valency": 1
-    }
-  ],
-  "publicRoots": [],
-  "useLedgerAfterSlot": -1
+  "localRoots": [{
+    "accessPoints": [{ "address": "127.0.0.1", "port": 3001 }],
+    "advertise": false, "trustable": true, "valency": 1
+  }],
+  "publicRoots": [], "useLedgerAfterSlot": -1
 }
 ```
 
-Set the node's `--host-addr 127.0.0.1` so it initiates outbound connections. The harness must be running in server mode (`serve_chain_to_one_client.json` or similar) before the node starts.
+The harness must be running in server mode before the node starts.
 
 ---
 
-### Known limitations
-
-- **Single client per session.** One incoming connection per `listen`/`close_listener` cycle.
-- **No rollback in auto-generated scripts.** Fixture-driven serving never sends `MsgRollBackward`. Explicit `responses` rules can include `roll_backward` if needed.
-- **Chain-Sync only.** Block-Fetch server is a future slice.
-- **Channel reuse.** A connection's Chain-Sync channel is consumed after one session. Multiple `serve_chain_sync` steps on the same connection are not yet supported.
-
-#### `sleep`
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `duration_secs` | yes | Seconds to sleep |
-
 ### Assertions (`expect`)
 
-Any step can have an optional `expect` object. Assertions are evaluated against
-the events emitted by that step. Failures emit `assertion_failed` and abort the
-scenario with a non-zero exit code.
+Any step can have an optional `expect` object. Failures emit `assertion_failed` and abort the scenario.
 
 ```json
 {
@@ -437,6 +500,8 @@ scenario with a non-zero exit code.
 | `must_contain_kind` | Each listed kind must appear at least once |
 | `must_not_contain_kind` | None of the listed kinds may appear |
 
+---
+
 ### Network magic quick-reference
 
 | Network | Magic |
@@ -447,125 +512,143 @@ scenario with a non-zero exit code.
 | Preview | `2` |
 | SanchoNet | `4` |
 
+---
+
 ### Included scenarios
+
+#### Client-side
 
 | File | Description |
 |------|-------------|
-| `scenarios/default.json` | Chain-Sync 10 headers + Block-Fetch (the default) |
-| `scenarios/chain_sync_only.json` | Chain-Sync 5 headers, no block fetch |
-| `scenarios/chain_sync_then_block_fetch.json` | Chain-Sync 10 + Block-Fetch |
-| `scenarios/assertion_demo.json` | Demonstrates `expect` clauses |
-| `scenarios/query_tip_chain_sync.json` | Query tip, then Chain-Sync from that tip |
-| `scenarios/repeat_demo.json` | Repeat 4×: sync 3 headers + fetch bodies |
-| `scenarios/combined_variables.json` | All features: variables, query_tip, repeat |
-| `scenarios/capture_chain_for_fixture.json` | Capture 20 headers to a fixture file |
-| `scenarios/serve_chain_to_one_client.json` | Server-mode: fixture auto-script, serve until client sends Done |
-| `scenarios/serve_chain_long_session.json` | Server-mode: fixture auto-script, hold 60 s at tip |
-| `scenarios/scripted_honest_serve.json` | Server-mode: explicit responses, honest behaviour |
-| `scenarios/scripted_stall_at_tip.json` | Server-mode: serve 3 headers then stall 60 s (AwaitReply) |
-| `scenarios/scripted_out_of_state_intersect.json` | Server-mode: adversarial — IntersectFound sent from CanAwait |
-| `scenarios/multi_peer_two_outgoing.json` | Two named outgoing connections, chain_sync on each |
-| `scenarios/multi_peer_consistency_check.json` | Same range synced from two connections, output to named variables |
-| `scenarios/multi_peer_server_two_clients.json` | One listener, two sequential clients served from the same fixture |
+| `default.json` | Chain-Sync 10 headers + Block-Fetch |
+| `chain_sync_only.json` | Chain-Sync 5 headers |
+| `chain_sync_then_block_fetch.json` | Chain-Sync 10 + Block-Fetch |
+| `assertion_demo.json` | Demonstrates `expect` clauses |
+| `query_tip_chain_sync.json` | Query tip, then Chain-Sync from that tip |
+| `repeat_demo.json` | Repeat 4×: sync 3 headers + fetch bodies |
+| `combined_variables.json` | Variables, query_tip, repeat together |
+| `capture_chain_for_fixture.json` | Capture 20 headers to a chain-sync fixture |
+| `capture_blocks_for_fixture.json` | Capture 20 block bodies to a block-fetch fixture |
+| `multi_peer_two_outgoing.json` | Two named outgoing connections, chain_sync on each |
+| `multi_peer_consistency_check.json` | Same range synced from two connections, output to named variables |
+| `client_block_fetch_one_range.json` | Minimal block-fetch client for adversarial server tests |
+
+#### Parallel
+
+| File | Description |
+|------|-------------|
+| `parallel_two_clients.json` | Two client connections opened and synced concurrently |
+| `parallel_server_two_chains.json` | Two incoming connections served in parallel from the same listener |
+| `parallel_with_error.json` | One branch uses a valid address; the other uses an invalid one — tests abort-on-first-error with per-step `target_address` |
+
+#### Peer identity
+
+| File | Description |
+|------|-------------|
+| `peer_identity_basic.json` | Two connections with distinct `peer_id`s; trace events carry the labels |
+| `peer_identity_with_emit.json` | `emit_peer_event` for `peer_produced_block` interleaved with wire events |
+| `peer_identity_anonymous_connection.json` | Connection without `peer_id` — confirms `peer_id` field is absent in trace |
+
+#### Server-side — honest
+
+| File | Description |
+|------|-------------|
+| `serve_chain_to_one_client.json` | Fixture auto-script, serve until client sends Done |
+| `serve_chain_long_session.json` | Fixture auto-script, hold 60 s at tip |
+| `scripted_honest_serve.json` | Explicit responses, honest behaviour |
+| `scripted_honest_block_fetch.json` | Honest Block-Fetch auto-script from fixture |
+| `scripted_no_blocks_decline.json` | Decline every range with NoBlocks |
+| `multi_peer_server_two_clients.json` | One listener, two sequential clients served from the same fixture |
+
+#### Server-side — adversarial Chain-Sync
+
+| File | Description |
+|------|-------------|
+| `scripted_stall_at_tip.json` | 3 headers then AwaitReply for 60 s |
+| `scripted_out_of_state_intersect.json` | IntersectFound sent from CanAwait state |
+
+#### Server-side — adversarial Block-Fetch
+
+Each scenario is paired with `client_block_fetch_one_range.json` in the integration tests.
+
+| File | Port | Violation | `peer_id` |
+|------|------|-----------|-----------|
+| `block_fetch_mid_batch_disconnect.json` | 3010 | StartBatch + 2 blocks + Disconnect (no BatchDone) | `mid_batch_dropper` |
+| `block_fetch_block_outside_batch.json` | 3011 | Block sent from Busy state (no preceding StartBatch) | `busy_state_block_sender` |
+| `block_fetch_batch_done_without_start.json` | 3012 | BatchDone sent from Busy state (no StartBatch) | `premature_batch_done` |
+| `block_fetch_excessive_blocks.json` | 3013 | 10 blocks served for a 1-block request | `block_overflower` |
+| `block_fetch_malformed_block.json` | 3014 | Raw `0x82 0xff` CBOR sent in Busy state | `cbor_poisoner` |
+| `block_fetch_no_blocks_after_start.json` | 3015 | StartBatch then NoBlocks (invalid in Streaming) | `no_blocks_mid_stream` |
+
+---
 
 ## Trace file format
 
 Each line is a self-contained JSON object.
 
-### Direction values
+### Top-level fields
 
-| Value | Meaning |
-|-------|---------|
-| `sent` | Wire message sent by the harness |
-| `received` | Wire message received from the node |
-| `internal` | Harness-generated meta-event (session start/end, summary, assertion, error) — not a single wire message |
+| Field | Always present | Description |
+|-------|---------------|-------------|
+| `timestamp` | yes | RFC 3339 timestamp |
+| `kind` | yes | Event kind (snake_case) |
+| `direction` | yes | `sent`, `received`, or `internal` |
+| `connection` | wire + lifecycle events | Connection name (`"default"` or explicit `as` name) |
+| `peer_id` | when set on connection | Peer identity label from `connect`/`accept_handshake` `peer_id` parameter, or from `emit_peer_event` |
+| `mini_protocol` | wire events | `"chain-sync"`, `"block-fetch"`, etc. |
+| `state_before` | wire events | Protocol state before the message |
+| `state_after` | wire events | Protocol state after the message |
+| `payload` | yes | Event-specific JSON object |
 
-`sent` and `received` events carry `state_before` and `state_after`.
-`internal` events carry only `mini_protocol` (when applicable) and `payload`.
+`sent`/`received` events carry `state_before` and `state_after`. `internal` events carry only `mini_protocol` (when applicable).
 
-### Scenario-level events
-
-```json
-{"kind":"scenario_started","direction":"internal","payload":{"name":"chain_sync_only","steps":4,...}}
-{"kind":"step_started","direction":"internal","payload":{"index":0,"kind":"connect"}}
-{"kind":"step_completed","direction":"internal","payload":{"index":0,"outcome":"ok"}}
-{"kind":"assertion_passed","direction":"internal","payload":{"step_index":1,"assertion":"must_contain_kind:handshake_completed","message":"found event with kind \"handshake_completed\""}}
-{"kind":"scenario_completed","direction":"internal","payload":{"name":"chain_sync_only","steps_passed":4,"steps_failed":0,"duration_ms":87,"outcome":"completed"}}
-```
-
-### Handshake events
-
-```json
-{"kind":"connection_opened","direction":"internal","payload":{"addr":"localhost:3001"}}
-{"kind":"handshake_started","direction":"internal","payload":{"magic":42}}
-{"kind":"handshake_version_proposed","direction":"sent","payload":{"magic":42,"versions":[7,8,9,10,11,12,13,14]}}
-{"kind":"handshake_version_accepted","direction":"received","payload":{"peer_data":"VersionData { ... }","version":14}}
-{"kind":"handshake_completed","direction":"internal","payload":{"negotiated_version":14}}
-```
-
-### Chain-Sync events
-
-```json
-{"kind":"chain_sync_started","direction":"internal","mini_protocol":"chain-sync","payload":{"target_headers":10}}
-{"kind":"chain_sync_find_intersect","direction":"sent","mini_protocol":"chain-sync","state_before":"Idle","state_after":"Intersect","payload":{"points":["origin"]}}
-{"kind":"chain_sync_intersect_found","direction":"received","mini_protocol":"chain-sync","state_before":"Intersect","state_after":"Idle","payload":{"point":"origin","tip":{...}}}
-{"kind":"chain_sync_roll_forward","direction":"received","mini_protocol":"chain-sync","state_before":"CanAwait","state_after":"Idle","payload":{"variant":6,"cbor_hex":"828a00...","cbor_len":815,"tip":{...}}}
-{"kind":"chain_sync_session_summary","direction":"internal","mini_protocol":"chain-sync","payload":{"headers_received":10,"collected_points":10,...}}
-```
-
-### Block-Fetch events
-
-```json
-{"kind":"block_fetch_started","direction":"internal","mini_protocol":"block-fetch","payload":{"total_points":10,"batch_size":1}}
-{"kind":"block_fetch_request_range","direction":"sent","mini_protocol":"block-fetch","state_before":"Idle","state_after":"Busy","payload":{"from":{"slot":62,"hash":"5a3d77..."},"to":{"slot":62,...},"batch_len":1}}
-{"kind":"block_fetch_block","direction":"received","mini_protocol":"block-fetch","state_before":"Streaming","state_after":"Streaming","payload":{"cbor_hex":"820a82...","cbor_len":1234}}
-{"kind":"block_fetch_session_summary","direction":"internal","mini_protocol":"block-fetch","payload":{"blocks_received":10,"total_bytes":12340,...}}
-```
-
-### `kind` values
+### Selected `kind` values
 
 | Value | Direction | Meaning |
 |-------|-----------|---------|
 | `scenario_started` | internal | Scenario execution begins |
-| `scenario_completed` | internal | Scenario finished; see `payload.outcome` |
-| `step_started` | internal | A step is about to execute |
-| `step_completed` | internal | A step finished; see `payload.outcome` |
-| `assertion_passed` | internal | An `expect` clause passed |
-| `assertion_failed` | internal | An `expect` clause failed (scenario aborted) |
-| `connection_opened` | internal | TCP connection established |
-| `connection_closed` | internal | Connection torn down |
-| `error` | internal | Unexpected error; see `payload.error` and `payload.phase` |
-| `handshake_started` | internal | Handshake mini-protocol initiated |
+| `scenario_completed` | internal | Scenario finished; `payload.outcome` |
+| `step_started` | internal | Step about to execute |
+| `step_completed` | internal | Step finished; `payload.outcome` |
+| `assertion_passed` / `assertion_failed` | internal | `expect` clause result |
+| `variable_set` / `variable_referenced` | internal | Variable store activity |
+| `connection_opened` / `connection_closed` | internal | TCP lifecycle |
+| `error` | internal | Unexpected error; `payload.error` + `payload.phase` |
 | `handshake_version_proposed` | sent | MsgProposeVersions |
 | `handshake_version_accepted` | received | MsgAcceptVersion |
-| `handshake_version_rejected` | received | MsgRefuse |
-| `handshake_completed` | internal | Handshake Done |
-| `chain_sync_started` | internal | Chain-Sync session opened |
+| `handshake_completed` | internal | Handshake done |
 | `chain_sync_find_intersect` | sent | MsgFindIntersect |
 | `chain_sync_intersect_found` | received | MsgIntersectFound |
-| `chain_sync_intersect_not_found` | received | MsgIntersectNotFound |
-| `chain_sync_request_next` | sent | MsgRequestNext |
-| `chain_sync_roll_forward` | received | MsgRollForward (header) |
+| `chain_sync_roll_forward` | received | MsgRollForward |
 | `chain_sync_roll_backward` | received | MsgRollBackward |
 | `chain_sync_await_reply` | received | MsgAwaitReply |
-| `chain_sync_done` | sent | MsgDone |
 | `chain_sync_session_summary` | internal | Chain-Sync statistics |
-| `block_fetch_started` | internal | Block-Fetch session opened |
 | `block_fetch_request_range` | sent | MsgRequestRange |
-| `block_fetch_no_blocks` | received | MsgNoBlocks |
 | `block_fetch_start_batch` | received | MsgStartBatch |
 | `block_fetch_block` | received | MsgBlock (full body) |
 | `block_fetch_batch_done` | received | MsgBatchDone |
+| `block_fetch_no_blocks` | received | MsgNoBlocks |
 | `block_fetch_client_done` | sent | MsgClientDone |
 | `block_fetch_session_summary` | internal | Block-Fetch statistics |
+| `parallel_started` | internal | `parallel` step begins |
+| `parallel_branch_started` | internal | One branch starts |
+| `parallel_branch_completed` | internal | Branch finished normally |
+| `parallel_branch_failed` | internal | Branch returned an error; `payload.step`, `payload.error` |
+| `parallel_branch_aborted` | internal | Branch dropped by parent after sibling failure; `payload.last_step` |
+| `parallel_completed` | internal | All branches done; `payload.outcome` |
+| `peer_produced_block` | internal | `emit_peer_event` with `event_kind: "peer_produced_block"` |
+| `peer_cast_vote` | internal | `emit_peer_event` with `event_kind: "peer_cast_vote"` |
+| `peer_forked_chain` | internal | `emit_peer_event` with `event_kind: "peer_forked_chain"` |
+| `peer_joined_network` | internal | `emit_peer_event` with `event_kind: "peer_joined_network"` |
+| `peer_left_network` | internal | `emit_peer_event` with `event_kind: "peer_left_network"` |
+| `peer_network_event` | internal | `emit_peer_event` with an unrecognised `event_kind` |
+| `server_bearer_accepted` | internal | TCP accept succeeded |
+| `server_handshake_accepted` | internal | Responder-side handshake complete |
+| `server_block_fetch_started` | internal | Block-Fetch script begins |
+| `server_block_fetch_completed` | internal | Block-Fetch script ends; `payload.blocks_served`, `payload.exit_reason` |
+| `response_rule_applied` | internal | One script rule fired; `payload.rule_index`, `payload.on`, `payload.send` |
 
-### MustReply
-
-`chain_sync_await_reply` appears when the harness catches up to the node's tip.
-The `await_timeout_secs` scenario parameter (default 30 s) controls how long
-the harness waits. On the local devnet this almost never triggers (blocks every
-0.1 s). Against preprod (20 s average block time) it is common if `count` is
-large enough to reach the tip.
+---
 
 ## Tests
 
@@ -575,64 +658,81 @@ large enough to reach the tip.
 cargo test
 ```
 
-- `trace::tests` — serialisation, `Direction::Internal`, `with_protocol`/`with_states`
-- `scenario::tests` — parsing, validation, `parse_point`
-- `scenario::fixture::tests` — load/save round-trip, cursor `find_intersect` (all cases), cursor advance
-- `scenario::vars::tests` — `resolve_ref` (all forms, error cases), `substitute_in_value`, `point_to_str`
-- `scenario::tests` — step parsing (variables, query_tip, repeat), validate constraints
-- `scenario::runner::tests` — assertion evaluator, `subscribed_protocols` suite check
+90 unit tests covering:
+
+- `trace::tests` — serialisation, `direction`, `with_protocol`/`with_states`, `peer_id` propagation, concurrent emit
+- `scenario::tests` — parsing, validation, `parse_point`, per-step `target_address`, `peer_id` placement rules
+- `scenario::fixture::tests` — load/save round-trip, cursor operations, anchor regression
+- `scenario::block_fixture::tests` — load, range lookup, round-trip
+- `scenario::vars::tests` — `resolve_ref` (all forms + error cases), `substitute_in_value`, `point_to_str`
+- `scenario::runner::tests` — assertion evaluator, `subscribed_protocols` suite, worker spawn lifecycle
+- `scenario::response_rules::tests` — rule parsing, `rule_def_to_script` resolution, `stream_batch` generation
 - `miniprotocols::handshake::tests` — graceful error on refused connection
 - `miniprotocols::chainsync::tests` — hex encoding, point extraction, payload fields
-- `miniprotocols::blockfetch::tests` — payload fields, summary fields
+- `miniprotocols::blockfetch::tests` — payload fields, summary fields, **capture_blocks_populated_with_batch_size_one**, **capture_blocks_empty_when_batch_size_gt_one**
 
 ### Integration tests
 
-Require the devnet (`docker compose up`):
+#### Devnet tests — require `docker compose up`
 
 ```sh
 cargo test --test live_node -- --ignored
 ```
 
-| Test | What it checks |
-|------|---------------|
-| `handshake_completes_against_devnet` | Full handshake, version negotiation, trace sequence |
-| `handshake_rejected_with_wrong_magic` | Node rejects unknown magic; trace stays valid |
-| `chain_sync_receives_n_headers_from_devnet` | 5 headers; event sequence, payload fields, summary |
-| `chain_sync_intersect_found_at_genesis` | `Point::Origin` resolves to `"origin"` |
-| `block_fetch_fetches_blocks_from_devnet` | 5 blocks; event sequence, `cbor_len > 0`, summary |
+Tests handshake, chain-sync, block-fetch, keep-alive, Tx-Submission, and variable-driven scenarios against the local devnet.
+
+#### Block-Fetch adversarial tests — require free TCP ports 3010–3015
+
+```sh
+cargo test --test live_node -- --ignored block_fetch_adversarial
+```
+
+Six tests, each pairing an adversarial server scenario with the `client_block_fetch_one_range.json` client. All have a 10-second timeout: if the client hangs (doesn't detect the violation within 10 s) the test records that as a conformance finding rather than a hard failure — except for `mid_batch_disconnect`, where hanging is itself an expected outcome.
+
+See `docs/block_fetch_conformance_results.md` for the results table.
+
+---
 
 ## Project structure
 
 ```
 src/
-  lib.rs                    — library root; module declarations, DEVNET_MAGIC
-  main.rs                   — CLI: load scenario file, run ScenarioRunner
-  trace.rs                  — TraceEvent, EventKind, Direction, Tracer        [unit tests inline]
+  lib.rs                          — library root; module declarations, DEVNET_MAGIC
+  main.rs                         — CLI: load scenario, run ScenarioRunner
+  trace.rs                        — TraceEvent, EventKind, Direction, Tracer        [unit tests]
   miniprotocols/
     mod.rs
-    handshake.rs            — NodeToNode Handshake                            [unit tests inline]
-    chainsync.rs            — Chain-Sync N2N (headers + point extraction)     [unit tests inline]
-    blockfetch.rs           — Block-Fetch N2N (block bodies)                  [unit tests inline]
+    handshake.rs                  — NodeToNode Handshake                            [unit tests]
+    chainsync.rs                  — Chain-Sync N2N client                           [unit tests]
+    chainsync_server.rs           — Chain-Sync response script executor
+    blockfetch.rs                 — Block-Fetch N2N client + fixture capture        [unit tests]
+    blockfetch_server.rs          — Block-Fetch response script executor
+    keepalive.rs                  — Keep-Alive client + server
+    txsubmission.rs               — Tx-Submission (passive receive)
   scenario/
-    mod.rs                  — Scenario, StepDef, Assertions types + validation [unit tests inline]
-    runner.rs               — ScenarioRunner, step handlers, assertions        [unit tests inline]
+    mod.rs                        — Scenario, StepDef, StepKind, validation         [unit tests]
+    runner.rs                     — ScenarioRunner, step handlers, CheckedOut guard  [unit tests]
+    vars.rs                       — variable store, substitution                    [unit tests]
+    fixture.rs                    — chain-sync fixture load/save/cursor             [unit tests]
+    block_fixture.rs              — block-fetch fixture load/save/range lookup      [unit tests]
+    response_rules.rs             — response rule types, send_sequence, conversion  [unit tests]
 scenarios/
-  default.json              — default scenario (chain-sync + block-fetch)
-  chain_sync_only.json
-  chain_sync_then_block_fetch.json
-  assertion_demo.json
+  *.json                          — see scenario catalogue above
+fixtures/
+  devnet_genesis.jsonl            — 20 chain-sync headers captured from local devnet
+  devnet_blocks.jsonl             — 20 block bodies (produced by capture_blocks_for_fixture.json)
+docs/
+  block_fetch_conformance_results.md — adversarial test findings (TBD columns after first run)
 tests/
-  live_node.rs              — integration tests against the Docker devnet
+  live_node.rs                    — integration tests (devnet + adversarial)
 scripts/
-  prepare-devnet.sh         — downloads Hydra devnet config and stamps genesis time
+  prepare-devnet.sh               — downloads Hydra devnet config, stamps genesis time
 ```
 
 ## What's next
 
-- Tx-Submission mini-protocol
-- Parse slot/hash/block_number from Block-Fetch block body CBOR
-- Named connection handles for multi-connection scenarios
+- Parse slot/hash/block_number from Block-Fetch block body CBOR to enable fixture capture with `batch_size > 1`
 - Peer-Sharing mini-protocol (once pallas-network exposes it; version ≥ 13)
 - Tx-Submission step handler
-- Keep-Alive trace events (requires making Tracer concurrency-safe for the background loop)
-- Agda specification verifier integration
+- Agda specification verifier integration — consume trace files and check against formal spec
+- Populate `docs/block_fetch_conformance_results.md` Observed column after first adversarial run

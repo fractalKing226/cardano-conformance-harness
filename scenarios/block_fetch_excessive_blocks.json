@@ -1,0 +1,26 @@
+{
+  "name": "block_fetch_excessive_blocks",
+  "description": "Client requests a range nominally covering 1 block; server sends StartBatch then 10 blocks from the fixture then BatchDone. The spec does not explicitly prohibit sending more blocks than requested, but clients may validate the response against their own range. Tests whether the client accepts the extra blocks, silently truncates them, or errors. Outcome is implementation-dependent — this scenario produces conformance evidence. Requires fixtures/devnet_blocks.jsonl with at least 10 entries.",
+  "network_magic": 42,
+  "trace_output_path": "trace_bf_excessive_blocks_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3013" },
+    { "kind": "accept_handshake", "as": "client_conn", "peer_id": "block_overflower" },
+    {
+      "kind": "serve_block_fetch",
+      "on": "client_conn",
+      "block_fetch_fixture_path": "fixtures/devnet_blocks.jsonl",
+      "responses": [
+        {
+          "on": "request_range",
+          "send": {
+            "kind": "stream_batch",
+            "block_indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+          }
+        }
+      ]
+    },
+    { "kind": "close_listener" }
+  ]
+}

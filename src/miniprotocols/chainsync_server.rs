@@ -69,7 +69,8 @@ impl ServerCsState {
             | ScriptSend::BatchDone
             | ScriptSend::NoBlocks
             | ScriptSend::StreamBatch { .. }
-            | ScriptSend::CursorRange            => self,
+            | ScriptSend::CursorRange
+            | ScriptSend::SendSequence { .. }    => self,
         }
     }
 }
@@ -509,7 +510,8 @@ async fn execute_send(
         }
         // Block-Fetch sends are only executed by blockfetch_server.rs — error if reached here.
         ScriptSend::StartBatch | ScriptSend::Block { .. } | ScriptSend::BatchDone
-        | ScriptSend::NoBlocks | ScriptSend::StreamBatch { .. } | ScriptSend::CursorRange => {
+        | ScriptSend::NoBlocks | ScriptSend::StreamBatch { .. } | ScriptSend::CursorRange
+        | ScriptSend::SendSequence { .. } => {
             anyhow::bail!("Block-Fetch send rule {:?} reached Chain-Sync execution loop", rule.send.kind_str());
         }
     }

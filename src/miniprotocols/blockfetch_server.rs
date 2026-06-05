@@ -159,7 +159,7 @@ pub async fn execute_block_fetch_script(
         rules_applied += 1;
 
         let done = execute_send(
-            rule,
+            &rule.send,
             &request,
             channel,
             fixture,
@@ -204,9 +204,12 @@ pub async fn execute_block_fetch_script(
 
 // ── Send execution ────────────────────────────────────────────────────────────
 
+/// Dispatches a `ScriptSend`. Handles `SendSequence` by iterating sub-sends via
+/// `execute_single_send`; delegates everything else to `execute_single_send` directly.
+/// Returns `true` if the session loop should exit (only `Disconnect` sub-sends do this).
 #[allow(clippy::too_many_arguments)]
 async fn execute_send(
-    rule: &ScriptRule,
+    send: &ScriptSend,
     request: &BlockFetchRequest,
     channel: &mut AgentChannel,
     fixture: Option<&BlockFixtureChain>,
@@ -216,7 +219,31 @@ async fn execute_send(
     blocks_served: &mut u64,
     no_blocks_responses: &mut u64,
 ) -> anyhow::Result<bool> {
-    match &rule.send {
+    if let ScriptSend::SendSequence { sends } = send {
+        for sub_send in sends {
+            let sub_before = *state;
+            if execute_single_send(sub_send, request, channel, fixture, tracer, sub_before, state, blocks_served, no_blocks_responses).await? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    execute_single_send(send, request, channel, fixture, tracer, state_before, state, blocks_served, no_blocks_responses).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_single_send(
+    send: &ScriptSend,
+    request: &BlockFetchRequest,
+    channel: &mut AgentChannel,
+    fixture: Option<&BlockFixtureChain>,
+    tracer: &Tracer,
+    state_before: ServerBfState,
+    state: &mut ServerBfState,
+    blocks_served: &mut u64,
+    no_blocks_responses: &mut u64,
+) -> anyhow::Result<bool> {
+    match send {
         ScriptSend::NoBlocks => {
             send_message(channel, &Message::NoBlocks).await?;
             *state = ServerBfState::Idle;
@@ -387,6 +414,10 @@ async fn execute_send(
                 ))
                 .await?;
         }
+
+        // SendSequence is handled by execute_send before reaching here.
+        ScriptSend::SendSequence { .. } =>
+            anyhow::bail!("SendSequence reached execute_single_send — this is a bug"),
 
         // Chain-Sync sends are only executed by chainsync_server.rs.
         other => {

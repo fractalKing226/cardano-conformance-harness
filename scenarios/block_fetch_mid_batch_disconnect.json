@@ -1,0 +1,30 @@
+{
+  "name": "block_fetch_mid_batch_disconnect",
+  "description": "Server sends StartBatch then two blocks then drops the connection without BatchDone. Block-Fetch spec §5.2 requires the server to send BatchDone to close a batch cleanly; omitting it is a protocol violation. Tests whether the client detects a mid-stream connection drop and surfaces an error rather than hanging. Uses send_sequence so all four sends fire for a single RequestRange without returning to the receive loop.",
+  "network_magic": 42,
+  "trace_output_path": "trace_bf_mid_batch_disconnect_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3010" },
+    { "kind": "accept_handshake", "as": "client_conn", "peer_id": "mid_batch_dropper" },
+    {
+      "kind": "serve_block_fetch",
+      "on": "client_conn",
+      "responses": [
+        {
+          "on": "request_range",
+          "send": {
+            "kind": "send_sequence",
+            "sends": [
+              { "kind": "start_batch" },
+              { "kind": "block", "block_cbor": "a0" },
+              { "kind": "block", "block_cbor": "a0" },
+              { "kind": "disconnect" }
+            ]
+          }
+        }
+      ]
+    },
+    { "kind": "close_listener" }
+  ]
+}

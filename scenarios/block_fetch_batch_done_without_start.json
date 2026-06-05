@@ -1,0 +1,22 @@
+{
+  "name": "block_fetch_batch_done_without_start",
+  "description": "Server sends BatchDone directly in response to RequestRange without a preceding StartBatch. BatchDone is only valid in Streaming state (after StartBatch); sending it from Busy state is a protocol violation. Tests whether the client enforces the state invariant and produces a clean error rather than treating the BatchDone as an empty-batch completion.",
+  "network_magic": 42,
+  "trace_output_path": "trace_bf_batch_done_without_start_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3012" },
+    { "kind": "accept_handshake", "as": "client_conn", "peer_id": "premature_batch_done" },
+    {
+      "kind": "serve_block_fetch",
+      "on": "client_conn",
+      "responses": [
+        {
+          "on": "request_range",
+          "send": { "kind": "batch_done" }
+        }
+      ]
+    },
+    { "kind": "close_listener" }
+  ]
+}

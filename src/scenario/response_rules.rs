@@ -76,6 +76,12 @@ pub enum SendDef {
     Wait       { duration_secs: u64 },
     Disconnect,
     RawBytes   { hex: String },
+    /// Emit an ordered list of sends for a single incoming message without
+    /// returning to the receive loop between them. Natural for Block-Fetch's
+    /// producer-driven streaming (e.g. StartBatch + blocks + Disconnect).
+    /// Nesting a send_sequence inside another send_sequence is rejected at
+    /// parse time.
+    SendSequence { sends: Vec<SendDef> },
 }
 
 /// One response rule as written in a scenario file.
@@ -120,6 +126,9 @@ pub enum ScriptSend {
     Wait { duration_secs: u64 },
     Disconnect,
     RawBytes { bytes: Vec<u8> },
+    /// Ordered sub-sends emitted for one incoming message without a recv between them.
+    /// Sub-sends may not themselves be SendSequence (flat only, validated at parse time).
+    SendSequence { sends: Vec<ScriptSend> },
     // Generated-only sentinels
     CursorFindIntersect,   // Chain-Sync: search cursor, send IntersectFound/NotFound
     CursorAdvance,         // Chain-Sync: advance cursor, send RollForward
@@ -151,6 +160,7 @@ impl ScriptSend {
             ScriptSend::Wait { .. }               => "wait",
             ScriptSend::Disconnect                => "disconnect",
             ScriptSend::RawBytes { .. }           => "raw_bytes",
+            ScriptSend::SendSequence { .. }       => "send_sequence",
             ScriptSend::CursorFindIntersect       => "cursor_find_intersect",
             ScriptSend::CursorAdvance             => "cursor_advance",
             ScriptSend::CursorRange               => "cursor_range",
@@ -183,13 +193,16 @@ impl ScriptRule {
 
 // ── Conversion ────────────────────────────────────────────────────────────────
 
-/// Convert a user-facing rule definition into a runtime rule.
-pub fn rule_def_to_script(
-    def: &ResponseRuleDef,
+/// Convert a single `SendDef` to a `ScriptSend`.
+///
+/// Does NOT handle `SendDef::SendSequence` — callers that need it must check
+/// for nesting first and then call this for each sub-send.
+fn convert_send_def(
+    def: &SendDef,
     cs_fixture: Option<&FixtureChain>,
     bf_fixture: Option<&BlockFixtureChain>,
-) -> anyhow::Result<ScriptRule> {
-    let send = match &def.send {
+) -> anyhow::Result<ScriptSend> {
+    Ok(match def {
         SendDef::RollForward { header_from_fixture, header_cbor, variant, tip } => {
             let source = match (header_from_fixture, header_cbor) {
                 (Some(idx), None) => {
@@ -296,6 +309,33 @@ pub fn rule_def_to_script(
                 .map_err(|e| anyhow::anyhow!("raw_bytes: invalid hex: {e}"))?;
             ScriptSend::RawBytes { bytes }
         }
+
+        // Callers handle nesting rejection before calling this function.
+        SendDef::SendSequence { .. } =>
+            anyhow::bail!("convert_send_def called on SendSequence — use rule_def_to_script"),
+    })
+}
+
+/// Convert a user-facing rule definition into a runtime rule.
+pub fn rule_def_to_script(
+    def: &ResponseRuleDef,
+    cs_fixture: Option<&FixtureChain>,
+    bf_fixture: Option<&BlockFixtureChain>,
+) -> anyhow::Result<ScriptRule> {
+    let send = if let SendDef::SendSequence { sends } = &def.send {
+        let mut converted = Vec::with_capacity(sends.len());
+        for (i, sub) in sends.iter().enumerate() {
+            if matches!(sub, SendDef::SendSequence { .. }) {
+                anyhow::bail!(
+                    "send_sequence: sends[{i}] is itself a send_sequence — \
+                     nesting is not allowed; flatten the sub-sends into the outer sequence"
+                );
+            }
+            converted.push(convert_send_def(sub, cs_fixture, bf_fixture)?);
+        }
+        ScriptSend::SendSequence { sends: converted }
+    } else {
+        convert_send_def(&def.send, cs_fixture, bf_fixture)?
     };
     Ok(ScriptRule { on: def.on.clone(), send, repeatable: false })
 }

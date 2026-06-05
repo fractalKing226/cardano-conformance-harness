@@ -1,0 +1,15 @@
+{
+  "name": "capture_blocks_for_fixture",
+  "description": "Capture 20 blocks from genesis into a block-fetch fixture file. Requires a prior chain_sync to collect points, then fetches the corresponding blocks. Run with: cargo run -- --scenario scenarios/capture_blocks_for_fixture.json --capture-block-fixture fixtures/devnet_blocks.jsonl",
+  "target_address": "localhost:3001",
+  "network_magic": 42,
+  "trace_output_path": "trace_capture_blocks.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "connect" },
+    { "kind": "handshake" },
+    { "kind": "chain_sync", "count": 20, "output": "pts" },
+    { "kind": "block_fetch", "points": "$pts", "batch_size": 1 },
+    { "kind": "disconnect" }
+  ]
+}

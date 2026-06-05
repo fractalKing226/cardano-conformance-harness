@@ -1,0 +1,22 @@
+{
+  "name": "block_fetch_malformed_block",
+  "description": "Server sends raw CBOR garbage bytes (0x82 0xff — a CBOR array tag followed by the break marker, which is syntactically incomplete) in response to RequestRange, where StartBatch or NoBlocks is expected. Tests whether the client correctly handles receiving malformed CBOR in Busy state. Note: this tests malformed bytes in Busy state, not malformed block bytes in Streaming state (which would require send_sequence with start_batch then raw_bytes — a valid future extension of this test).",
+  "network_magic": 42,
+  "trace_output_path": "trace_bf_malformed_block_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3014" },
+    { "kind": "accept_handshake", "as": "client_conn", "peer_id": "cbor_poisoner" },
+    {
+      "kind": "serve_block_fetch",
+      "on": "client_conn",
+      "responses": [
+        {
+          "on": "request_range",
+          "send": { "kind": "raw_bytes", "hex": "82ff" }
+        }
+      ]
+    },
+    { "kind": "close_listener" }
+  ]
+}

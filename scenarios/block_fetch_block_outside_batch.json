@@ -1,0 +1,22 @@
+{
+  "name": "block_fetch_block_outside_batch",
+  "description": "Server sends a Block message directly in response to RequestRange without a preceding StartBatch. Block is only valid in Streaming state; the spec requires StartBatch or NoBlocks from Busy state. Tests whether the client enforces this state invariant and produces an error rather than silently accepting the out-of-order message.",
+  "network_magic": 42,
+  "trace_output_path": "trace_bf_block_outside_batch_server.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3011" },
+    { "kind": "accept_handshake", "as": "client_conn", "peer_id": "busy_state_block_sender" },
+    {
+      "kind": "serve_block_fetch",
+      "on": "client_conn",
+      "responses": [
+        {
+          "on": "request_range",
+          "send": { "kind": "block", "block_cbor": "a0" }
+        }
+      ]
+    },
+    { "kind": "close_listener" }
+  ]
+}

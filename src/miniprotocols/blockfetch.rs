@@ -59,6 +59,7 @@ pub async fn run_block_fetch(
     let mut blocks_received: u64 = 0;
     let mut no_blocks_responses: u64 = 0;
     let mut total_bytes: u64 = 0;
+    let mut captured_blocks: Vec<CapturedBlock> = Vec::new();
 
     let effective_batch = batch_size.max(1);
 
@@ -79,6 +80,18 @@ pub async fn run_block_fetch(
     for batch in points.chunks(effective_batch) {
         let from = batch.first().unwrap();
         let to = batch.last().unwrap();
+        // When the batch contains exactly one Point::Specific, the slot and hash
+        // are known from the request itself — no CBOR parsing needed. Multi-point
+        // batches would require decoding each block's header to recover its slot,
+        // which is left as a future extension.
+        let capture_point: Option<(u64, Vec<u8>)> = if batch.len() == 1 {
+            match from {
+                Point::Specific(slot, hash) => Some((*slot, hash.clone())),
+                Point::Origin => None,
+            }
+        } else {
+            None
+        };
 
         let sb = state_str(&client);
         tracer
@@ -115,7 +128,7 @@ pub async fn run_block_fetch(
                     blocks_received,
                     no_blocks_responses,
                     total_bytes,
-                    vec![],
+                    std::mem::take(&mut captured_blocks),
                     started_at,
                     "error",
                 );
@@ -167,6 +180,13 @@ pub async fn run_block_fetch(
                             blocks_received += 1;
                             batch_blocks += 1;
                             debug!(blocks_received, bytes = body.len(), "Block received");
+                            if let Some((slot, ref hash)) = capture_point {
+                                captured_blocks.push(CapturedBlock {
+                                    slot,
+                                    block_hash: hash.clone(),
+                                    cbor: body.clone(),
+                                });
+                            }
                             tracer
                                 .emit(
                                     TraceEvent::new(
@@ -175,7 +195,6 @@ pub async fn run_block_fetch(
                                         json!({
                                             "cbor_hex": encode_hex(&body),
                                             "cbor_len": body.len(),
-                                            // TODO: extract slot/hash/block_number from body CBOR
                                         }),
                                     )
                                     .with_states(MINI_PROTOCOL, &sb, state_str(&client)),
@@ -213,7 +232,7 @@ pub async fn run_block_fetch(
                                 blocks_received,
                                 no_blocks_responses,
                                 total_bytes,
-                                vec![],
+                                std::mem::take(&mut captured_blocks),
                                 started_at,
                                 "error",
                             );
@@ -253,7 +272,7 @@ pub async fn run_block_fetch(
         blocks_received,
         no_blocks_responses,
         total_bytes,
-        vec![],
+        captured_blocks,
         started_at,
         "completed",
     );
@@ -337,5 +356,101 @@ mod tests {
         });
         assert_eq!(payload["cbor_hex"], "abcdef");
         assert_eq!(payload["cbor_len"], 3);
+    }
+
+    /// Verifies that run_block_fetch populates captured_blocks when batch_size == 1.
+    /// Uses a real loopback TCP connection so the full block-fetch path is exercised.
+    #[tokio::test]
+    async fn capture_blocks_populated_with_batch_size_one() {
+        use pallas_network::miniprotocols::blockfetch::Server as BfServer;
+        use pallas_network::multiplexer::{Bearer, Plexer};
+        use tempfile::NamedTempFile;
+
+        const SLOT: u64 = 42;
+        const HASH: [u8; 32] = [0xaa; 32];
+        const BODY: &[u8] = &[0x01, 0x02, 0x03, 0x04];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let tmp = NamedTempFile::new().unwrap();
+        let tracer = crate::trace::Tracer::open(tmp.path()).await.unwrap();
+
+        let (_, summary) = tokio::join!(
+            // Server branch: accept one range request, send one block, done.
+            async move {
+                let (bearer, _) = Bearer::accept_tcp(&listener).await.unwrap();
+                let mut plexer = Plexer::new(bearer);
+                let ch = plexer.subscribe_server(BLOCK_FETCH_PROTOCOL);
+                plexer.spawn();
+                let mut srv = BfServer::new(ch);
+                let _ = srv.recv_while_idle().await; // RequestRange
+                srv.send_start_batch().await.unwrap();
+                srv.send_block(BODY.to_vec()).await.unwrap();
+                srv.send_batch_done().await.unwrap();
+                let _ = srv.recv_while_idle().await; // ClientDone
+            },
+            // Client branch: run_block_fetch with one Point::Specific, batch_size 1.
+            async move {
+                let bearer = Bearer::connect_tcp(addr).await.unwrap();
+                let mut plexer = Plexer::new(bearer);
+                let ch = plexer.subscribe_client(BLOCK_FETCH_PROTOCOL);
+                plexer.spawn();
+                let point = Point::Specific(SLOT, HASH.to_vec());
+                run_block_fetch(ch, vec![point], 1, &tracer).await.unwrap()
+            }
+        );
+
+        assert_eq!(summary.blocks_received, 1, "one block should be received");
+        assert_eq!(summary.captured_blocks.len(), 1, "captured_blocks must have one entry");
+        let cb = &summary.captured_blocks[0];
+        assert_eq!(cb.slot, SLOT,            "slot must match requested point");
+        assert_eq!(cb.block_hash, HASH,      "hash must match requested point");
+        assert_eq!(cb.cbor, BODY,            "cbor must be the raw block body");
+    }
+
+    /// batch_size > 1 must NOT capture (slot/hash are indeterminate without CBOR parsing).
+    #[tokio::test]
+    async fn capture_blocks_empty_when_batch_size_gt_one() {
+        use pallas_network::miniprotocols::blockfetch::Server as BfServer;
+        use pallas_network::multiplexer::{Bearer, Plexer};
+        use tempfile::NamedTempFile;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let tmp = NamedTempFile::new().unwrap();
+        let tracer = crate::trace::Tracer::open(tmp.path()).await.unwrap();
+
+        let (_, summary) = tokio::join!(
+            async move {
+                let (bearer, _) = Bearer::accept_tcp(&listener).await.unwrap();
+                let mut plexer = Plexer::new(bearer);
+                let ch = plexer.subscribe_server(BLOCK_FETCH_PROTOCOL);
+                plexer.spawn();
+                let mut srv = BfServer::new(ch);
+                let _ = srv.recv_while_idle().await;
+                srv.send_start_batch().await.unwrap();
+                srv.send_block(vec![0x01]).await.unwrap();
+                srv.send_block(vec![0x02]).await.unwrap();
+                srv.send_batch_done().await.unwrap();
+                let _ = srv.recv_while_idle().await;
+            },
+            async move {
+                let bearer = Bearer::connect_tcp(addr).await.unwrap();
+                let mut plexer = Plexer::new(bearer);
+                let ch = plexer.subscribe_client(BLOCK_FETCH_PROTOCOL);
+                plexer.spawn();
+                let pts = vec![
+                    Point::Specific(1, vec![0x01; 32]),
+                    Point::Specific(2, vec![0x02; 32]),
+                ];
+                run_block_fetch(ch, pts, 2, &tracer).await.unwrap()
+            }
+        );
+
+        assert_eq!(summary.blocks_received, 2);
+        assert_eq!(summary.captured_blocks.len(), 0,
+            "multi-point batches must not capture (slot/hash unknown without CBOR parse)");
     }
 }

@@ -1,0 +1,19 @@
+{
+  "name": "client_block_fetch_one_range",
+  "description": "Simple client-side harness scenario for Block-Fetch adversarial tests: connect, handshake, request one range, disconnect. The target_address is set programmatically in each integration test to point to the adversarial server port. The points are syntactically valid but do not match any real blocks — adversarial servers ignore the range and respond according to their script.",
+  "target_address": "localhost:3010",
+  "network_magic": 42,
+  "trace_output_path": "trace_bf_client.jsonl",
+  "expected_outcome": "failure",
+  "steps": [
+    { "kind": "connect" },
+    { "kind": "handshake" },
+    {
+      "kind": "block_fetch",
+      "points": [
+        "1:0000000000000000000000000000000000000000000000000000000000000001"
+      ]
+    },
+    { "kind": "disconnect" }
+  ]
+}

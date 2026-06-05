@@ -815,3 +815,169 @@ async fn repeat_body_variables_visible_within_same_iteration() {
         "no error events expected"
     );
 }
+
+// ── Block-Fetch adversarial server scenarios ──────────────────────────────────
+//
+// Each test pairs a scripted adversarial server harness with the simple client
+// scenario in scenarios/client_block_fetch_one_range.json. The server is
+// spawned as a background tokio task; after a 50 ms sleep the client runs.
+// A 10-second timeout on the server join catches hangs.
+//
+// Run all: cargo test --test live_node -- --ignored block_fetch_adversarial
+//
+// These tests do not require the devnet — they create their own server on a
+// dedicated port (3010-3015). They do require those ports to be free, which is
+// why they are marked #[ignore].
+
+/// Load a scenario file relative to the crate root and override its trace path.
+fn load_adversarial_scenario(relative_path: &str, trace_file: &NamedTempFile) -> Scenario {
+    let mut s = cardano_conformance_harness::scenario::load(
+        std::path::Path::new(relative_path)
+    ).expect("adversarial scenario file must parse and validate");
+    s.trace_output_path = trace_file.path().to_path_buf();
+    s
+}
+
+// ScenarioRunner::run() returns Pin<Box<dyn Future>> which is !Send, so tokio::spawn
+// can't be used here. Run the server in a LocalSet so spawn_local is available.
+//
+// Returns (client_trace_events, timed_out).
+// `timed_out = true` means the 10-second wall-clock budget expired before both
+// the client and server scenarios completed. The caller decides whether that is
+// an acceptable conformance finding (e.g. mid_batch_disconnect, where Pallas may
+// hang rather than error cleanly) or a hard test failure (the other five).
+async fn run_adversarial_pair(server_path: &str, client_port: u16) -> (Vec<Value>, bool) {
+    let server_trace = NamedTempFile::new().unwrap();
+    let client_trace = NamedTempFile::new().unwrap();
+
+    let server_scenario = load_adversarial_scenario(server_path, &server_trace);
+    let mut client_scenario = load_adversarial_scenario(
+        "scenarios/client_block_fetch_one_range.json", &client_trace
+    );
+    client_scenario.target_address = Some(format!("localhost:{client_port}"));
+
+    // The timeout wraps the ENTIRE pair — both the client run (which can hang if
+    // Pallas's client doesn't detect the disconnect) and the server run.
+    let local = tokio::task::LocalSet::new();
+    let timed_out = tokio::time::timeout(
+        Duration::from_secs(10),
+        local.run_until(async move {
+            let server_handle = tokio::task::spawn_local(
+                ScenarioRunner::new(server_scenario).run()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = ScenarioRunner::new(client_scenario).run().await;
+            let _ = server_handle.await;
+        }),
+    )
+    .await
+    .is_err(); // Ok(()) = completed; Err(Elapsed) = timeout
+
+    (read_trace(&client_trace), timed_out)
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3010; run with: cargo test --test live_node -- --ignored block_fetch_adversarial"]
+async fn block_fetch_adversarial_mid_batch_disconnect() {
+    let (events, timed_out) = run_adversarial_pair(
+        "scenarios/block_fetch_mid_batch_disconnect.json", 3010
+    ).await;
+
+    // Both outcomes are valid conformance findings:
+    //   - timed_out=true: Pallas's client hung (didn't detect the disconnect) — itself noteworthy.
+    //   - timed_out=false: Pallas detected the disconnect and surfaced an error cleanly.
+    // Either way the test passes; what matters is which branch fires (document in results.md).
+    if timed_out {
+        // Pallas did not recover within 10 s — conformance finding: client hangs on mid-stream drop.
+        return;
+    }
+    let summary = events.iter().find(|e| e["kind"] == "block_fetch_session_summary");
+    assert!(summary.is_some(), "client trace must contain block_fetch_session_summary");
+    let p = &summary.unwrap()["payload"];
+    assert_ne!(p["exit_reason"], "completed",
+        "mid-batch disconnect must not complete normally; got: {}", p["exit_reason"]);
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3011; run with: cargo test --test live_node -- --ignored block_fetch_adversarial"]
+async fn block_fetch_adversarial_block_outside_batch() {
+    let (events, timed_out) = run_adversarial_pair(
+        "scenarios/block_fetch_block_outside_batch.json", 3011
+    ).await;
+    assert!(!timed_out, "out-of-state Block should cause a fast client error, not a hang");
+
+    let summary = events.iter().find(|e| e["kind"] == "block_fetch_session_summary");
+    assert!(summary.is_some(), "client trace must contain block_fetch_session_summary");
+    let p = &summary.unwrap()["payload"];
+    assert_ne!(p["exit_reason"], "completed",
+        "out-of-state Block must not produce a clean completion; got: {}", p["exit_reason"]);
+    assert_eq!(p["blocks_received"], 0,
+        "no blocks should be accepted before StartBatch");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3012; run with: cargo test --test live_node -- --ignored block_fetch_adversarial"]
+async fn block_fetch_adversarial_batch_done_without_start() {
+    let (events, timed_out) = run_adversarial_pair(
+        "scenarios/block_fetch_batch_done_without_start.json", 3012
+    ).await;
+    assert!(!timed_out, "out-of-state BatchDone should cause a fast client error, not a hang");
+
+    let summary = events.iter().find(|e| e["kind"] == "block_fetch_session_summary");
+    assert!(summary.is_some(), "client trace must contain block_fetch_session_summary");
+    let p = &summary.unwrap()["payload"];
+    assert_ne!(p["exit_reason"], "completed",
+        "out-of-state BatchDone must not produce a clean completion; got: {}", p["exit_reason"]);
+    assert_eq!(p["blocks_received"], 0,
+        "no blocks should be delivered for an empty batch starting with BatchDone");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3013 and fixtures/devnet_blocks.jsonl with ≥10 entries; run with: cargo test --test live_node -- --ignored block_fetch_adversarial"]
+async fn block_fetch_adversarial_excessive_blocks() {
+    let (events, timed_out) = run_adversarial_pair(
+        "scenarios/block_fetch_excessive_blocks.json", 3013
+    ).await;
+    assert!(!timed_out, "excessive blocks should complete (or error), not hang");
+
+    let summary = events.iter().find(|e| e["kind"] == "block_fetch_session_summary");
+    assert!(summary.is_some(), "client trace must contain block_fetch_session_summary");
+    let p = &summary.unwrap()["payload"];
+    // Outcome is implementation-dependent — record what Pallas actually does.
+    // The assertion just verifies the summary field is present and numeric.
+    assert!(p["blocks_received"].is_number(),
+        "blocks_received must be present in session summary");
+    // Document: p["exit_reason"] tells us whether Pallas accepted or rejected extras.
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3014; run with: cargo test --test live_node -- --ignored block_fetch_adversarial"]
+async fn block_fetch_adversarial_malformed_block() {
+    let (events, timed_out) = run_adversarial_pair(
+        "scenarios/block_fetch_malformed_block.json", 3014
+    ).await;
+    assert!(!timed_out, "malformed CBOR should cause a fast decode error, not a hang");
+
+    let summary = events.iter().find(|e| e["kind"] == "block_fetch_session_summary");
+    assert!(summary.is_some(), "client trace must contain block_fetch_session_summary");
+    let p = &summary.unwrap()["payload"];
+    assert_ne!(p["exit_reason"], "completed",
+        "malformed CBOR must not produce a clean completion; got: {}", p["exit_reason"]);
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3015; run with: cargo test --test live_node -- --ignored block_fetch_adversarial"]
+async fn block_fetch_adversarial_no_blocks_after_start() {
+    let (events, timed_out) = run_adversarial_pair(
+        "scenarios/block_fetch_no_blocks_after_start.json", 3015
+    ).await;
+    assert!(!timed_out, "NoBlocks after StartBatch should cause a fast client error, not a hang");
+
+    let summary = events.iter().find(|e| e["kind"] == "block_fetch_session_summary");
+    assert!(summary.is_some(), "client trace must contain block_fetch_session_summary");
+    let p = &summary.unwrap()["payload"];
+    assert_ne!(p["exit_reason"], "completed",
+        "NoBlocks after StartBatch must not complete normally; got: {}", p["exit_reason"]);
+    assert_eq!(p["blocks_received"], 0,
+        "no blocks should be delivered when NoBlocks follows StartBatch");
+}
