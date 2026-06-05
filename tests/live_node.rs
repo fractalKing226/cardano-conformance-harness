@@ -6,7 +6,7 @@ use cardano_conformance_harness::miniprotocols::handshake::{handshake_on_channel
 use cardano_conformance_harness::miniprotocols::keepalive::{run_keepalive, KEEP_ALIVE_PROTOCOL};
 use cardano_conformance_harness::miniprotocols::txsubmission::{run_tx_submission, TX_SUBMISSION_PROTOCOL};
 use cardano_conformance_harness::scenario::runner::ScenarioRunner;
-use cardano_conformance_harness::scenario::{Assertions, Scenario, StepDef, StepKind, StepParams};
+use cardano_conformance_harness::scenario::{Assertions, Scenario, StepDef, StepKind};
 use cardano_conformance_harness::trace::Tracer;
 use cardano_conformance_harness::DEVNET_MAGIC;
 use pallas_network::miniprotocols::keepalive::Client as KaClient;
@@ -25,6 +25,7 @@ fn make_scenario(name: &str, trace_path: &std::path::Path, steps: Vec<StepDef>) 
         network_magic: DEVNET_MAGIC,
         trace_output_path: trace_path.to_path_buf(),
         expected_outcome: None,
+        network: None,
         steps,
     }
 }
@@ -980,5 +981,90 @@ async fn block_fetch_adversarial_no_blocks_after_start() {
         "NoBlocks after StartBatch must not complete normally; got: {}", p["exit_reason"]);
     assert_eq!(p["blocks_received"], 0,
         "no blocks should be delivered when NoBlocks follows StartBatch");
+}
+
+// ── Network declaration integration tests ─────────────────────────────────────
+//
+// Require free TCP ports (3020, 3021) and fixtures/devnet_genesis.jsonl.
+// Do NOT require the devnet — the harness serves its own connections.
+// Run with: cargo test --test live_node -- --ignored network_declaration
+
+/// Run one server scenario and connect one chain-sync client. Returns server trace.
+async fn run_server_with_chain_sync_client(server_path: &str, port: u16) -> Vec<Value> {
+    let server_trace = NamedTempFile::new().unwrap();
+    let mut server_scenario = cardano_conformance_harness::scenario::load(
+        std::path::Path::new(server_path)
+    ).expect("scenario must parse");
+    server_scenario.trace_output_path = server_trace.path().to_path_buf();
+
+    let local = tokio::task::LocalSet::new();
+    let _ = tokio::time::timeout(Duration::from_secs(15), local.run_until(async move {
+        let server_handle = tokio::task::spawn_local(
+            ScenarioRunner::new(server_scenario).run()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let addr = format!("localhost:{port}");
+        let bearer = Bearer::connect_tcp(addr.as_str()).await.unwrap();
+        let mut plexer = Plexer::new(bearer);
+        let hs_ch = plexer.subscribe_client(PROTOCOL_N2N_HANDSHAKE);
+        let cs_ch = plexer.subscribe_client(CHAIN_SYNC_PROTOCOL);
+        let _ka = plexer.subscribe_client(pallas_network::miniprotocols::PROTOCOL_N2N_KEEP_ALIVE);
+        plexer.spawn();
+
+        let tmp = NamedTempFile::new().unwrap();
+        let tracer = Tracer::open(tmp.path()).await.unwrap();
+        let _ = handshake_on_channel(hs_ch, cardano_conformance_harness::DEVNET_MAGIC, &tracer).await;
+        let _ = run_chain_sync(cs_ch, vec![pallas_network::miniprotocols::Point::Origin],
+            3, Duration::from_secs(5), &tracer).await;
+        let _ = server_handle.await;
+    })).await;
+
+    read_trace(&server_trace)
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3021 and fixtures/devnet_genesis.jsonl; run with: cargo test --test live_node -- --ignored network_declaration"]
+async fn network_declaration_as_peer_overrides_accept_handshake_peer_id() {
+    // accept_handshake sets peer_id "original_id"; serve_chain_sync uses
+    // as_peer "declared_peer". All chain-sync wire events must carry
+    // peer_id "declared_peer" — confirming the override takes effect.
+    let events = run_server_with_chain_sync_client(
+        "scenarios/as_peer_overrides_peer_id.json", 3021
+    ).await;
+
+    let cs_wire: Vec<&Value> = events.iter()
+        .filter(|e| e["mini_protocol"] == "chain-sync"
+               && matches!(e["direction"].as_str(), Some("sent") | Some("received")))
+        .collect();
+    assert!(!cs_wire.is_empty(), "expected chain-sync wire events in server trace");
+
+    for e in &cs_wire {
+        assert_eq!(e["peer_id"], "declared_peer",
+            "wire event must be attributed to 'declared_peer' (as_peer override), not 'original_id': {e}");
+    }
+    assert!(
+        cs_wire.iter().all(|e| e["peer_id"] != "original_id"),
+        "no chain-sync wire events should carry 'original_id' after as_peer override"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3020 and fixtures/devnet_genesis.jsonl; run with: cargo test --test live_node -- --ignored network_declaration"]
+async fn network_declaration_emits_network_declared_trace_event() {
+    // Connect one client to the two_peers scenario (the second parallel branch
+    // will time out — that's fine). Verify the trace contains a network_declared
+    // event listing both peers with correct ids.
+    let events = run_server_with_chain_sync_client(
+        "scenarios/two_peers_different_chains.json", 3020
+    ).await;
+
+    let nd = events.iter().find(|e| e["kind"] == "network_declared");
+    assert!(nd.is_some(), "trace must contain network_declared event");
+    let peers = nd.unwrap()["payload"]["peers"].as_array().unwrap();
+    assert_eq!(peers.len(), 2);
+    let ids: Vec<&str> = peers.iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"honest_peer"));
+    assert!(ids.contains(&"adversary"));
 }
 

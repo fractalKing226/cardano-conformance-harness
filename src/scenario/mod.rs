@@ -13,6 +13,26 @@ use serde_json::Value;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
+/// One peer in the imaginary network.
+/// Each peer holds an identity (`id`) and optional fixture paths for the
+/// protocols it can serve. Steps reference peers by `id` via `as_peer:`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Peer {
+    pub id: String,
+    /// Path to the chain-sync fixture this peer serves (`serve_chain_sync as_peer:`).
+    pub chain_sync_fixture:  Option<String>,
+    /// Path to the block-fetch fixture this peer serves (`serve_block_fetch as_peer:`).
+    pub block_fetch_fixture: Option<String>,
+    pub description:         Option<String>,
+}
+
+/// Top-level imaginary-network declaration — a list of named peers with their
+/// assigned chains. Scenarios without this field behave exactly as before.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Network {
+    pub peers: Vec<Peer>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Scenario {
     pub name: String,
@@ -21,6 +41,9 @@ pub struct Scenario {
     pub network_magic: u64,
     pub trace_output_path: PathBuf,
     pub expected_outcome: Option<String>,
+    /// Optional imaginary-network declaration. When present, peers are named
+    /// here and `serve_*` steps can reference them via `as_peer:`.
+    pub network: Option<Network>,
     pub steps: Vec<StepDef>,
 }
 
@@ -228,6 +251,13 @@ pub struct StepParams {
 
     /// emit_peer_event: the kind of network event (e.g. "peer_produced_block").
     pub event_kind: Option<String>,
+
+    /// serve_chain_sync / serve_block_fetch: resolve fixture and peer_id from a
+    /// named peer in the scenario's network declaration. Mutually exclusive with
+    /// the corresponding `fixture_path` / `block_fetch_fixture_path` parameter.
+    /// When present, the serving connection automatically acquires the peer's id
+    /// as its `peer_id`, overriding any peer_id set at accept_handshake time.
+    pub as_peer: Option<String>,
 }
 
 /// How Block-Fetch obtains its point list.
@@ -294,6 +324,8 @@ pub fn validate(scenario: &Scenario) -> anyhow::Result<()> {
     validate_steps(&scenario.steps, &mut errors, &mut false);
     validate_connection_names(&scenario.steps, &mut errors);
     validate_connect_addresses(scenario, &mut errors);
+    validate_network_declaration(scenario, &mut errors);
+    validate_as_peer_refs(&scenario.steps, scenario.network.as_ref(), &mut errors);
     if !errors.is_empty() {
         anyhow::bail!(
             "scenario \"{}\" has validation errors:\n  - {}",
@@ -437,6 +469,62 @@ fn collect_connect_steps(steps: &[StepDef], counter: &mut usize, out: &mut Vec<(
     }
 }
 
+/// Validates the `network` block: unique peer ids, each peer has at least one fixture.
+fn validate_network_declaration(scenario: &Scenario, errors: &mut Vec<String>) {
+    let Some(ref network) = scenario.network else { return };
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for peer in &network.peers {
+        if !seen.insert(peer.id.as_str()) {
+            errors.push(format!("network: duplicate peer id \"{}\"", peer.id));
+        }
+        if peer.chain_sync_fixture.is_none() && peer.block_fetch_fixture.is_none() {
+            errors.push(format!(
+                "network: peer \"{}\" has no fixtures — add chain_sync_fixture or block_fetch_fixture",
+                peer.id
+            ));
+        }
+    }
+}
+
+/// Validates that every `as_peer` reference in the step tree names a declared peer.
+/// If there is no network block but a step uses `as_peer`, that is also an error.
+fn validate_as_peer_refs(steps: &[StepDef], network: Option<&Network>, errors: &mut Vec<String>) {
+    walk_as_peer_refs(steps, network, errors);
+}
+
+fn walk_as_peer_refs(steps: &[StepDef], network: Option<&Network>, errors: &mut Vec<String>) {
+    for (i, step) in steps.iter().enumerate() {
+        let pos = format!("step[{i}] ({})", step.kind.as_str());
+        if let Some(Value::String(as_peer_id)) = step.raw_params.get("as_peer") {
+            match network {
+                None => errors.push(format!(
+                    "{pos}: as_peer requires a network declaration in the scenario"
+                )),
+                Some(net) => {
+                    if !net.peers.iter().any(|p| &p.id == as_peer_id) {
+                        errors.push(format!(
+                            "{pos}: as_peer \"{as_peer_id}\" is not declared in the network block"
+                        ));
+                    }
+                }
+            }
+        }
+        // Recurse into repeat bodies and parallel branches.
+        if let Some(body_val) = step.raw_params.get("body") {
+            if let Ok(body) = serde_json::from_value::<Vec<StepDef>>(body_val.clone()) {
+                walk_as_peer_refs(&body, network, errors);
+            }
+        }
+        if let Some(branches_val) = step.raw_params.get("branches") {
+            if let Ok(branches) = serde_json::from_value::<Vec<Vec<StepDef>>>(branches_val.clone()) {
+                for branch in &branches {
+                    walk_as_peer_refs(branch, network, errors);
+                }
+            }
+        }
+    }
+}
+
 fn validate_steps(steps: &[StepDef], errors: &mut Vec<String>, has_chain_sync: &mut bool) {
     for (i, step) in steps.iter().enumerate() {
         let pos = format!("step[{i}] ({})", step.kind.as_str());
@@ -558,9 +646,15 @@ fn validate_step(
         StepKind::ServeBlockFetch => {
             let has_fixture   = step.raw_params.get("block_fetch_fixture_path").is_some();
             let has_responses = step.raw_params.get("responses").is_some();
-            if !has_fixture && !has_responses {
+            let has_as_peer   = step.raw_params.get("as_peer").is_some();
+            if has_fixture && has_as_peer {
                 errors.push(format!(
-                    "{pos}: serve_block_fetch requires block_fetch_fixture_path, responses, or both"
+                    "{pos}: block_fetch_fixture_path and as_peer are mutually exclusive"
+                ));
+            }
+            if !has_fixture && !has_responses && !has_as_peer {
+                errors.push(format!(
+                    "{pos}: serve_block_fetch requires block_fetch_fixture_path, as_peer, responses, or both"
                 ));
             }
         }
@@ -577,9 +671,15 @@ fn validate_step(
         StepKind::ServeChainSync => {
             let has_fixture   = step.raw_params.get("fixture_path").is_some();
             let has_responses = step.raw_params.get("responses").is_some();
-            if !has_fixture && !has_responses {
+            let has_as_peer   = step.raw_params.get("as_peer").is_some();
+            if has_fixture && has_as_peer {
                 errors.push(format!(
-                    "{pos}: serve_chain_sync requires fixture_path, responses, or both"
+                    "{pos}: fixture_path and as_peer are mutually exclusive"
+                ));
+            }
+            if !has_fixture && !has_responses && !has_as_peer {
+                errors.push(format!(
+                    "{pos}: serve_chain_sync requires fixture_path, as_peer, or responses"
                 ));
             }
             // fixture_path + responses is allowed: responses drives the script,
@@ -893,6 +993,97 @@ mod tests {
         let s: Scenario = serde_json::from_str(json).unwrap();
         let err = validate(&s).unwrap_err().to_string();
         assert!(err.contains("target_address is only valid on connect steps"), "{err}");
+    }
+
+    // ── Network declaration tests ─────────────────────────────────────────────
+
+    fn server_with_network(network_json: &str, steps_json: &str) -> String {
+        format!(r#"{{
+            "name":"t","network_magic":1,"trace_output_path":"t.jsonl",
+            "network": {network_json},
+            "steps": [{steps_json}]
+        }}"#)
+    }
+
+    #[test]
+    fn network_declaration_parses_and_validates() {
+        let json = server_with_network(
+            r#"{ "peers": [{ "id": "p1", "chain_sync_fixture": "f.jsonl" }] }"#,
+            r#"{ "kind": "listen", "bind_address": "0.0.0.0:9999" },
+               { "kind": "accept_handshake" },
+               { "kind": "serve_chain_sync", "as_peer": "p1" }"#,
+        );
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        assert!(validate(&s).is_ok());
+        let net = s.network.unwrap();
+        assert_eq!(net.peers.len(), 1);
+        assert_eq!(net.peers[0].id, "p1");
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_peer_ids() {
+        let json = server_with_network(
+            r#"{ "peers": [
+                { "id": "same", "chain_sync_fixture": "a.jsonl" },
+                { "id": "same", "chain_sync_fixture": "b.jsonl" }
+            ] }"#,
+            r#"{ "kind": "listen" }"#,
+        );
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("duplicate peer id"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_peer_without_fixtures() {
+        let json = server_with_network(
+            r#"{ "peers": [{ "id": "empty_peer" }] }"#,
+            r#"{ "kind": "listen" }"#,
+        );
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("no fixtures"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_as_peer_without_network_block() {
+        let json = r#"{
+            "name":"t","network_magic":1,"trace_output_path":"t.jsonl",
+            "steps":[
+                { "kind": "listen" },
+                { "kind": "accept_handshake" },
+                { "kind": "serve_chain_sync", "as_peer": "nobody" }
+            ]
+        }"#;
+        let s: Scenario = serde_json::from_str(json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("requires a network declaration"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_as_peer_referencing_unknown_peer() {
+        let json = server_with_network(
+            r#"{ "peers": [{ "id": "known", "chain_sync_fixture": "f.jsonl" }] }"#,
+            r#"{ "kind": "listen" },
+               { "kind": "accept_handshake" },
+               { "kind": "serve_chain_sync", "as_peer": "unknown_peer" }"#,
+        );
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("not declared in the network block"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_as_peer_and_fixture_path_together() {
+        let json = server_with_network(
+            r#"{ "peers": [{ "id": "p1", "chain_sync_fixture": "f.jsonl" }] }"#,
+            r#"{ "kind": "listen" },
+               { "kind": "accept_handshake" },
+               { "kind": "serve_chain_sync", "as_peer": "p1", "fixture_path": "other.jsonl" }"#,
+        );
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
     }
 
     #[test]

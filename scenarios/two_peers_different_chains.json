@@ -1,0 +1,38 @@
+{
+  "name": "two_peers_different_chains",
+  "description": "Demonstrates the network declaration vocabulary. Two peers are declared — 'honest_peer' and 'adversary' — each with an assigned chain. The harness binds one listener and serves both clients in parallel, attributing each session to the correct imaginary peer. In a complete scenario the two peers would hold divergent chains (different blocks at the same slots); this slice uses the same genesis fixture for both to exercise the vocabulary without requiring a second captured chain.",
+  "network_magic": 42,
+  "trace_output_path": "trace_two_peers.jsonl",
+  "expected_outcome": "success",
+  "network": {
+    "peers": [
+      {
+        "id": "honest_peer",
+        "chain_sync_fixture": "fixtures/devnet_genesis.jsonl",
+        "description": "An honest peer serving the canonical genesis chain"
+      },
+      {
+        "id": "adversary",
+        "chain_sync_fixture": "fixtures/devnet_genesis.jsonl",
+        "description": "An adversarial peer. In a full scenario this would hold a divergent chain; here it uses the same fixture to demonstrate peer attribution."
+      }
+    ]
+  },
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3020" },
+    {
+      "kind": "parallel",
+      "branches": [
+        [
+          { "kind": "accept_handshake", "as": "client_honest" },
+          { "kind": "serve_chain_sync", "on": "client_honest", "as_peer": "honest_peer", "await_at_tip_secs": 2 }
+        ],
+        [
+          { "kind": "accept_handshake", "as": "client_adversary" },
+          { "kind": "serve_chain_sync", "on": "client_adversary", "as_peer": "adversary", "await_at_tip_secs": 2 }
+        ]
+      ]
+    },
+    { "kind": "close_listener" }
+  ]
+}

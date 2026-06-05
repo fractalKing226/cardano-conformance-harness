@@ -27,10 +27,24 @@ use crate::miniprotocols::keepalive::{run_keepalive, run_keepalive_server, KEEP_
 use crate::miniprotocols::txsubmission::{run_tx_submission, TX_SUBMISSION_PROTOCOL};
 use crate::scenario::fixture;
 use crate::scenario::vars::{point_to_str, substitute_in_value, VarStore};
-use crate::scenario::{BlockFetchPoints, Scenario, StepDef, StepKind, StepParams};
+use crate::scenario::{BlockFetchPoints, Network, Peer, Scenario, StepDef, StepKind, StepParams};
 use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
 
 use super::parse_point;
+
+// ── Network peer lookup ───────────────────────────────────────────────────────
+
+/// Looks up a peer by id in the scenario's network declaration.
+/// Returns a clear error if the network block is absent or the peer is unknown.
+fn lookup_peer<'a>(network: &'a Option<Arc<Network>>, peer_id: &str) -> anyhow::Result<&'a Peer> {
+    network
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("as_peer: no network declaration in scenario"))?
+        .peers
+        .iter()
+        .find(|p| p.id == peer_id)
+        .ok_or_else(|| anyhow::anyhow!("as_peer: peer \"{peer_id}\" not found in network block"))
+}
 
 // ── Protocol subscription ─────────────────────────────────────────────────────
 
@@ -90,10 +104,28 @@ impl ScenarioRunner {
             .await?;
 
         let mut state = RunnerState {
-            capture_fixture_path:         self.capture_fixture.clone(),
-            capture_block_fixture_path:   self.capture_block_fixture.clone(),
+            capture_fixture_path:       self.capture_fixture.clone(),
+            capture_block_fixture_path: self.capture_block_fixture.clone(),
+            network:                    self.scenario.network.as_ref().map(|n| Arc::new(n.clone())),
             ..Default::default()
         };
+
+        // Emit one NetworkDeclared event so the trace records the imaginary topology.
+        if let Some(ref network) = self.scenario.network {
+            let peers_json: Vec<serde_json::Value> = network.peers.iter().map(|p| {
+                let mut obj = json!({ "id": p.id });
+                if let Some(ref f) = p.chain_sync_fixture  { obj["chain_sync_fixture"]  = f.clone().into(); }
+                if let Some(ref f) = p.block_fetch_fixture { obj["block_fetch_fixture"] = f.clone().into(); }
+                if let Some(ref d) = p.description         { obj["description"]         = d.clone().into(); }
+                obj
+            }).collect();
+            tracer.emit(TraceEvent::new(
+                EventKind::NetworkDeclared,
+                Direction::Internal,
+                json!({ "peers": peers_json }),
+            )).await?;
+        }
+
         let mut steps_passed: u64 = 0;
         let mut steps_failed: u64 = 0;
 
@@ -264,6 +296,9 @@ struct RunnerState {
     // These are set-once at construction and cloned cheaply into spawned tasks.
     capture_fixture_path:         Option<std::path::PathBuf>,
     capture_block_fixture_path:   Option<std::path::PathBuf>,
+    /// Imaginary-network declaration from the scenario. Stored as Arc so cloning
+    /// RunnerState for parallel branches is O(1).
+    network:                      Option<Arc<Network>>,
 }
 
 impl Default for RunnerState {
@@ -277,6 +312,7 @@ impl Default for RunnerState {
             block_fixture_anchor_written: Arc::new(AtomicBool::new(false)),
             capture_fixture_path:         None,
             capture_block_fixture_path:   None,
+            network:                      None,
         }
     }
 }
@@ -826,11 +862,28 @@ fn execute_step<'a>(
                 let mut cs_channel = sc.cs_channel.take()
                     .ok_or_else(|| anyhow::anyhow!("serve_chain_sync: no chain-sync channel"))?;
 
-                let await_secs = params.await_at_tip_secs.unwrap_or(30).min(300);
+                // as_peer: resolve fixture path from the peer's chain_sync_fixture and
+                // override the connection's peer_id so all wire events are attributed to
+                // the correct imaginary peer. Must happen before eff_trc is created.
+                let effective_fixture_path: Option<String> = if let Some(ref as_peer_id) = params.as_peer {
+                    let peer = lookup_peer(&state.network, as_peer_id)?;
+                    let path = peer.chain_sync_fixture.as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "serve_chain_sync as_peer \"{as_peer_id}\": \
+                             peer has no chain_sync_fixture"
+                        ))?
+                        .to_string();
+                    sc.peer_id = Some(peer.id.clone());
+                    Some(path)
+                } else {
+                    params.fixture_path.clone()
+                };
 
-                // Load fixture if fixture_path is set (used for auto-generation OR
-                // as a header source for header_from_fixture in explicit responses).
-                let fixture_opt = if let Some(path) = &params.fixture_path {
+                let await_secs = params.await_at_tip_secs.unwrap_or(30).min(300);
+                let eff_trc = tracer.for_peer_opt(sc.peer_id.clone());
+
+                // Load fixture if a path is available (auto-generation or header sources).
+                let fixture_opt = if let Some(ref path) = effective_fixture_path {
                     let chain = fixture::load(std::path::Path::new(path.as_str()))
                         .with_context(|| format!("serve_chain_sync: loading fixture \"{path}\""))?;
                     Some(chain)
@@ -856,16 +909,14 @@ fn execute_step<'a>(
                             .collect::<anyhow::Result<Vec<_>>>()?
                     }
                     None => {
-                        // Auto-generate from fixture (fixture_path must be set;
-                        // validation guarantees at least one of the two is present).
+                        // Auto-generate from fixture.
                         let chain = fixture_opt.as_ref().ok_or_else(|| {
-                            anyhow::anyhow!("serve_chain_sync: fixture_path is required when responses is not set")
+                            anyhow::anyhow!("serve_chain_sync: fixture_path or as_peer is required when responses is not set")
                         })?;
                         generate_from_fixture(chain, await_secs)
                     }
                 };
 
-                let eff_trc = tracer.for_peer_opt(sc.peer_id.clone());
                 let summary = execute_response_script(
                     &mut cs_channel,
                     &script,
@@ -890,8 +941,25 @@ fn execute_step<'a>(
                 let mut bf_channel = sc.bf_channel.take()
                     .ok_or_else(|| anyhow::anyhow!("serve_block_fetch: no block-fetch channel"))?;
 
-                // Load BF fixture if provided.
-                let bf_fixture_opt = if let Some(path) = &params.block_fetch_fixture_path {
+                // as_peer: resolve from peer's block_fetch_fixture and override peer_id.
+                let effective_bf_path: Option<String> = if let Some(ref as_peer_id) = params.as_peer {
+                    let peer = lookup_peer(&state.network, as_peer_id)?;
+                    let path = peer.block_fetch_fixture.as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "serve_block_fetch as_peer \"{as_peer_id}\": \
+                             peer has no block_fetch_fixture"
+                        ))?
+                        .to_string();
+                    sc.peer_id = Some(peer.id.clone());
+                    Some(path)
+                } else {
+                    params.block_fetch_fixture_path.clone()
+                };
+
+                let eff_trc = tracer.for_peer_opt(sc.peer_id.clone());
+
+                // Load BF fixture if a path is available.
+                let bf_fixture_opt = if let Some(ref path) = effective_bf_path {
                     let chain = block_fixture::load(std::path::Path::new(path.as_str()))
                         .with_context(|| format!("serve_block_fetch: loading fixture \"{path}\""))?;
                     Some(chain)
@@ -919,7 +987,6 @@ fn execute_step<'a>(
                     }
                 };
 
-                let eff_trc = tracer.for_peer_opt(sc.peer_id.clone());
                 let summary = execute_block_fetch_script(
                     &mut bf_channel,
                     &script,

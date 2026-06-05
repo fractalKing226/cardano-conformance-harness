@@ -94,6 +94,9 @@ pub enum EventKind {
     ServerChainSyncStarted,
     ServerChainSyncCompleted,
 
+    // Network topology declaration
+    NetworkDeclared,
+
     // Peer-identity / imaginary-network events (emitted by emit_peer_event step)
     PeerProducedBlock,
     PeerCastVote,

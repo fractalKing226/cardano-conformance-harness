@@ -1,0 +1,21 @@
+{
+  "name": "as_peer_overrides_peer_id",
+  "description": "Regression test for the as_peer precedence rule. The accept_handshake step sets peer_id to 'original_id'; the serve_chain_sync step uses as_peer: 'declared_peer'. Wire events from the serve step must carry peer_id 'declared_peer', not 'original_id'. This verifies that as_peer on a serve step overrides a peer_id set at accept time.",
+  "network_magic": 42,
+  "trace_output_path": "trace_as_peer_override.jsonl",
+  "expected_outcome": "success",
+  "network": {
+    "peers": [
+      {
+        "id": "declared_peer",
+        "chain_sync_fixture": "fixtures/devnet_genesis.jsonl"
+      }
+    ]
+  },
+  "steps": [
+    { "kind": "listen", "bind_address": "0.0.0.0:3021" },
+    { "kind": "accept_handshake", "as": "conn", "peer_id": "original_id" },
+    { "kind": "serve_chain_sync", "on": "conn", "as_peer": "declared_peer", "await_at_tip_secs": 1 },
+    { "kind": "close_listener" }
+  ]
+}
