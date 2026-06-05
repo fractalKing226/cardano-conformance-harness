@@ -1,6 +1,6 @@
 {
   "name": "parallel_with_error",
-  "description": "One branch connects successfully; the other attempts to connect to a port that has no listener. Validates that a failure in any branch causes the parallel step (and hence the scenario) to fail.",
+  "description": "One branch sleeps for 10 seconds; the other immediately errors by referencing a connection name that was never created. The framework should abort the sleeping branch when the other fails, completing the scenario in well under 10 seconds.",
   "target_address": "localhost:3001",
   "network_magic": 42,
   "trace_output_path": "trace_parallel_with_error.jsonl",
@@ -10,12 +10,11 @@
       "kind": "parallel",
       "branches": [
         [
-          { "kind": "connect", "as": "good_client" },
-          { "kind": "handshake", "on": "good_client" }
+          { "kind": "connect", "as": "slow_branch" },
+          { "kind": "handshake", "on": "slow_branch" },
+          { "kind": "sleep", "duration_secs": 10 }
         ],
-        [
-          { "kind": "connect", "as": "bad_client", "target_address": "localhost:19999" }
-        ]
+        [{ "kind": "handshake", "on": "nonexistent_connection" }]
       ]
     }
   ]

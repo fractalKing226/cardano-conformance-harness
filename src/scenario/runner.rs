@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -943,16 +943,30 @@ fn execute_step<'a>(
                 let branches: Vec<Vec<StepDef>> = serde_json::from_value(branches_val.clone())
                     .context("parallel: invalid branches")?;
 
+                let branch_count = branches.len();
+
                 tracer
                     .emit(TraceEvent::new(
                         EventKind::ParallelStarted,
                         Direction::Internal,
-                        json!({ "branch_count": branches.len() }),
+                        json!({ "branch_count": branch_count }),
                     ))
                     .await?;
 
-                // Build one future per branch. Each branch gets its own RunnerState
-                // clone (O(1) — just bumps Arc ref-counts) and the shared Tracer.
+                // Per-branch flags written by the futures before they return or are dropped.
+                // After try_join_all resolves we inspect these to emit branch_aborted for
+                // any branch that was still in-flight when the failing branch returned Err.
+                let completed: Vec<Arc<AtomicBool>> = (0..branch_count)
+                    .map(|_| Arc::new(AtomicBool::new(false)))
+                    .collect();
+                let failed: Vec<Arc<AtomicBool>> = (0..branch_count)
+                    .map(|_| Arc::new(AtomicBool::new(false)))
+                    .collect();
+                // Last step index each branch reached (set before each run_step call).
+                let last_step: Vec<Arc<AtomicUsize>> = (0..branch_count)
+                    .map(|_| Arc::new(AtomicUsize::new(0)))
+                    .collect();
+
                 let branch_futs: Vec<_> = branches
                     .into_iter()
                     .enumerate()
@@ -960,6 +974,9 @@ fn execute_step<'a>(
                         let mut branch_state = state.clone();
                         let branch_tracer = tracer.clone();
                         let addr = target_address.to_string();
+                        let completed_flag = Arc::clone(&completed[bi]);
+                        let failed_flag   = Arc::clone(&failed[bi]);
+                        let last_step_flag = Arc::clone(&last_step[bi]);
                         async move {
                             branch_tracer
                                 .emit(TraceEvent::new(
@@ -969,6 +986,7 @@ fn execute_step<'a>(
                                 ))
                                 .await?;
                             for (si, step) in branch_steps.iter().enumerate() {
+                                last_step_flag.store(si, Ordering::Relaxed);
                                 if let Err(e) = run_step(
                                     step,
                                     si,
@@ -979,6 +997,7 @@ fn execute_step<'a>(
                                 )
                                 .await
                                 {
+                                    failed_flag.store(true, Ordering::Relaxed);
                                     let _ = branch_tracer
                                         .emit(TraceEvent::new(
                                             EventKind::ParallelBranchFailed,
@@ -989,6 +1008,7 @@ fn execute_step<'a>(
                                     return Err(e);
                                 }
                             }
+                            completed_flag.store(true, Ordering::Relaxed);
                             branch_tracer
                                 .emit(TraceEvent::new(
                                     EventKind::ParallelBranchCompleted,
@@ -1002,6 +1022,27 @@ fn execute_step<'a>(
                     .collect();
 
                 let result: anyhow::Result<Vec<()>> = try_join_all(branch_futs).await;
+
+                // try_join_all drops all remaining futures on the first Err.
+                // Those futures never wrote completed=true or failed=true, so we
+                // emit branch_aborted from the parent task (which is still running)
+                // to give the trace a clean completion event for every branch.
+                if result.is_err() {
+                    for bi in 0..branch_count {
+                        if !completed[bi].load(Ordering::Relaxed)
+                            && !failed[bi].load(Ordering::Relaxed)
+                        {
+                            let last = last_step[bi].load(Ordering::Relaxed);
+                            let _ = tracer
+                                .emit(TraceEvent::new(
+                                    EventKind::ParallelBranchAborted,
+                                    Direction::Internal,
+                                    json!({ "branch": bi, "last_step": last }),
+                                ))
+                                .await;
+                        }
+                    }
+                }
 
                 tracer
                     .emit(TraceEvent::new(
