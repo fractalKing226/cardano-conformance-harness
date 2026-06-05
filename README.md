@@ -18,6 +18,10 @@ Reads a scenario JSON file at startup and executes its steps in order. Supports:
 - **Variables** — steps can write outputs to named variables that later steps reference with `$name` syntax
 - **Adversarial serving** — scripted response rules send spec-incorrect messages (wrong state, truncated batches, malformed CBOR) to produce conformance evidence
 - **Fixture capture** — `--capture-fixture` and `--capture-block-fixture` record real-node traffic into replayable JSONL files
+- **Network declarations** — scenarios declare an imaginary network of named peers, each with assigned chain content and an optional block-production rule
+- **Slot model** — scenarios carry an imaginary clock (`start_slot`, `advance_to_slot`, `tick_slots`); peer content is filtered to entries visible at the current slot
+- **Stateful peers** — peers hold a runtime chain that persists across steps; `peer_extends_chain` appends entries explicitly; `production_rule` extends the chain automatically as time advances
+- **Automatic block production** — `every_n_slots` and `at_slots` rules produce deterministic synthetic blocks whenever the scenario clock passes the rule's firing slots
 
 ## Prerequisites
 
@@ -112,6 +116,7 @@ A scenario is a JSON file that describes a sequence of steps to execute.
 | `network_magic` | yes | Cardano network magic number |
 | `trace_output_path` | yes | Path for the JSON-lines trace output |
 | `expected_outcome` | no | Informational string logged in `scenario_completed` (e.g. `"success"`) |
+| `network` | no | Imaginary-network declaration — peers, slot model, production rules. See [docs/network_declarations.md](docs/network_declarations.md) |
 
 ### Named connections (`as` and `on`)
 
@@ -297,6 +302,40 @@ Emits a peer-identity network-state event into the trace without using any conne
 
 Closes the TCP connection cleanly. No parameters.
 
+#### `advance_to_slot`
+
+Advances the imaginary network clock to an absolute slot. Requires a `network` block with `start_slot` set. Errors if the target is not strictly greater than the current slot.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `slot` | yes | Absolute target slot |
+
+Triggers automatic block production for all peers with a `production_rule` in the range `(current_slot, slot]`.
+
+#### `tick_slots`
+
+Advances the clock by a relative number of slots. Requires `count ≥ 1` (validated at parse time).
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `count` | yes | Slots to advance (literal or `$varname`) |
+
+Also triggers production rules for the advanced range.
+
+#### `peer_extends_chain`
+
+Appends a new header (and optionally a block body) to a declared peer's chain. Any `serve_chain_sync as_peer:` step that runs afterwards sees the extended chain. Requires a `network` block with the peer declared.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `peer_id` | yes | Which peer to extend |
+| `slot` | yes | Slot of the new entry (must be strictly greater than the current chain tip) |
+| `block_number` | yes | Block height |
+| `block_hash` | yes | 64-char hex (32 bytes) |
+| `header_cbor` | yes | Hex-encoded header bytes |
+| `variant` | no | Era variant byte (default: 6 = Conway) |
+| `block_body_cbor` | no | Hex-encoded block body — if present, stored for `serve_block_fetch as_peer:` |
+
 ---
 
 ### Server-side step kinds
@@ -330,6 +369,7 @@ Executes a response script against the client's Chain-Sync session.
 | Parameter | Form | Description |
 |-----------|------|-------------|
 | `fixture_path` | auto | Path to a chain-sync JSONL fixture. Auto-generates an honest script. |
+| `as_peer` | peer state | Peer id from the `network` block. Uses the peer's current chain entries (filtered by `current_slot` when set) as the fixture. Sets the connection's `peer_id`. Mutually exclusive with `fixture_path`. |
 | `responses` | explicit | Ordered list of response rules (see below). |
 | `fixture_path` + `responses` | hybrid | `responses` drives; `fixture_path` provides header sources for `header_from_fixture` references. |
 | `await_at_tip_secs` | auto only | Seconds to hold in MustReply at tip (default 30, max 300). |
@@ -549,6 +589,18 @@ Any step can have an optional `expect` object. Failures emit `assertion_failed` 
 | `peer_identity_with_emit.json` | `emit_peer_event` for `peer_produced_block` interleaved with wire events |
 | `peer_identity_anonymous_connection.json` | Connection without `peer_id` — confirms `peer_id` field is absent in trace |
 
+#### Network declarations and imaginary-network model
+
+| File | Description |
+|------|-------------|
+| `two_peers_different_chains.json` | Two peers declared with distinct ids, served in parallel; demonstrates `as_peer` vocabulary |
+| `as_peer_overrides_peer_id.json` | `accept_handshake peer_id: "X"` then `serve_chain_sync as_peer: "Y"` — `as_peer` wins; regression test for override precedence |
+| `network_with_time.json` | Network starts at slot 100; `advance_to_slot` + `tick_slots` emit `slot_advanced` events; all wire events carry `slot` context |
+| `peer_runtime_extension.json` | 20-entry fixture peer extended to 21 at runtime via `peer_extends_chain`; client sees the full extended chain |
+| `slot_filtered_serving.json` | Fixture peer with current_slot advance; only entries with `slot ≤ current_slot` are served |
+| `auto_production_every_5_slots.json` | Peer with `every_n_slots { first_slot: 100, interval: 5 }`; advance to 130 produces 7 blocks automatically |
+| `auto_production_two_peers_different_rules.json` | Two peers — one with `every_n_slots`, one with `at_slots` — served in parallel after a single `advance_to_slot` |
+
 #### Server-side — honest
 
 | File | Description |
@@ -595,6 +647,7 @@ Each line is a self-contained JSON object.
 | `direction` | yes | `sent`, `received`, or `internal` |
 | `connection` | wire + lifecycle events | Connection name (`"default"` or explicit `as` name) |
 | `peer_id` | when set on connection | Peer identity label from `connect`/`accept_handshake` `peer_id` parameter, or from `emit_peer_event` |
+| `slot` | when `network.start_slot` is set | Imaginary-network slot at event emission time. Absent when no `start_slot` is declared |
 | `mini_protocol` | wire events | `"chain-sync"`, `"block-fetch"`, etc. |
 | `state_before` | wire events | Protocol state before the message |
 | `state_after` | wire events | Protocol state after the message |
@@ -647,6 +700,11 @@ Each line is a self-contained JSON object.
 | `server_block_fetch_started` | internal | Block-Fetch script begins |
 | `server_block_fetch_completed` | internal | Block-Fetch script ends; `payload.blocks_served`, `payload.exit_reason` |
 | `response_rule_applied` | internal | One script rule fired; `payload.rule_index`, `payload.on`, `payload.send` |
+| `network_declared` | internal | Emitted once at scenario start when a `network` block is present; lists declared peers |
+| `slot_advanced` | internal | `advance_to_slot` or `tick_slots` fired; `payload.from_slot`, `payload.to_slot`, `payload.reason` |
+| `peer_state_initialized` | internal | One per peer at scenario start; `payload.peer_id`, `payload.chain_entries_loaded`, `payload.blocks_loaded` |
+| `peer_chain_extended` | internal | A peer's chain gained an entry; `payload.peer_id`, `payload.slot`, `payload.block_hash`, `payload.block_number`, `payload.source` (`"explicit"` or `"production_rule"`) |
+| `production_rule_fired` | internal | A production rule was evaluated; `payload.peer_id`, `payload.slot`, `payload.rule_kind`, `payload.skipped` |
 
 ---
 
@@ -658,18 +716,19 @@ Each line is a self-contained JSON object.
 cargo test
 ```
 
-90 unit tests covering:
+133 unit tests covering:
 
-- `trace::tests` — serialisation, `direction`, `with_protocol`/`with_states`, `peer_id` propagation, concurrent emit
-- `scenario::tests` — parsing, validation, `parse_point`, per-step `target_address`, `peer_id` placement rules
+- `trace::tests` — serialisation, `direction`, `with_protocol`/`with_states`, `peer_id`/`slot` propagation, concurrent emit
+- `scenario::tests` — parsing, validation, `parse_point`, per-step `target_address`, `peer_id` rules, production_rule validation
 - `scenario::fixture::tests` — load/save round-trip, cursor operations, anchor regression
 - `scenario::block_fixture::tests` — load, range lookup, round-trip
 - `scenario::vars::tests` — `resolve_ref` (all forms + error cases), `substitute_in_value`, `point_to_str`
-- `scenario::runner::tests` — assertion evaluator, `subscribed_protocols` suite, worker spawn lifecycle
-- `scenario::response_rules::tests` — rule parsing, `rule_def_to_script` resolution, `stream_batch` generation
+- `scenario::peer_state::tests` — `slots_in_range` for both rule kinds, `apply_production_rules` (sequencing, skip-on-conflict, block_number continuity, range inclusivity), `filtered_fixture_chain` slot filtering
+- `scenario::runner::tests` — assertion evaluator, `subscribed_protocols` suite, worker spawn lifecycle, slot advance/tick/rewind, `peer_extends_chain` runtime validation, `network_without_start_slot_does_not_activate_slot_tracking`
+- `scenario::response_rules::tests` — rule parsing, `rule_def_to_script`, `stream_batch` generation
 - `miniprotocols::handshake::tests` — graceful error on refused connection
 - `miniprotocols::chainsync::tests` — hex encoding, point extraction, payload fields
-- `miniprotocols::blockfetch::tests` — payload fields, summary fields, **capture_blocks_populated_with_batch_size_one**, **capture_blocks_empty_when_batch_size_gt_one**
+- `miniprotocols::blockfetch::tests` — payload fields, summary fields, capture correctness
 
 ### Integration tests
 
@@ -691,6 +750,30 @@ Six tests, each pairing an adversarial server scenario with the `client_block_fe
 
 See `docs/block_fetch_conformance_results.md` for the results table.
 
+#### Network declaration tests — require free TCP ports 3020–3021
+
+```sh
+cargo test --test live_node -- --ignored network_declaration
+```
+
+Two tests: `as_peer` override of `accept_handshake` peer_id, and `network_declared` event presence.
+
+#### Peer state tests — require free TCP ports 3023–3024
+
+```sh
+cargo test --test live_node -- --ignored peer_state
+```
+
+Two tests: `peer_runtime_extension` (21 headers after explicit chain extension), `slot_filtered_serving` (5 of 10 entries visible at a given slot).
+
+#### Automatic production tests — require free TCP ports 3025–3026
+
+```sh
+cargo test --test live_node -- --ignored auto_production
+```
+
+Two tests: single peer with `every_n_slots` produces 7 blocks; two peers with different rules each produce the correct count.
+
 ---
 
 ## Project structure
@@ -710,8 +793,9 @@ src/
     keepalive.rs                  — Keep-Alive client + server
     txsubmission.rs               — Tx-Submission (passive receive)
   scenario/
-    mod.rs                        — Scenario, StepDef, StepKind, validation         [unit tests]
+    mod.rs                        — Scenario, StepDef, StepKind, Network, ProductionRule, validation  [unit tests]
     runner.rs                     — ScenarioRunner, step handlers, CheckedOut guard  [unit tests]
+    peer_state.rs                 — PeerState, ChainEntry, apply_production_rules   [unit tests]
     vars.rs                       — variable store, substitution                    [unit tests]
     fixture.rs                    — chain-sync fixture load/save/cursor             [unit tests]
     block_fixture.rs              — block-fetch fixture load/save/range lookup      [unit tests]
@@ -722,7 +806,8 @@ fixtures/
   devnet_genesis.jsonl            — 20 chain-sync headers captured from local devnet
   devnet_blocks.jsonl             — 20 block bodies (produced by capture_blocks_for_fixture.json)
 docs/
-  block_fetch_conformance_results.md — adversarial test findings (TBD columns after first run)
+  block_fetch_conformance_results.md — adversarial test findings (Pallas 0.36.0 results populated)
+  network_declarations.md           — network/peer/slot/production vocabulary reference
 tests/
   live_node.rs                    — integration tests (devnet + adversarial)
 scripts/
@@ -731,7 +816,9 @@ scripts/
 
 ## What's next
 
-- Parse slot/hash/block_number from Block-Fetch block body CBOR to enable fixture capture with `batch_size > 1`
+- Cryptographically valid block content — real KES signatures and VRF proofs for produced blocks (slice 6+)
+- Cross-peer state interaction — peer A's chain visible to peer B's production rule
+- Parse slot/hash/block_number from Block-Fetch block body CBOR to enable `batch_size > 1` fixture capture
 - Peer-Sharing mini-protocol (once pallas-network exposes it; version ≥ 13)
 - Tx-Submission step handler
 - Agda specification verifier integration — consume trace files and check against formal spec

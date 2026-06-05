@@ -27,7 +27,9 @@ use crate::miniprotocols::keepalive::{run_keepalive, run_keepalive_server, KEEP_
 use crate::miniprotocols::txsubmission::{run_tx_submission, TX_SUBMISSION_PROTOCOL};
 use crate::scenario::fixture;
 use crate::scenario::vars::{point_to_str, substitute_in_value, VarStore};
-use crate::scenario::peer_state::{ChainEntry, PeerState, decode_hex as decode_hex_bytes};
+use crate::scenario::peer_state::{
+    apply_production_rules, ChainEntry, PeerState, ProductionEvent, decode_hex as decode_hex_bytes,
+};
 use crate::scenario::fixture::DEFAULT_HEADER_VARIANT;
 use crate::scenario::{BlockFetchPoints, Network, Peer, Scenario, StepDef, StepKind, StepParams};
 use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
@@ -35,6 +37,40 @@ use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
 use super::parse_point;
 
 // ── Network peer lookup ───────────────────────────────────────────────────────
+
+/// Emits `ProductionRuleFired` (and `PeerChainExtended` for non-skipped blocks)
+/// trace events for each entry in a production batch.
+async fn emit_production_events(
+    events: &[ProductionEvent],
+    tracer: &Tracer,
+) -> anyhow::Result<()> {
+    for ev in events {
+        tracer.emit(TraceEvent::new(
+            EventKind::ProductionRuleFired,
+            Direction::Internal,
+            json!({
+                "peer_id":   ev.peer_id,
+                "slot":      ev.slot,
+                "rule_kind": ev.rule_kind,
+                "skipped":   ev.skipped,
+            }),
+        )).await?;
+        if !ev.skipped {
+            tracer.emit(TraceEvent::new(
+                EventKind::PeerChainExtended,
+                Direction::Internal,
+                json!({
+                    "peer_id":      ev.peer_id,
+                    "slot":         ev.slot,
+                    "block_hash":   ev.block_hash_hex,
+                    "block_number": ev.block_number,
+                    "source":       "production_rule",
+                }),
+            )).await?;
+        }
+    }
+    Ok(())
+}
 
 /// Emits a `SlotAdvanced` trace event recording a slot transition.
 /// Called by both `advance_to_slot` and `tick_slots` handlers.
@@ -177,6 +213,7 @@ impl ScenarioRunner {
                         ))?;
                     peer_state = PeerState::from_fixture_chain(&chain);
                 }
+                peer_state.production_rule = peer.production_rule.clone();
 
                 if let Some(ref path) = peer.block_fetch_fixture {
                     let chain = block_fixture::load(std::path::Path::new(path.as_str()))
@@ -1193,7 +1230,7 @@ fn execute_step<'a>(
                         "slot":         slot,
                         "block_hash":   block_hash_hex,
                         "block_number": block_number,
-                        "source":       "peer_extends_chain",
+                        "source":       "explicit",
                     }),
                 )).await?;
                 Ok(())
@@ -1216,7 +1253,13 @@ fn execute_step<'a>(
                     );
                 }
                 slot_arc.store(new_slot, Ordering::Relaxed); // Relaxed: see above
+                // Apply production rules for (current, new_slot] before emitting events.
+                let prod_events = {
+                    let mut guard = state.peers.lock().unwrap();
+                    apply_production_rules(&mut guard, current, new_slot)
+                };
                 emit_slot_advanced(current, new_slot, "advance_to_slot", tracer).await?;
+                emit_production_events(&prod_events, tracer).await?;
                 Ok(())
             }
 
@@ -1231,7 +1274,12 @@ fn execute_step<'a>(
                 // Returns the value before the addition; new value = old + count.
                 let old_slot = slot_arc.fetch_add(count, Ordering::Relaxed);
                 let new_slot = old_slot + count;
+                let prod_events = {
+                    let mut guard = state.peers.lock().unwrap();
+                    apply_production_rules(&mut guard, old_slot, new_slot)
+                };
                 emit_slot_advanced(old_slot, new_slot, "tick_slots", tracer).await?;
+                emit_production_events(&prod_events, tracer).await?;
                 Ok(())
             }
 
@@ -1657,6 +1705,7 @@ mod tests {
                 chain_sync_fixture: Some("fixtures/devnet_genesis.jsonl".into()),
                 block_fetch_fixture: None,
                 description: None,
+                production_rule: None,
             }],
             start_slot: None,     // explicitly absent
             slot_length_ms: None,

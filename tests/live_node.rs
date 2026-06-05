@@ -1226,3 +1226,62 @@ async fn slot_filtered_serving_exposes_only_visible_entries() {
         "server must send exactly 5 headers (entries at slots 100-500, visible at slot 550)");
 }
 
+// ── Automatic production (slice 4) integration tests ─────────────────────────
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3025; run with: cargo test --test live_node -- --ignored auto_production"]
+async fn auto_production_every_5_slots_serves_7_headers() {
+    // Network starts at slot 99, rule fires at 100..130 step 5 → 7 blocks.
+    // Client requests 7 headers; server must send all 7.
+    let events = run_server_with_chain_sync_client_n(
+        "scenarios/auto_production_every_5_slots.json", 3025, 7
+    ).await;
+
+    // 7 production_rule_fired events (all non-skipped)
+    let fired: Vec<&Value> = events.iter()
+        .filter(|e| e["kind"] == "production_rule_fired" && e["payload"]["skipped"] == false)
+        .collect();
+    assert_eq!(fired.len(), 7,
+        "expected 7 production_rule_fired events (slots 100,105,…,130)");
+    assert_eq!(fired[0]["payload"]["slot"], 100u64);
+    assert_eq!(fired[6]["payload"]["slot"], 130u64);
+
+    // 7 peer_chain_extended events with source: production_rule
+    let extended: Vec<&Value> = events.iter()
+        .filter(|e| e["kind"] == "peer_chain_extended"
+               && e["payload"]["source"] == "production_rule")
+        .collect();
+    assert_eq!(extended.len(), 7);
+
+    // 7 roll_forward events sent to the client
+    let rf = events.iter()
+        .filter(|e| e["kind"] == "chain_sync_roll_forward" && e["direction"] == "sent")
+        .count();
+    assert_eq!(rf, 7, "server must serve all 7 produced blocks");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3026; run with: cargo test --test live_node -- --ignored auto_production"]
+async fn auto_production_two_peers_different_rules() {
+    // steady_peer: every 5 slots from 100 → 5 blocks at {100,105,110,115,120}
+    // sparse_peer: at_slots [102,107,117] → 3 blocks
+    // Two clients connect in parallel; each sees its peer's production.
+    let events = run_server_with_chain_sync_client_n(
+        "scenarios/auto_production_two_peers_different_rules.json", 3026, 5
+    ).await;
+
+    let steady_fired: Vec<&Value> = events.iter()
+        .filter(|e| e["kind"] == "production_rule_fired"
+               && e["payload"]["peer_id"] == "steady_peer"
+               && e["payload"]["skipped"] == false)
+        .collect();
+    assert_eq!(steady_fired.len(), 5, "steady_peer must produce 5 blocks");
+
+    let sparse_fired: Vec<&Value> = events.iter()
+        .filter(|e| e["kind"] == "production_rule_fired"
+               && e["payload"]["peer_id"] == "sparse_peer"
+               && e["payload"]["skipped"] == false)
+        .collect();
+    assert_eq!(sparse_fired.len(), 3, "sparse_peer must produce 3 blocks at [102,107,117]");
+}
+

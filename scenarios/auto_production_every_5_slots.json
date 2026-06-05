@@ -1,0 +1,28 @@
+{
+  "name": "auto_production_every_5_slots",
+  "description": "Demonstrates automatic block production. One peer is configured with every_n_slots { first_slot: 100, interval: 5 }. The network starts at slot 99; advancing to slot 130 triggers production for slots 100, 105, 110, 115, 120, 125, 130 — seven blocks. A client then connects and receives all seven via chain-sync. Note: production fires during time advances on the range (old, new], so start_slot must be strictly less than first_slot to include the first block.",
+  "network_magic": 42,
+  "trace_output_path": "trace_auto_production_every_5_slots.jsonl",
+  "expected_outcome": "success",
+  "network": {
+    "start_slot": 99,
+    "peers": [
+      {
+        "id": "honest_peer",
+        "description": "Produces one block every 5 slots",
+        "production_rule": {
+          "kind": "every_n_slots",
+          "first_slot": 100,
+          "interval": 5
+        }
+      }
+    ]
+  },
+  "steps": [
+    { "kind": "advance_to_slot", "slot": 130 },
+    { "kind": "listen", "bind_address": "0.0.0.0:3025" },
+    { "kind": "accept_handshake", "as": "client" },
+    { "kind": "serve_chain_sync", "on": "client", "as_peer": "honest_peer", "await_at_tip_secs": 2 },
+    { "kind": "close_listener" }
+  ]
+}

@@ -102,6 +102,9 @@ pub enum EventKind {
     // Peer state lifecycle
     PeerStateInitialized,
     PeerChainExtended,
+    /// Fired once per slot per peer whenever a production rule is evaluated
+    /// (regardless of whether it produced a block or was skipped).
+    ProductionRuleFired,
 
     // Peer-identity / imaginary-network events (emitted by emit_peer_event step)
     PeerProducedBlock,

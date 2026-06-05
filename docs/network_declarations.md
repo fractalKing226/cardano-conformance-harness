@@ -329,6 +329,115 @@ Peer state lives in `RunnerState.peers: Arc<Mutex<HashMap<String, PeerState>>>`.
 
 ---
 
+---
+
+## Automatic block production (slice 4)
+
+Peers can be configured with a `production_rule` that automatically extends their chain when the scenario's imaginary clock advances. This makes scenarios declarative: rather than scripting each `peer_extends_chain` step, the scenario declares "this peer produces a block every N slots" and the harness handles the extensions.
+
+### `production_rule` field on `Peer`
+
+```json
+{
+  "id": "honest_peer",
+  "chain_sync_fixture": "fixtures/chain_a.jsonl",
+  "production_rule": {
+    "kind": "every_n_slots",
+    "first_slot": 100,
+    "interval": 5
+  }
+}
+```
+
+Three forms:
+
+| `kind` | Parameters | Fires at |
+|--------|-----------|----------|
+| `none` | — | Never (default when field is absent) |
+| `every_n_slots` | `first_slot: u64`, `interval: u64 ≥ 1` | `first_slot`, `first_slot + interval`, `first_slot + 2*interval`, … |
+| `at_slots` | `slots: [u64, …]` (strictly increasing, non-empty) | Exactly the listed slots |
+
+### When production fires
+
+Production fires **only during explicit time advances** (`advance_to_slot` and `tick_slots`). It evaluates the half-open range `(old_slot, new_slot]` — exclusive on the old slot (never re-fire at the current position), inclusive on the new slot (fire at the target).
+
+There is **no background timer and no production at startup**. The harness is deterministic: blocks only appear when the scenario explicitly advances time.
+
+### ⚠ The `start_slot` / `first_slot` interaction
+
+A common authoring mistake: setting `start_slot` equal to `first_slot`.
+
+```json
+"network": {
+  "start_slot": 100,          ← scenario starts here
+  "peers": [{
+    "production_rule": { "kind": "every_n_slots", "first_slot": 100, "interval": 5 }
+  }]
+}
+```
+
+**No block is produced at slot 100.** The scenario clock *starts* at 100; production only fires during advances *past* the starting point. The first advance would produce slots in `(100, new_slot]`, so slot 100 is never reached.
+
+**The fix:** set `start_slot` strictly below `first_slot`.
+
+```json
+"network": {
+  "start_slot": 99,           ← one slot below first production slot
+  "peers": [{
+    "production_rule": { "kind": "every_n_slots", "first_slot": 100, "interval": 5 }
+  }]
+}
+"steps": [
+  { "kind": "advance_to_slot", "slot": 130 }
+  // → produces at 100, 105, 110, 115, 120, 125, 130 (7 blocks)
+]
+```
+
+More generally: **if you want blocks starting at slot N, set `start_slot < N` OR explicitly advance time past N.**
+
+### Conflict resolution: production vs explicit extension
+
+If `peer_extends_chain` extends a peer's chain to slot N, and a production rule would also fire at slot N during a subsequent `advance_to_slot`, production **silently skips slot N** (chain tip already covers it). Explicit extensions take natural precedence — no coordination needed.
+
+A `production_rule_fired { skipped: true }` event is still emitted for the evaluation, preserving a full audit trail in the trace.
+
+### Trace events
+
+| Kind | `payload` fields | When |
+|------|-----------------|------|
+| `production_rule_fired` | `peer_id`, `slot`, `rule_kind`, `skipped` | Every (peer, slot) evaluation — whether or not a block was produced |
+| `peer_chain_extended` | `peer_id`, `slot`, `block_hash`, `block_number`, `source: "production_rule"` | Only for non-skipped productions |
+
+`skipped: true` means the rule was evaluated but the chain tip already covered that slot. `skipped: false` means a block was appended.
+
+The `source` field on `peer_chain_extended` now distinguishes three origins:
+
+| `source` | Meaning |
+|----------|---------|
+| `"explicit"` | From a `peer_extends_chain` step |
+| `"production_rule"` | From automatic production during a time advance |
+
+Fixture-loaded entries emit `peer_state_initialized` (bulk count) rather than individual `peer_chain_extended` events.
+
+### Validation rules
+
+| Rule | Error |
+|------|-------|
+| `every_n_slots` with `interval: 0` | `"interval must be at least 1"` |
+| `at_slots` with empty `slots` list | `"slots list must be non-empty"` |
+| `at_slots` with non-strictly-increasing `slots` | `"slots must be strictly increasing"` |
+| `every_n_slots.first_slot < network.start_slot` | `"first_slot N is before network start_slot M"` |
+
+### Synthetic block content
+
+Automatically produced blocks have minimal but wire-parseable content:
+
+- **`block_hash`** — Blake2b-256 of `peer_id_bytes ‖ slot_be64 ‖ prev_hash_bytes`. Deterministic and unique per `(peer_id, slot, prev_hash)`.
+- **`header_cbor`** — `array(2)[array(2)[block_number, slot], null]`. The same minimal shape `extract_header_fields` uses for chain-sync. Real VRF proofs and KES signatures are slice 6+.
+- **`block_body_cbor`** — `0xa0` (CBOR empty map). Valid CBOR, sufficient for block-fetch wire exchange.
+
+---
+
 ## What future slices will change
 
 This slice introduces the vocabulary without changing the content model. In subsequent

@@ -1,0 +1,47 @@
+{
+  "name": "auto_production_two_peers_different_rules",
+  "description": "Two peers with different production rules served in parallel. 'steady_peer' produces every 5 slots starting at 100; 'sparse_peer' produces at specific slots [102, 107, 117]. Advancing to slot 120 from start_slot 99 causes steady_peer to produce at {100, 105, 110, 115, 120} (5 blocks) and sparse_peer to produce at {102, 107, 117} (3 blocks). Each client receives its peer's production pattern.",
+  "network_magic": 42,
+  "trace_output_path": "trace_auto_production_two_peers.jsonl",
+  "expected_outcome": "success",
+  "network": {
+    "start_slot": 99,
+    "peers": [
+      {
+        "id": "steady_peer",
+        "description": "Produces one block every 5 slots starting at 100",
+        "production_rule": {
+          "kind": "every_n_slots",
+          "first_slot": 100,
+          "interval": 5
+        }
+      },
+      {
+        "id": "sparse_peer",
+        "description": "Produces at three specific slots only",
+        "production_rule": {
+          "kind": "at_slots",
+          "slots": [102, 107, 117]
+        }
+      }
+    ]
+  },
+  "steps": [
+    { "kind": "advance_to_slot", "slot": 120 },
+    { "kind": "listen", "bind_address": "0.0.0.0:3026" },
+    {
+      "kind": "parallel",
+      "branches": [
+        [
+          { "kind": "accept_handshake", "as": "conn_steady" },
+          { "kind": "serve_chain_sync", "on": "conn_steady", "as_peer": "steady_peer", "await_at_tip_secs": 2 }
+        ],
+        [
+          { "kind": "accept_handshake", "as": "conn_sparse" },
+          { "kind": "serve_chain_sync", "on": "conn_sparse", "as_peer": "sparse_peer", "await_at_tip_secs": 2 }
+        ]
+      ]
+    },
+    { "kind": "close_listener" }
+  ]
+}

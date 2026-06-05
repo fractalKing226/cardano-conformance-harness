@@ -14,6 +14,60 @@ use serde_json::Value;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
+/// Rule governing when a peer automatically produces blocks as the scenario's
+/// imaginary clock advances. Production fires during `advance_to_slot` and
+/// `tick_slots` for all slots in the half-open range (old_slot, new_slot].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProductionRule {
+    /// No automatic production — explicit opt-out (same as absent).
+    None,
+    /// Produces at `first_slot`, `first_slot + interval`, `first_slot + 2*interval`, …
+    EveryNSlots { first_slot: u64, interval: u64 },
+    /// Produces at exactly the listed slots (must be strictly increasing).
+    AtSlots { slots: Vec<u64> },
+}
+
+impl ProductionRule {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            ProductionRule::None          => "none",
+            ProductionRule::EveryNSlots { .. } => "every_n_slots",
+            ProductionRule::AtSlots { .. }     => "at_slots",
+        }
+    }
+
+    /// Returns every slot in the **closed** interval `[from, to]` at which
+    /// this rule fires. Caller is responsible for passing (old+1, new) so
+    /// the advance range `(old, new]` is respected.
+    pub fn slots_in_range(&self, from: u64, to: u64) -> Vec<u64> {
+        if from > to { return vec![]; }
+        match self {
+            ProductionRule::None => vec![],
+            ProductionRule::EveryNSlots { first_slot, interval } => {
+                if *interval == 0 { return vec![]; }
+                let mut slots = Vec::new();
+                // First slot >= from
+                let start = if *first_slot >= from {
+                    *first_slot
+                } else {
+                    let steps = (from - first_slot + interval - 1) / interval;
+                    first_slot + steps * interval
+                };
+                let mut s = start;
+                while s <= to {
+                    slots.push(s);
+                    s = s.saturating_add(*interval);
+                }
+                slots
+            }
+            ProductionRule::AtSlots { slots } => {
+                slots.iter().copied().filter(|&s| s >= from && s <= to).collect()
+            }
+        }
+    }
+}
+
 /// One peer in the imaginary network.
 /// Each peer holds an identity (`id`) and optional fixture paths for the
 /// protocols it can serve. Steps reference peers by `id` via `as_peer:`.
@@ -25,6 +79,9 @@ pub struct Peer {
     /// Path to the block-fetch fixture this peer serves (`serve_block_fetch as_peer:`).
     pub block_fetch_fixture: Option<String>,
     pub description:         Option<String>,
+    /// Optional automatic block-production rule. When absent or `{ "kind": "none" }`,
+    /// this peer never produces blocks automatically.
+    pub production_rule: Option<ProductionRule>,
 }
 
 /// Top-level imaginary-network declaration — a list of named peers with their
@@ -510,19 +567,61 @@ fn collect_connect_steps(steps: &[StepDef], counter: &mut usize, out: &mut Vec<(
     }
 }
 
-/// Validates the `network` block: unique peer ids, each peer has at least one fixture.
+/// Validates the `network` block: unique peer ids, each peer has at least one fixture,
+/// and production_rule fields are well-formed.
 fn validate_network_declaration(scenario: &Scenario, errors: &mut Vec<String>) {
     let Some(ref network) = scenario.network else { return };
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for peer in &network.peers {
+        let pos = format!("network.peers[\"{}\"]", peer.id);
         if !seen.insert(peer.id.as_str()) {
             errors.push(format!("network: duplicate peer id \"{}\"", peer.id));
         }
-        if peer.chain_sync_fixture.is_none() && peer.block_fetch_fixture.is_none() {
+        let has_content = peer.chain_sync_fixture.is_some()
+            || peer.block_fetch_fixture.is_some()
+            || matches!(&peer.production_rule, Some(r) if !matches!(r, ProductionRule::None));
+        if !has_content {
             errors.push(format!(
-                "network: peer \"{}\" has no fixtures — add chain_sync_fixture or block_fetch_fixture",
+                "network: peer \"{}\" has no content source — declare \
+                 chain_sync_fixture, block_fetch_fixture, or production_rule",
                 peer.id
             ));
+        }
+        // Validate production_rule if present.
+        match &peer.production_rule {
+            None | Some(ProductionRule::None) => {}
+            Some(ProductionRule::EveryNSlots { first_slot, interval }) => {
+                if *interval == 0 {
+                    errors.push(format!(
+                        "{pos}: production_rule interval must be at least 1 (got 0)"
+                    ));
+                }
+                if let Some(start) = network.start_slot {
+                    if *first_slot < start {
+                        errors.push(format!(
+                            "{pos}: production_rule first_slot {first_slot} is before \
+                             network start_slot {start} — no blocks would ever be produced \
+                             (blocks only fire during time advances past start_slot)"
+                        ));
+                    }
+                }
+            }
+            Some(ProductionRule::AtSlots { slots }) => {
+                if slots.is_empty() {
+                    errors.push(format!("{pos}: production_rule at_slots slots list must be non-empty"));
+                } else {
+                    for i in 1..slots.len() {
+                        if slots[i] <= slots[i - 1] {
+                            errors.push(format!(
+                                "{pos}: production_rule at_slots slots must be strictly increasing \
+                                 (slots[{i}]={} is not greater than slots[{}]={})",
+                                slots[i], i - 1, slots[i - 1]
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1129,14 +1228,29 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_peer_without_fixtures() {
+    fn peer_with_no_content_sources_is_rejected() {
+        // No fixture and no production_rule (or explicit None) — must fail.
         let json = server_with_network(
             r#"{ "peers": [{ "id": "empty_peer" }] }"#,
             r#"{ "kind": "listen" }"#,
         );
         let s: Scenario = serde_json::from_str(&json).unwrap();
         let err = validate(&s).unwrap_err().to_string();
-        assert!(err.contains("no fixtures"), "{err}");
+        assert!(err.contains("no content source"), "{err}");
+        assert!(err.contains("production_rule"), "{err}");
+    }
+
+    #[test]
+    fn peer_with_only_production_rule_passes_validation() {
+        // production_rule is a valid content source — no fixture required.
+        let json = server_with_network(
+            r#"{ "start_slot": 99, "peers": [{ "id": "p",
+                 "production_rule": { "kind": "every_n_slots",
+                                      "first_slot": 100, "interval": 5 } }] }"#,
+            r#"{ "kind": "listen" }"#,
+        );
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        assert!(validate(&s).is_ok(), "production_rule alone must satisfy the content-source requirement");
     }
 
     #[test]
@@ -1181,6 +1295,62 @@ mod tests {
     }
 
     // ── Slot-evolution step validation tests ─────────────────────────────────
+
+    // ── production_rule validation ────────────────────────────────────────────
+
+    fn network_with_rule(rule_json: &str) -> String {
+        format!(r#"{{
+            "name":"t","network_magic":1,"trace_output_path":"t.jsonl",
+            "network":{{
+                "start_slot":99,
+                "peers":[{{
+                    "id":"p",
+                    "chain_sync_fixture":"f.jsonl",
+                    "production_rule":{rule_json}
+                }}]
+            }},
+            "steps":[]
+        }}"#)
+    }
+
+    #[test]
+    fn every_n_slots_interval_zero_rejected() {
+        let json = network_with_rule(r#"{"kind":"every_n_slots","first_slot":100,"interval":0}"#);
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("interval must be at least 1"), "{err}");
+    }
+
+    #[test]
+    fn at_slots_empty_list_rejected() {
+        let json = network_with_rule(r#"{"kind":"at_slots","slots":[]}"#);
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("non-empty"), "{err}");
+    }
+
+    #[test]
+    fn at_slots_not_strictly_increasing_rejected() {
+        let json = network_with_rule(r#"{"kind":"at_slots","slots":[100,105,100]}"#);
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("strictly increasing"), "{err}");
+    }
+
+    #[test]
+    fn every_n_slots_first_slot_before_start_slot_rejected() {
+        let json = network_with_rule(r#"{"kind":"every_n_slots","first_slot":50,"interval":5}"#);
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("first_slot") && err.contains("start_slot"), "{err}");
+    }
+
+    #[test]
+    fn valid_production_rule_passes_validation() {
+        let json = network_with_rule(r#"{"kind":"every_n_slots","first_slot":100,"interval":5}"#);
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        assert!(validate(&s).is_ok());
+    }
 
     #[test]
     fn peer_extends_chain_without_peer_id_is_rejected() {
