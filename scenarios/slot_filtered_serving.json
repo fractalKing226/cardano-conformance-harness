@@ -1,0 +1,25 @@
+{
+  "name": "slot_filtered_serving",
+  "description": "Declares a network starting at slot 0 with a peer holding a 20-entry chain (slots 138-157). Advances the imaginary clock to slot 145 via advance_to_slot, then serves chain-sync to one client. Because current_slot is 145, only entries with slot <= 145 are visible — that's 8 entries (slots 138-145, block_numbers 0-7). The client sees 8 RollForward messages and then AwaitReply at tip. This demonstrates that slot-aware serve is opt-in via the network time model: without a network declaration (no start_slot), all entries are visible.",
+  "network_magic": 42,
+  "trace_output_path": "trace_slot_filtered_serving.jsonl",
+  "expected_outcome": "success",
+  "network": {
+    "start_slot": 0,
+    "slot_length_ms": 1000,
+    "peers": [
+      {
+        "id": "block_producer",
+        "chain_sync_fixture": "fixtures/devnet_genesis.jsonl",
+        "description": "A block producer whose chain is only partially visible at the current slot"
+      }
+    ]
+  },
+  "steps": [
+    { "kind": "advance_to_slot", "slot": 145 },
+    { "kind": "listen", "bind_address": "0.0.0.0:3024" },
+    { "kind": "accept_handshake", "as": "client" },
+    { "kind": "serve_chain_sync", "on": "client", "as_peer": "block_producer", "await_at_tip_secs": 2 },
+    { "kind": "close_listener" }
+  ]
+}

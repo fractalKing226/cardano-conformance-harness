@@ -27,6 +27,8 @@ use crate::miniprotocols::keepalive::{run_keepalive, run_keepalive_server, KEEP_
 use crate::miniprotocols::txsubmission::{run_tx_submission, TX_SUBMISSION_PROTOCOL};
 use crate::scenario::fixture;
 use crate::scenario::vars::{point_to_str, substitute_in_value, VarStore};
+use crate::scenario::peer_state::{ChainEntry, PeerState, decode_hex as decode_hex_bytes};
+use crate::scenario::fixture::DEFAULT_HEADER_VARIANT;
 use crate::scenario::{BlockFetchPoints, Network, Peer, Scenario, StepDef, StepKind, StepParams};
 use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
 
@@ -128,9 +130,15 @@ impl ScenarioRunner {
 
         // Initialize the slot counter before creating RunnerState so the tracer
         // can stamp ScenarioStarted and NetworkDeclared with the starting slot.
-        let current_slot: Option<Arc<AtomicU64>> = self.scenario.network.as_ref().map(|n| {
-            Arc::new(AtomicU64::new(n.start_slot.unwrap_or(0)))
-        });
+        // current_slot is only initialized when start_slot is explicitly declared.
+        // A network block without start_slot means "peers exist but time is not
+        // tracked" — no slot filtering, no SlotAdvanced events, advance_to_slot and
+        // tick_slots steps will error (they require an explicit starting point).
+        // Defaulting to 0 here would silently hide all fixture entries whose slots
+        // are non-zero (e.g. a devnet fixture captured at slots 138+).
+        let current_slot: Option<Arc<AtomicU64>> = self.scenario.network.as_ref()
+            .and_then(|n| n.start_slot)
+            .map(|s| Arc::new(AtomicU64::new(s)));
         let tracer = tracer.with_slot_tracker(current_slot.clone());
 
         let mut state = RunnerState {
@@ -155,6 +163,44 @@ impl ScenarioRunner {
                 Direction::Internal,
                 json!({ "peers": peers_json }),
             )).await?;
+
+            // Initialize each peer's runtime state from its declared fixtures.
+            // Emits PeerStateInitialized for every peer (including empty ones).
+            let mut peers_map: HashMap<String, PeerState> = HashMap::new();
+            for peer in &network.peers {
+                let mut peer_state = PeerState::new();
+
+                if let Some(ref path) = peer.chain_sync_fixture {
+                    let chain = fixture::load(std::path::Path::new(path.as_str()))
+                        .with_context(|| format!(
+                            "peer \"{}\": loading chain_sync_fixture \"{path}\"", peer.id
+                        ))?;
+                    peer_state = PeerState::from_fixture_chain(&chain);
+                }
+
+                if let Some(ref path) = peer.block_fetch_fixture {
+                    let chain = block_fixture::load(std::path::Path::new(path.as_str()))
+                        .with_context(|| format!(
+                            "peer \"{}\": loading block_fetch_fixture \"{path}\"", peer.id
+                        ))?;
+                    peer_state.extend_from_block_fixture_chain(&chain);
+                }
+
+                let chain_entries_loaded = peer_state.chain_entries.len();
+                let blocks_loaded = peer_state.block_store.len();
+                tracer.emit(TraceEvent::new(
+                    EventKind::PeerStateInitialized,
+                    Direction::Internal,
+                    json!({
+                        "peer_id":              peer.id,
+                        "chain_entries_loaded": chain_entries_loaded,
+                        "blocks_loaded":        blocks_loaded,
+                    }),
+                )).await?;
+
+                peers_map.insert(peer.id.clone(), peer_state);
+            }
+            *state.peers.lock().unwrap() = peers_map;
         }
 
         let mut steps_passed: u64 = 0;
@@ -333,6 +379,9 @@ struct RunnerState {
     /// Current imaginary-network slot. Shared across all parallel branches via Arc.
     /// None when the scenario has no network declaration.
     current_slot:                 Option<Arc<AtomicU64>>,
+    /// Runtime state for each declared peer. Populated at scenario start from
+    /// peer fixtures; extended at runtime by `peer_extends_chain` steps.
+    peers:                        Arc<Mutex<HashMap<String, PeerState>>>,
 }
 
 impl Default for RunnerState {
@@ -348,6 +397,7 @@ impl Default for RunnerState {
             capture_block_fixture_path:   None,
             network:                      None,
             current_slot:                 None,
+            peers:                        Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -897,34 +947,40 @@ fn execute_step<'a>(
                 let mut cs_channel = sc.cs_channel.take()
                     .ok_or_else(|| anyhow::anyhow!("serve_chain_sync: no chain-sync channel"))?;
 
-                // as_peer: resolve fixture path from the peer's chain_sync_fixture and
-                // override the connection's peer_id so all wire events are attributed to
-                // the correct imaginary peer. Must happen before eff_trc is created.
-                let effective_fixture_path: Option<String> = if let Some(ref as_peer_id) = params.as_peer {
-                    let peer = lookup_peer(&state.network, as_peer_id)?;
-                    let path = peer.chain_sync_fixture.as_deref()
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "serve_chain_sync as_peer \"{as_peer_id}\": \
-                             peer has no chain_sync_fixture"
-                        ))?
-                        .to_string();
-                    sc.peer_id = Some(peer.id.clone());
-                    Some(path)
-                } else {
-                    params.fixture_path.clone()
-                };
+                // as_peer: clone the peer's current chain (filtered by slot) from PeerState
+                // and override the connection's peer_id. The lock is released before any I/O.
+                // as_peer takes precedence over fixture_path (mutually exclusive, validated).
+                let fixture_opt: Option<crate::scenario::fixture::FixtureChain> =
+                    if let Some(ref as_peer_id) = params.as_peer {
+                        let _ = lookup_peer(&state.network, as_peer_id)?;
+                        sc.peer_id = Some(as_peer_id.clone());
+                        let current_slot_val = state.current_slot
+                            .as_ref().map(|a| a.load(Ordering::Relaxed));
+                        let chain = {
+                            let guard = state.peers.lock().unwrap();
+                            let ps = guard.get(as_peer_id.as_str()).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "serve_chain_sync: peer \"{as_peer_id}\" has no state; \
+                                     declare it in the network block"
+                                )
+                            })?;
+                            if ps.chain_entries.is_empty() && ps.chain_tip_slot().is_none() {
+                                None  // empty chain — auto-generate will produce empty script
+                            } else {
+                                Some(ps.filtered_fixture_chain(current_slot_val))
+                            }
+                        };
+                        chain
+                    } else if let Some(ref path) = params.fixture_path {
+                        let chain = fixture::load(std::path::Path::new(path.as_str()))
+                            .with_context(|| format!("serve_chain_sync: loading fixture \"{path}\""))?;
+                        Some(chain)
+                    } else {
+                        None
+                    };
 
                 let await_secs = params.await_at_tip_secs.unwrap_or(30).min(300);
                 let eff_trc = tracer.for_peer_opt(sc.peer_id.clone());
-
-                // Load fixture if a path is available (auto-generation or header sources).
-                let fixture_opt = if let Some(ref path) = effective_fixture_path {
-                    let chain = fixture::load(std::path::Path::new(path.as_str()))
-                        .with_context(|| format!("serve_chain_sync: loading fixture \"{path}\""))?;
-                    Some(chain)
-                } else {
-                    None
-                };
 
                 // Build the response script.
                 let script = match step.raw_params.get("responses") {
@@ -976,31 +1032,32 @@ fn execute_step<'a>(
                 let mut bf_channel = sc.bf_channel.take()
                     .ok_or_else(|| anyhow::anyhow!("serve_block_fetch: no block-fetch channel"))?;
 
-                // as_peer: resolve from peer's block_fetch_fixture and override peer_id.
-                let effective_bf_path: Option<String> = if let Some(ref as_peer_id) = params.as_peer {
-                    let peer = lookup_peer(&state.network, as_peer_id)?;
-                    let path = peer.block_fetch_fixture.as_deref()
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "serve_block_fetch as_peer \"{as_peer_id}\": \
-                             peer has no block_fetch_fixture"
-                        ))?
-                        .to_string();
-                    sc.peer_id = Some(peer.id.clone());
-                    Some(path)
-                } else {
-                    params.block_fetch_fixture_path.clone()
-                };
+                // as_peer: clone the peer's block_store from PeerState and override peer_id.
+                // Lock is released before any I/O.
+                let bf_fixture_opt: Option<crate::scenario::block_fixture::BlockFixtureChain> =
+                    if let Some(ref as_peer_id) = params.as_peer {
+                        let _ = lookup_peer(&state.network, as_peer_id)?;
+                        sc.peer_id = Some(as_peer_id.clone());
+                        let chain = {
+                            let guard = state.peers.lock().unwrap();
+                            let ps = guard.get(as_peer_id.as_str()).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "serve_block_fetch: peer \"{as_peer_id}\" has no state; \
+                                     declare it in the network block"
+                                )
+                            })?;
+                            ps.to_block_fixture_chain()
+                        };
+                        if chain.entries.is_empty() { None } else { Some(chain) }
+                    } else if let Some(ref path) = params.block_fetch_fixture_path {
+                        let chain = block_fixture::load(std::path::Path::new(path.as_str()))
+                            .with_context(|| format!("serve_block_fetch: loading fixture \"{path}\""))?;
+                        Some(chain)
+                    } else {
+                        None
+                    };
 
                 let eff_trc = tracer.for_peer_opt(sc.peer_id.clone());
-
-                // Load BF fixture if a path is available.
-                let bf_fixture_opt = if let Some(ref path) = effective_bf_path {
-                    let chain = block_fixture::load(std::path::Path::new(path.as_str()))
-                        .with_context(|| format!("serve_block_fetch: loading fixture \"{path}\""))?;
-                    Some(chain)
-                } else {
-                    None
-                };
 
                 // Build the response script.
                 let script = match step.raw_params.get("responses") {
@@ -1072,6 +1129,73 @@ fn execute_step<'a>(
                 tracer
                     .emit(TraceEvent::new(kind, Direction::Internal, payload).with_peer_id(peer_id))
                     .await?;
+                Ok(())
+            }
+
+            StepKind::PeerExtendsChain => {
+                let peer_id = params.peer_id.as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("peer_extends_chain: peer_id is required"))?;
+                let slot = params.slot
+                    .ok_or_else(|| anyhow::anyhow!("peer_extends_chain: slot is required"))?;
+                let block_number = params.block_number
+                    .ok_or_else(|| anyhow::anyhow!("peer_extends_chain: block_number is required"))?;
+                let block_hash_hex = params.block_hash.as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("peer_extends_chain: block_hash is required"))?;
+                let header_cbor_hex = params.header_cbor.as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("peer_extends_chain: header_cbor is required"))?;
+
+                // Decode outside the lock — decoding is not instant and the lock should be brief.
+                let block_hash   = decode_hex_bytes(block_hash_hex).context("peer_extends_chain: block_hash")?;
+                let header_cbor  = decode_hex_bytes(header_cbor_hex).context("peer_extends_chain: header_cbor")?;
+                let variant      = params.variant.unwrap_or(DEFAULT_HEADER_VARIANT);
+                let body_opt: Option<Vec<u8>> = params.block_body_cbor.as_deref()
+                    .map(|hex| decode_hex_bytes(hex).context("peer_extends_chain: block_body_cbor"))
+                    .transpose()?;
+
+                // Brief lock: validate monotonic order and push the new entry.
+                {
+                    let mut guard = state.peers.lock().unwrap();
+                    let ps = guard.get_mut(peer_id).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "peer_extends_chain: peer \"{peer_id}\" not found — \
+                             declare it in the network block"
+                        )
+                    })?;
+
+                    // Monotonic slot check. Accept any slot when chain is empty;
+                    // a misleading "tip slot 0" message would be confusing.
+                    if let Some(tip_slot) = ps.chain_tip_slot() {
+                        if slot <= tip_slot {
+                            anyhow::bail!(
+                                "peer_extends_chain: slot {slot} is not greater than \
+                                 current chain tip slot {tip_slot}"
+                            );
+                        }
+                    }
+
+                    ps.chain_entries.push(ChainEntry {
+                        slot,
+                        block_hash: block_hash.clone(),
+                        block_number,
+                        header_cbor,
+                        variant,
+                    });
+                    if let Some(body) = body_opt {
+                        ps.block_store.insert((slot, block_hash.clone()), body);
+                    }
+                }
+
+                tracer.emit(TraceEvent::new(
+                    EventKind::PeerChainExtended,
+                    Direction::Internal,
+                    json!({
+                        "peer_id":      peer_id,
+                        "slot":         slot,
+                        "block_hash":   block_hash_hex,
+                        "block_number": block_number,
+                        "source":       "peer_extends_chain",
+                    }),
+                )).await?;
                 Ok(())
             }
 
@@ -1381,6 +1505,7 @@ pub fn evaluate_assertions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scenario::{Network, Peer};
     use crate::scenario::Assertions;
 
     fn events(kinds: &[&str]) -> Vec<Value> {
@@ -1513,6 +1638,43 @@ mod tests {
         assert!(state.server_connections.lock().unwrap().is_empty(), "no server connections before accept_handshake");
     }
 
+    #[test]
+    fn network_without_start_slot_does_not_activate_slot_tracking() {
+        // Pins the invariant: declaring a network for peer vocabulary but omitting
+        // start_slot must NOT activate slot tracking. The runner's initialization is:
+        //
+        //   scenario.network.as_ref().and_then(|n| n.start_slot).map(Arc::new(AtomicU64::new(s)))
+        //
+        // The original bug used `.map(|n| Arc::new(AtomicU64::new(n.start_slot.unwrap_or(0))))`,
+        // which produced Some(0) for any network-declaring scenario and silently hid all
+        // fixture entries above slot 0 (e.g. devnet entries at slots 138+).
+        //
+        // This test replicates the initialization formula directly. A regression to
+        // unwrap_or(0) would produce Some(0) here and the assertion would fail.
+        let network: Option<Network> = Some(Network {
+            peers: vec![Peer {
+                id: "p".to_string(),
+                chain_sync_fixture: Some("fixtures/devnet_genesis.jsonl".into()),
+                block_fetch_fixture: None,
+                description: None,
+            }],
+            start_slot: None,     // explicitly absent
+            slot_length_ms: None,
+        });
+
+        let current_slot: Option<Arc<AtomicU64>> = network
+            .as_ref()
+            .and_then(|n| n.start_slot)           // None when start_slot absent
+            .map(|s| Arc::new(AtomicU64::new(s))); // never reached
+
+        assert!(
+            current_slot.is_none(),
+            "network without start_slot must yield current_slot = None; \
+             got Some(_) — regression: unwrap_or(0) would activate slot tracking \
+             at slot 0 and hide all fixture entries with slot > 0"
+        );
+    }
+
     /// After Connect, channels are allocated but workers are not yet running.
     /// After Handshake, workers are running and channels are consumed.
     ///
@@ -1641,6 +1803,118 @@ mod tests {
         execute_step(&step, &json!({ "count": 1 }), "", 42, &mut state, &tracer)
             .await.expect("tick_slots count=1 should succeed");
         assert_eq!(state.current_slot.as_ref().unwrap().load(Ordering::Relaxed), 1);
+    }
+
+    // ── PeerExtendsChain runtime tests ───────────────────────────────────────
+
+    async fn run_peer_extends_chain(
+        state: &mut RunnerState,
+        tracer: &crate::trace::Tracer,
+        peer_id: &str,
+        slot: u64,
+        block_number: u64,
+        block_hash_hex: &str,
+        header_cbor_hex: &str,
+    ) -> anyhow::Result<()> {
+        let params_json = json!({
+            "peer_id": peer_id,
+            "slot": slot,
+            "block_number": block_number,
+            "block_hash": block_hash_hex,
+            "header_cbor": header_cbor_hex,
+        });
+        let step = slot_step(StepKind::PeerExtendsChain, params_json.clone());
+        execute_step(&step, &params_json, "", 42, state, tracer).await
+    }
+
+    fn state_with_peer(peer_id: &str) -> RunnerState {
+        let mut ps = PeerState::new();
+        ps.chain_entries.push(crate::scenario::peer_state::ChainEntry {
+            slot: 10, block_hash: vec![0x01; 32], block_number: 1,
+            header_cbor: vec![0xaa], variant: 6,
+        });
+        let mut peers = HashMap::new();
+        peers.insert(peer_id.to_string(), ps);
+        RunnerState {
+            peers: Arc::new(Mutex::new(peers)),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_extends_chain_appends_new_entry() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tracer = crate::trace::Tracer::open(tmp.path()).await.unwrap();
+        let mut state = state_with_peer("p");
+        run_peer_extends_chain(&mut state, &tracer, "p", 20, 2, &"aa".repeat(32), "8200")
+            .await.expect("valid extension should succeed");
+        let guard = state.peers.lock().unwrap();
+        let ps = guard.get("p").unwrap();
+        assert_eq!(ps.chain_entries.len(), 2);
+        assert_eq!(ps.chain_entries[1].slot, 20);
+    }
+
+    #[tokio::test]
+    async fn peer_extends_chain_rejects_same_slot() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tracer = crate::trace::Tracer::open(tmp.path()).await.unwrap();
+        let mut state = state_with_peer("p");
+        let err = run_peer_extends_chain(&mut state, &tracer, "p", 10, 2, &"bb".repeat(32), "8200")
+            .await.unwrap_err().to_string();
+        assert!(err.contains("not greater than current chain tip slot"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn peer_extends_chain_rejects_rewind() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tracer = crate::trace::Tracer::open(tmp.path()).await.unwrap();
+        let mut state = state_with_peer("p");
+        let err = run_peer_extends_chain(&mut state, &tracer, "p", 5, 2, &"cc".repeat(32), "8200")
+            .await.unwrap_err().to_string();
+        assert!(err.contains("not greater than current chain tip slot"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn peer_extends_chain_accepts_any_slot_when_empty() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tracer = crate::trace::Tracer::open(tmp.path()).await.unwrap();
+        let mut peers = HashMap::new();
+        peers.insert("p".to_string(), PeerState::new());  // empty chain
+        let mut state = RunnerState {
+            peers: Arc::new(Mutex::new(peers)),
+            ..Default::default()
+        };
+        run_peer_extends_chain(&mut state, &tracer, "p", 1, 1, &"dd".repeat(32), "8200")
+            .await.expect("empty chain should accept any slot");
+        assert_eq!(state.peers.lock().unwrap().get("p").unwrap().chain_entries.len(), 1);
+    }
+
+    #[test]
+    fn peer_state_slot_filter_unit() {
+        // Constructed synthetic PeerState — no fixture file dependency.
+        // 10 entries at slots 100, 110, 120, ..., 190.
+        let mut ps = PeerState::new();
+        for (i, slot) in (100u64..=190).step_by(10).enumerate() {
+            ps.chain_entries.push(crate::scenario::peer_state::ChainEntry {
+                slot,
+                block_hash:   vec![slot as u8; 32],
+                block_number: i as u64,
+                header_cbor:  vec![0x82, 0x82, i as u8, 0x18, slot as u8, 0xf6],
+                variant:      6,
+            });
+        }
+        assert_eq!(ps.chain_entries.len(), 10);
+
+        // Visible at slot 145: 100, 110, 120, 130, 140 = 5 entries.
+        let visible = ps.filtered_fixture_chain(Some(145));
+        assert_eq!(visible.entries.len(), 5, "exactly 5 entries have slot <= 145");
+        assert_eq!(visible.entries.last().unwrap().slot, 140);
+
+        // Visible at slot 200: all 10.
+        assert_eq!(ps.filtered_fixture_chain(Some(200)).entries.len(), 10);
+
+        // No filter: all 10.
+        assert_eq!(ps.filtered_fixture_chain(None).entries.len(), 10);
     }
 
     #[tokio::test]

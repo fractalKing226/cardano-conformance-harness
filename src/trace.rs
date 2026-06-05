@@ -99,6 +99,10 @@ pub enum EventKind {
     NetworkDeclared,
     SlotAdvanced,
 
+    // Peer state lifecycle
+    PeerStateInitialized,
+    PeerChainExtended,
+
     // Peer-identity / imaginary-network events (emitted by emit_peer_event step)
     PeerProducedBlock,
     PeerCastVote,

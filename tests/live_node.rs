@@ -989,8 +989,13 @@ async fn block_fetch_adversarial_no_blocks_after_start() {
 // Do NOT require the devnet — the harness serves its own connections.
 // Run with: cargo test --test live_node -- --ignored network_declaration
 
-/// Run one server scenario and connect one chain-sync client. Returns server trace.
-async fn run_server_with_chain_sync_client(server_path: &str, port: u16) -> Vec<Value> {
+/// Run one server scenario and connect one chain-sync client requesting `count` headers.
+/// Returns the server's trace events.
+async fn run_server_with_chain_sync_client_n(
+    server_path: &str,
+    port: u16,
+    count: u64,
+) -> Vec<Value> {
     let server_trace = NamedTempFile::new().unwrap();
     let mut server_scenario = cardano_conformance_harness::scenario::load(
         std::path::Path::new(server_path)
@@ -1016,11 +1021,48 @@ async fn run_server_with_chain_sync_client(server_path: &str, port: u16) -> Vec<
         let tracer = Tracer::open(tmp.path()).await.unwrap();
         let _ = handshake_on_channel(hs_ch, cardano_conformance_harness::DEVNET_MAGIC, &tracer).await;
         let _ = run_chain_sync(cs_ch, vec![pallas_network::miniprotocols::Point::Origin],
-            3, Duration::from_secs(5), &tracer).await;
+            count, Duration::from_secs(8), &tracer).await;
         let _ = server_handle.await;
     })).await;
 
     read_trace(&server_trace)
+}
+
+/// Convenience wrapper that requests 3 headers — used by network-declaration tests.
+async fn run_server_with_chain_sync_client(server_path: &str, port: u16) -> Vec<Value> {
+    run_server_with_chain_sync_client_n(server_path, port, 3).await
+}
+
+/// Encode a `u64` as CBOR unsigned integer (minimal form).
+fn cbor_uint(v: u64) -> Vec<u8> {
+    if v <= 23         { vec![v as u8] }
+    else if v <= 0xFF  { vec![0x18, v as u8] }
+    else if v <= 0xFFFF { vec![0x19, (v >> 8) as u8, (v & 0xFF) as u8] }
+    else { vec![0x1a, (v>>24) as u8, ((v>>16)&0xFF) as u8, ((v>>8)&0xFF) as u8, (v&0xFF) as u8] }
+}
+
+/// Write a synthetic chain-sync JSONL fixture with N entries at evenly-spaced slots.
+/// Each entry contains minimal but parseable CBOR: `array(2)[array(2)[bn, slot], null]`,
+/// which is exactly the shape `extract_header_fields` expects (outer array, inner array
+/// starting with block_number then slot, then anything for the signature).
+fn write_synthetic_chain_fixture(path: &std::path::Path, slot_step: u64, count: u64) {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path).unwrap();
+    writeln!(f, r#"{{"anchor":true}}"#).unwrap();
+    for bn in 0..count {
+        let slot = (bn + 1) * slot_step;
+        let bn_bytes  = cbor_uint(bn);
+        let sl_bytes  = cbor_uint(slot);
+        let mut cbor  = vec![0x82u8, 0x82];  // array(2), array(2)
+        cbor.extend_from_slice(&bn_bytes);
+        cbor.extend_from_slice(&sl_bytes);
+        cbor.push(0xf6);                      // null (signature placeholder)
+        let cbor_hex: String = cbor.iter().map(|b| format!("{b:02x}")).collect();
+        let hash_hex = format!("{slot:064x}");
+        writeln!(f,
+            r#"{{"slot":{slot},"block_hash":"{hash_hex}","block_number":{bn},"cbor_hex":"{cbor_hex}","variant":6}}"#
+        ).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1100,5 +1142,87 @@ async fn network_with_time_slot_context_on_wire_events() {
         assert_eq!(e["slot"], 250,
             "chain-sync wire event must carry slot 250: {e}");
     }
+}
+
+// ── Peer state (slice 3) integration tests ────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3023 and fixtures/devnet_genesis.jsonl; run with: cargo test --test live_node -- --ignored peer_state"]
+async fn peer_runtime_extension_serves_21_headers() {
+    // Server serves a 20-entry fixture peer extended at runtime to 21 entries.
+    // Client requests all 21; server must send all 21 roll_forward messages.
+    let events = run_server_with_chain_sync_client_n(
+        "scenarios/peer_runtime_extension.json", 3023, 21
+    ).await;
+
+    assert!(
+        events.iter().any(|e| e["kind"] == "peer_chain_extended"),
+        "trace must contain peer_chain_extended event"
+    );
+    let rf = events.iter()
+        .filter(|e| e["kind"] == "chain_sync_roll_forward" && e["direction"] == "sent")
+        .count();
+    assert_eq!(rf, 21,
+        "server must have sent 21 roll_forward messages (20 from fixture + 1 runtime extension)");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3024; run with: cargo test --test live_node -- --ignored peer_state"]
+async fn slot_filtered_serving_exposes_only_visible_entries() {
+    // Constructed fixture: 10 entries at slots 100, 200, 300, …, 1000 (step 100).
+    // Advance to slot 550: visible = {100, 200, 300, 400, 500} = 5 entries.
+    // Client requests exactly 5; server sends 5 then AwaitReply.
+    let tmp_fixture = NamedTempFile::new().unwrap();
+    write_synthetic_chain_fixture(tmp_fixture.path(), 100, 10);
+
+    // Load the slot_filtered scenario and point it at the synthetic fixture.
+    let mut scenario = cardano_conformance_harness::scenario::load(
+        std::path::Path::new("scenarios/slot_filtered_serving.json")
+    ).expect("slot_filtered_serving.json must parse");
+    scenario.network.as_mut().unwrap().peers[0].chain_sync_fixture =
+        Some(tmp_fixture.path().to_string_lossy().into_owned());
+    // Override the advance_to_slot target by modifying the step's raw_params.
+    // The scenario has steps[0] = advance_to_slot. Override slot → 550.
+    if let serde_json::Value::Object(ref mut m) = scenario.steps[0].raw_params {
+        m.insert("slot".into(), serde_json::json!(550u64));
+    }
+    // Rebind to a temp trace file and run.
+    let server_trace = NamedTempFile::new().unwrap();
+    scenario.trace_output_path = server_trace.path().to_path_buf();
+    // Port 3024 is declared in the scenario's listen step — no change needed.
+
+    let local = tokio::task::LocalSet::new();
+    let _ = tokio::time::timeout(Duration::from_secs(15), local.run_until(async move {
+        let server_handle = tokio::task::spawn_local(
+            ScenarioRunner::new(scenario).run()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let bearer = Bearer::connect_tcp("localhost:3024").await.unwrap();
+        let mut plexer = Plexer::new(bearer);
+        let hs_ch = plexer.subscribe_client(PROTOCOL_N2N_HANDSHAKE);
+        let cs_ch = plexer.subscribe_client(CHAIN_SYNC_PROTOCOL);
+        let _ka = plexer.subscribe_client(pallas_network::miniprotocols::PROTOCOL_N2N_KEEP_ALIVE);
+        plexer.spawn();
+        let tmp = NamedTempFile::new().unwrap();
+        let tracer = Tracer::open(tmp.path()).await.unwrap();
+        let _ = handshake_on_channel(hs_ch, cardano_conformance_harness::DEVNET_MAGIC, &tracer).await;
+        // 5 entries visible — request exactly 5.
+        let _ = run_chain_sync(cs_ch, vec![pallas_network::miniprotocols::Point::Origin],
+            5, Duration::from_secs(8), &tracer).await;
+        let _ = server_handle.await;
+    })).await;
+
+    let events = read_trace(&server_trace);
+
+    let sa = events.iter().find(|e| e["kind"] == "slot_advanced");
+    assert!(sa.is_some(), "slot_advanced event must appear");
+    assert_eq!(sa.unwrap()["payload"]["to_slot"], 550u64);
+
+    let rf = events.iter()
+        .filter(|e| e["kind"] == "chain_sync_roll_forward" && e["direction"] == "sent")
+        .count();
+    assert_eq!(rf, 5,
+        "server must send exactly 5 headers (entries at slots 100-500, visible at slot 550)");
 }
 

@@ -48,6 +48,22 @@ pub struct BlockFixtureChain {
 }
 
 impl BlockFixtureChain {
+    /// Build a `BlockFixtureChain` from a peer's block_store.
+    ///
+    /// `BTreeMap<(slot, hash), body>` iterates in slot order, which is the order
+    /// a Block-Fetch server serves blocks in.
+    pub fn from_block_store(store: &std::collections::BTreeMap<(u64, Vec<u8>), Vec<u8>>) -> Self {
+        let entries = store
+            .iter()
+            .map(|((slot, hash), body)| BlockFixtureEntry {
+                slot:          *slot,
+                block_hash:    encode_hex(hash),
+                block_cbor_hex: encode_hex(body),
+            })
+            .collect();
+        Self { anchor: pallas_network::miniprotocols::Point::Origin, entries }
+    }
+
     /// Find all entries whose points fall in `[from, to]` (inclusive, in chain
     /// order). Returns `None` if either endpoint is missing from the fixture or
     /// `to` comes before `from` in chain order.

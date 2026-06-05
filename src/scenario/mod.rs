@@ -1,5 +1,6 @@
 pub mod block_fixture;
 pub mod fixture;
+pub mod peer_state;
 pub mod response_rules;
 pub mod runner;
 pub mod vars;
@@ -151,6 +152,11 @@ pub enum StepKind {
     /// Advance the imaginary network clock by a relative number of slots.
     /// `count` must be at least 1.
     TickSlots,
+    /// Append a new header (and optionally a block body) to a declared peer's
+    /// chain. The new entry's slot must be strictly greater than the current
+    /// chain tip slot. Any `serve_chain_sync as_peer:` step that runs after this
+    /// will see the extended chain.
+    PeerExtendsChain,
 }
 
 impl StepKind {
@@ -171,8 +177,9 @@ impl StepKind {
             StepKind::CloseListener   => "close_listener",
             StepKind::Parallel        => "parallel",
             StepKind::EmitPeerEvent   => "emit_peer_event",
-            StepKind::AdvanceToSlot   => "advance_to_slot",
-            StepKind::TickSlots       => "tick_slots",
+            StepKind::AdvanceToSlot    => "advance_to_slot",
+            StepKind::TickSlots        => "tick_slots",
+            StepKind::PeerExtendsChain => "peer_extends_chain",
         }
     }
 
@@ -276,6 +283,20 @@ pub struct StepParams {
 
     /// advance_to_slot: absolute target slot number.
     pub slot: Option<u64>,
+
+    // ── peer_extends_chain params ─────────────────────────────────────────────
+
+    /// Block height of the new entry.
+    pub block_number: Option<u64>,
+    /// 64-char hex-encoded block hash of the new entry.
+    pub block_hash: Option<String>,
+    /// Hex-encoded header CBOR bytes.
+    pub header_cbor: Option<String>,
+    /// Era variant byte (default: `DEFAULT_HEADER_VARIANT`).
+    pub variant: Option<u8>,
+    /// Optional hex-encoded block body. When present, also stored in the peer's
+    /// block_store so `serve_block_fetch as_peer` can serve it.
+    pub block_body_cbor: Option<String>,
 }
 
 /// How Block-Fetch obtains its point list.
@@ -441,7 +462,8 @@ fn validate_connection_names(steps: &[StepDef], errors: &mut Vec<String>) {
                 // across nested step lists is not enforced here.
             }
             StepKind::Sleep | StepKind::EmitPeerEvent
-            | StepKind::AdvanceToSlot | StepKind::TickSlots => {}
+            | StepKind::AdvanceToSlot | StepKind::TickSlots
+            | StepKind::PeerExtendsChain => {}
         }
     }
     // Warn about unclosed connections (not an error — cleanup handles them).
@@ -551,6 +573,13 @@ fn validate_steps(steps: &[StepDef], errors: &mut Vec<String>, has_chain_sync: &
     }
 }
 
+// When adding a new StepKind, audit these allowlists:
+//   1. peer_id allowlist (around line 585)
+//   2. target_address allowlist (around line 580)
+//   3. validate_connection_names match — needs an explicit arm
+//
+// Forgetting any of these produces "passes unit tests, fails integration
+// tests" failures where the new step kind is rejected at parse time.
 fn validate_step(
     step: &StepDef,
     pos: &str,
@@ -563,11 +592,15 @@ fn validate_step(
     if step.raw_params.get("peer_id").is_some()
         && !matches!(
             step.kind,
-            StepKind::Connect | StepKind::AcceptHandshake | StepKind::EmitPeerEvent
+            StepKind::Connect
+                | StepKind::AcceptHandshake
+                | StepKind::EmitPeerEvent
+                | StepKind::PeerExtendsChain
         )
     {
         errors.push(format!(
-            "{pos}: peer_id is only valid on connect, accept_handshake, and emit_peer_event steps"
+            "{pos}: peer_id is only valid on connect, accept_handshake, \
+             emit_peer_event, and peer_extends_chain steps"
         ));
     }
 
@@ -685,6 +718,24 @@ fn validate_step(
             if step.raw_params.get("event_kind").is_none() {
                 errors.push(format!("{pos}: emit_peer_event requires event_kind"));
             }
+        }
+
+        StepKind::PeerExtendsChain => {
+            for req in &["peer_id", "slot", "block_number", "block_hash", "header_cbor"] {
+                if step.raw_params.get(req).is_none() {
+                    errors.push(format!("{pos}: peer_extends_chain requires {req}"));
+                }
+            }
+            // Validate block_hash is 64 hex chars (32 bytes) when it's a literal.
+            if let Some(Value::String(h)) = step.raw_params.get("block_hash") {
+                if !h.starts_with('$') && h.len() != 64 {
+                    errors.push(format!(
+                        "{pos}: peer_extends_chain block_hash must be 64 hex characters (32 bytes), got {}",
+                        h.len()
+                    ));
+                }
+            }
+            // Monotonic slot check and peer existence are runtime validations.
         }
 
         StepKind::AdvanceToSlot => {
@@ -1130,6 +1181,36 @@ mod tests {
     }
 
     // ── Slot-evolution step validation tests ─────────────────────────────────
+
+    #[test]
+    fn peer_extends_chain_without_peer_id_is_rejected() {
+        // peer_id is required on peer_extends_chain; omitting it must be a parse-time error.
+        let json = server_with_network(
+            r#"{ "peers": [{ "id": "p", "chain_sync_fixture": "f.jsonl" }] }"#,
+            r#"{ "kind": "peer_extends_chain",
+                 "slot": 100, "block_number": 1,
+                 "block_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                 "header_cbor": "8200" }"#,
+        );
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("peer_extends_chain requires peer_id"), "{err}");
+    }
+
+    #[test]
+    fn peer_extends_chain_with_peer_id_passes_validation() {
+        // Confirm the allowlist fix: peer_id on peer_extends_chain must not be rejected.
+        let json = server_with_network(
+            r#"{ "peers": [{ "id": "p", "chain_sync_fixture": "f.jsonl" }] }"#,
+            r#"{ "kind": "peer_extends_chain",
+                 "peer_id": "p",
+                 "slot": 100, "block_number": 1,
+                 "block_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                 "header_cbor": "8200" }"#,
+        );
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        assert!(validate(&s).is_ok(), "peer_extends_chain with peer_id must be valid");
+    }
 
     #[test]
     fn advance_to_slot_requires_slot_param() {

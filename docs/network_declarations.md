@@ -258,6 +258,77 @@ event is the authoritative record of when the transition occurred.
 
 ---
 
+---
+
+## Peer state (slice 3)
+
+Each declared peer gains **runtime state** — an in-memory chain that persists across steps and can be extended during scenario execution. Serve steps consult the peer's current state rather than re-reading the fixture file.
+
+### How state is initialized
+
+At scenario start, for each declared peer:
+
+1. If `chain_sync_fixture` is set, load it into the peer's `chain_entries` (one `ChainEntry` per fixture line).
+2. If `block_fetch_fixture` is set, load it into the peer's `block_store` (slot+hash → body bytes).
+3. Emit `peer_state_initialized { peer_id, chain_entries_loaded, blocks_loaded }` — emitted for every peer including those with no fixtures (`entries_loaded: 0`).
+
+The fixture is read once at startup. Subsequent `serve_chain_sync as_peer:` steps use the in-memory state, not the file.
+
+### `peer_extends_chain`
+
+Appends a new header (and optionally a block body) to a named peer's chain. Any `serve_chain_sync as_peer:` step that runs afterwards sees the extended chain.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `peer_id` | yes | Which peer to extend |
+| `slot` | yes | Slot of the new block (explicit — not parsed from CBOR) |
+| `block_number` | yes | Block height |
+| `block_hash` | yes | 64-char hex (32 bytes) |
+| `header_cbor` | yes | Hex-encoded header bytes |
+| `variant` | no | Era variant byte (default: `DEFAULT_HEADER_VARIANT`) |
+| `block_body_cbor` | no | Hex-encoded block body — if present, added to block_store |
+
+**Monotonic slot check.** The new entry's slot must be strictly greater than the current chain tip slot. When the chain is empty, any slot is accepted (no "tip slot 0" error). Error message: `"peer_extends_chain: slot N is not greater than current chain tip slot M"`.
+
+The parameter set mirrors the fixture JSONL format — scenario authors who've captured a fixture can lift an entry verbatim.
+
+```json
+{
+  "kind": "peer_extends_chain",
+  "peer_id": "block_producer",
+  "slot": 158,
+  "block_number": 20,
+  "block_hash": "0000...0158",
+  "header_cbor": "828a...",
+  "variant": 6
+}
+```
+
+### Slot-aware serving
+
+When the scenario has a `current_slot` (from `network.start_slot` + `advance_to_slot`/`tick_slots`), `serve_chain_sync as_peer:` only exposes entries with `slot <= current_slot`. Entries in the peer's chain with higher slots are invisible until time advances.
+
+```
+fixture: 20 entries at slots 138-157
+advance_to_slot: 145
+serve_chain_sync: sees only 8 entries (slots 138-145)
+```
+
+If the scenario has no `network` block, or `current_slot` is not set, all entries are exposed — identical to today's behavior. Slot-aware serving is purely opt-in.
+
+### Trace events
+
+| Kind | When | Payload fields |
+|------|------|----------------|
+| `peer_state_initialized` | Once per peer at scenario start | `peer_id`, `chain_entries_loaded`, `blocks_loaded` |
+| `peer_chain_extended` | On each `peer_extends_chain` step | `peer_id`, `slot`, `block_hash`, `block_number`, `source` |
+
+### Locking
+
+Peer state lives in `RunnerState.peers: Arc<Mutex<HashMap<String, PeerState>>>`. Serve steps take a brief lock, clone the relevant entries, and release before any long-running I/O. `peer_extends_chain` takes a brief lock to push one entry and releases immediately. Parallel branches can read the same peer's chain simultaneously (unlike connections, which are exclusively checked out).
+
+---
+
 ## What future slices will change
 
 This slice introduces the vocabulary without changing the content model. In subsequent

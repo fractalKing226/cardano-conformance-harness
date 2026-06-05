@@ -1,0 +1,44 @@
+{
+  "name": "peer_runtime_extension",
+  "description": "Declares a peer with a 20-entry fixture, adds a 21st entry via peer_extends_chain, then serves chain-sync to one client. The client should see 21 headers \u2014 confirming serve steps read from PeerState (which includes the runtime extension) rather than re-reading the fixture file. The extension entry borrows header CBOR from the last fixture entry; the declared slot (158) may differ from the CBOR-encoded slot (157) \u2014 this is expected for this demonstration scenario.",
+  "network_magic": 42,
+  "trace_output_path": "trace_peer_runtime_extension.jsonl",
+  "expected_outcome": "success",
+  "network": {
+    "peers": [
+      {
+        "id": "growing_peer",
+        "chain_sync_fixture": "fixtures/devnet_genesis.jsonl",
+        "description": "A peer whose chain grows during the scenario"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "kind": "peer_extends_chain",
+      "peer_id": "growing_peer",
+      "slot": 158,
+      "block_number": 20,
+      "block_hash": "0000000000000000000000000000000000000000000000000000000000000158",
+      "header_cbor": "828a13189d5820f7f9353ecf740aa4f3bf8bcf30d418ab3c0022e769d2dcf4cb29663f24a9632858205a3d778e76741a009e29d23093cfe046131808d34d7c864967b515e98dfc35835820b882007593ef70f86e5c0948561a3b8e8851529a4f98975f2b24e768dda38ce282584086d2e820038f81947ed78a9cae6bcf685754f59214bc35b8e0fade1186b733e32e238e667f6cb2aeb89ae1c8a5809ead5a81f3f540f263fc5ec8e4180b08a140585094ad912ec4ff4f0d3cc09bc19262e8eaf1495d14042f31a373558190c5d9a9c7165113190f1459be191139424197cf5026cbc4d4054d29a5297dd4af54788ab39fdf2aac7e573c7c84b5aa28c94c140804582029571d16f081709b3c48651860077bebf9340abb3fc7133443c54f1f5a5edcf18458204cd49bb05e9885142fe7af1481107995298771fd1a24e72b506a4d600ee2b3120000584089fc9e9f551b2ea873bf31643659d049152d5c8e8de86be4056370bccc5fa62dd12e3f152f1664e614763e46eaa7a17ed366b5cef19958773d1ab96941442e0b820b005901c0bb219ffb0f0e9820ad04f550bde28bd6c5299cd6d5e9e1887a4845a859b1a0c5f109d042fa0f9e44de7df013b39f0809d5c0d6219de712823d67ecad5a003d0813f86ef743a7bba0286db6ddf3d85bf8e49ddbf14d9d3b7ee22f4857c77b740948f84f2e72f6bcf91f405e34ea50a2c53fa4876b43cfce2bcfe87c06a903de8b4dc7d3187f76048fbef9a52b72d80d835bb76eced7c0e0cdc5b58869b73c095dffa01db4ff51765afcead565395a5ed1cf74e5f2134d61076fece21aacd080bb3b92c77b1328ff1b83855da704fc366bf4415490602481d1939136eeaf252c65184912a779d9d94a90e32b72c1877ef60b6d79e707ce5a762acb4bed46436efeb2394c385ec63fcd85ed56eec3de48860a1ec950aad4f91cbf741dbd7bf1d3c278875bd20e31ff5372339f6aa5280ad9b8bf3514889ac44600fe57ca0b535d6d3f53311e21199cccc0b080f28d18f4dc6987731e10e4ade00df7c6921c5ef3022b6f49a29ba307a2c8f4bd2ba42fcfa0aad68a2f0ad31fff69a99d3471f9036dda2bb36c716beae8d706bc648a790d4697e1d044a11a49f305ab8bc64a094bd81bda7395fe6f77dd5557c39919dd9bb9cf22a87fe47408ae3ec2247007d015a5",
+      "variant": 6
+    },
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3023"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client"
+    },
+    {
+      "kind": "serve_chain_sync",
+      "on": "client",
+      "as_peer": "growing_peer",
+      "await_at_tip_secs": 2
+    },
+    {
+      "kind": "close_listener"
+    }
+  ]
+}
