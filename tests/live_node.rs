@@ -981,3 +981,4 @@ async fn block_fetch_adversarial_no_blocks_after_start() {
     assert_eq!(p["blocks_received"], 0,
         "no blocks should be delivered when NoBlocks follows StartBatch");
 }
+

@@ -735,4 +735,3 @@ scripts/
 - Peer-Sharing mini-protocol (once pallas-network exposes it; version ≥ 13)
 - Tx-Submission step handler
 - Agda specification verifier integration — consume trace files and check against formal spec
-- Populate `docs/block_fetch_conformance_results.md` Observed column after first adversarial run
