@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,29 @@ use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
 use super::parse_point;
 
 // ── Network peer lookup ───────────────────────────────────────────────────────
+
+/// Emits a `SlotAdvanced` trace event recording a slot transition.
+/// Called by both `advance_to_slot` and `tick_slots` handlers.
+async fn emit_slot_advanced(
+    from_slot: u64,
+    to_slot:   u64,
+    reason:    &str,
+    tracer:    &Tracer,
+) -> anyhow::Result<()> {
+    tracer
+        .emit(
+            TraceEvent::new(
+                EventKind::SlotAdvanced,
+                Direction::Internal,
+                json!({ "from_slot": from_slot, "to_slot": to_slot, "reason": reason }),
+            )
+            // Pin the event's slot to to_slot. The tracer's auto-stamp would also
+            // give to_slot (since the store already happened), but being explicit
+            // removes any ambiguity about which slot a SlotAdvanced event describes.
+            .with_slot(to_slot),
+        )
+        .await
+}
 
 /// Looks up a peer by id in the scenario's network declaration.
 /// Returns a clear error if the network block is absent or the peer is unknown.
@@ -103,10 +126,18 @@ impl ScenarioRunner {
             ))
             .await?;
 
+        // Initialize the slot counter before creating RunnerState so the tracer
+        // can stamp ScenarioStarted and NetworkDeclared with the starting slot.
+        let current_slot: Option<Arc<AtomicU64>> = self.scenario.network.as_ref().map(|n| {
+            Arc::new(AtomicU64::new(n.start_slot.unwrap_or(0)))
+        });
+        let tracer = tracer.with_slot_tracker(current_slot.clone());
+
         let mut state = RunnerState {
             capture_fixture_path:       self.capture_fixture.clone(),
             capture_block_fixture_path: self.capture_block_fixture.clone(),
             network:                    self.scenario.network.as_ref().map(|n| Arc::new(n.clone())),
+            current_slot,
             ..Default::default()
         };
 
@@ -299,6 +330,9 @@ struct RunnerState {
     /// Imaginary-network declaration from the scenario. Stored as Arc so cloning
     /// RunnerState for parallel branches is O(1).
     network:                      Option<Arc<Network>>,
+    /// Current imaginary-network slot. Shared across all parallel branches via Arc.
+    /// None when the scenario has no network declaration.
+    current_slot:                 Option<Arc<AtomicU64>>,
 }
 
 impl Default for RunnerState {
@@ -313,6 +347,7 @@ impl Default for RunnerState {
             capture_fixture_path:         None,
             capture_block_fixture_path:   None,
             network:                      None,
+            current_slot:                 None,
         }
     }
 }
@@ -1040,6 +1075,42 @@ fn execute_step<'a>(
                 Ok(())
             }
 
+            StepKind::AdvanceToSlot => {
+                let new_slot = params.slot
+                    .ok_or_else(|| anyhow::anyhow!("advance_to_slot: slot parameter is required"))?;
+                let slot_arc = state.current_slot.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "advance_to_slot: no network declaration — current_slot is not initialized"
+                    ))?;
+                // Relaxed: slot is a logical counter, not a memory-ordering barrier.
+                // The SlotAdvanced trace event is the authoritative record of changes.
+                let current = slot_arc.load(Ordering::Relaxed);
+                if new_slot <= current {
+                    anyhow::bail!(
+                        "advance_to_slot: target slot {new_slot} is not greater than \
+                         current slot {current}"
+                    );
+                }
+                slot_arc.store(new_slot, Ordering::Relaxed); // Relaxed: see above
+                emit_slot_advanced(current, new_slot, "advance_to_slot", tracer).await?;
+                Ok(())
+            }
+
+            StepKind::TickSlots => {
+                let count = params.count
+                    .ok_or_else(|| anyhow::anyhow!("tick_slots: count parameter is required"))?;
+                let slot_arc = state.current_slot.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "tick_slots: no network declaration — current_slot is not initialized"
+                    ))?;
+                // fetch_add with Relaxed: atomic increment of a monotonic counter.
+                // Returns the value before the addition; new value = old + count.
+                let old_slot = slot_arc.fetch_add(count, Ordering::Relaxed);
+                let new_slot = old_slot + count;
+                emit_slot_advanced(old_slot, new_slot, "tick_slots", tracer).await?;
+                Ok(())
+            }
+
             StepKind::Parallel => {
                 let branches_val = step
                     .raw_params
@@ -1503,5 +1574,90 @@ mod tests {
         if let Some(h) = conn.ka_handle.take() { h.abort(); }
         if let Some(h) = conn.ts_handle.take() { h.abort(); }
         conn.plexer.abort().await;
+    }
+
+    // ── Slot-evolution runtime tests ──────────────────────────────────────────
+
+    async fn make_slot_state(start: u64) -> (RunnerState, crate::trace::Tracer, tempfile::NamedTempFile) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let slot_arc = Arc::new(AtomicU64::new(start));
+        let tracer = crate::trace::Tracer::open(tmp.path()).await.unwrap()
+            .with_slot_tracker(Some(Arc::clone(&slot_arc)));
+        let state = RunnerState { current_slot: Some(slot_arc), ..Default::default() };
+        (state, tracer, tmp)
+    }
+
+    fn slot_step(kind: crate::scenario::StepKind, params: Value) -> crate::scenario::StepDef {
+        crate::scenario::StepDef {
+            kind,
+            raw_params: params,
+            output: None, as_name: None, on_name: None, expect: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn advance_to_slot_stores_new_value() {
+        let (mut state, tracer, _tmp) = make_slot_state(100).await;
+        let step = slot_step(StepKind::AdvanceToSlot, json!({ "slot": 200 }));
+        execute_step(&step, &json!({ "slot": 200 }), "", 42, &mut state, &tracer)
+            .await.expect("advance_to_slot 100→200 should succeed");
+        let current = state.current_slot.as_ref().unwrap().load(Ordering::Relaxed);
+        assert_eq!(current, 200);
+    }
+
+    #[tokio::test]
+    async fn advance_to_slot_rejects_same_slot() {
+        let (mut state, tracer, _tmp) = make_slot_state(100).await;
+        let step = slot_step(StepKind::AdvanceToSlot, json!({ "slot": 100 }));
+        let err = execute_step(&step, &json!({ "slot": 100 }), "", 42, &mut state, &tracer)
+            .await.unwrap_err().to_string();
+        assert!(err.contains("not greater than current slot"), "{err}");
+        // Slot must be unchanged.
+        assert_eq!(state.current_slot.as_ref().unwrap().load(Ordering::Relaxed), 100);
+    }
+
+    #[tokio::test]
+    async fn advance_to_slot_rejects_rewind() {
+        let (mut state, tracer, _tmp) = make_slot_state(200).await;
+        let step = slot_step(StepKind::AdvanceToSlot, json!({ "slot": 100 }));
+        let err = execute_step(&step, &json!({ "slot": 100 }), "", 42, &mut state, &tracer)
+            .await.unwrap_err().to_string();
+        assert!(err.contains("not greater than current slot"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tick_slots_advances_by_count() {
+        let (mut state, tracer, _tmp) = make_slot_state(50).await;
+        let step = slot_step(StepKind::TickSlots, json!({ "count": 25 }));
+        execute_step(&step, &json!({ "count": 25 }), "", 42, &mut state, &tracer)
+            .await.expect("tick_slots 50+25 should succeed");
+        assert_eq!(state.current_slot.as_ref().unwrap().load(Ordering::Relaxed), 75);
+    }
+
+    #[tokio::test]
+    async fn tick_slots_count_one_works() {
+        let (mut state, tracer, _tmp) = make_slot_state(0).await;
+        let step = slot_step(StepKind::TickSlots, json!({ "count": 1 }));
+        execute_step(&step, &json!({ "count": 1 }), "", 42, &mut state, &tracer)
+            .await.expect("tick_slots count=1 should succeed");
+        assert_eq!(state.current_slot.as_ref().unwrap().load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn slot_appears_on_trace_events_when_network_declared() {
+        let (mut state, tracer, tmp) = make_slot_state(42).await;
+        // Emit any step that produces a trace event — tick_slots emits SlotAdvanced.
+        let step = slot_step(StepKind::TickSlots, json!({ "count": 8 }));
+        execute_step(&step, &json!({ "count": 8 }), "", 1, &mut state, &tracer)
+            .await.unwrap();
+        let events: Vec<Value> = std::fs::read_to_string(tmp.path()).unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let slot_advanced = events.iter().find(|e| e["kind"] == "slot_advanced").unwrap();
+        assert_eq!(slot_advanced["slot"], 50, "SlotAdvanced event should carry to_slot=50");
+        assert_eq!(slot_advanced["payload"]["from_slot"], 42);
+        assert_eq!(slot_advanced["payload"]["to_slot"], 50);
+        assert_eq!(slot_advanced["payload"]["reason"], "tick_slots");
     }
 }

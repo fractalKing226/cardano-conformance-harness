@@ -179,6 +179,85 @@ which connection without any inference.
 
 ---
 
+---
+
+## Slot evolution
+
+The imaginary network has a clock. Scenarios advance it explicitly; the harness
+does not tick it automatically.
+
+### Time fields in the `network` block
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `start_slot` | `0` | The slot the network begins at when the scenario starts |
+| `slot_length_ms` | `1000` | Wall-clock ms per slot — vocabulary reserved for future use; not acted on in this slice |
+
+### `advance_to_slot`
+
+Sets the current slot to an absolute value.
+
+```json
+{ "kind": "advance_to_slot", "slot": 200 }
+```
+
+- Requires a `network` block (errors otherwise).
+- `slot` must be **strictly greater than** the current slot. Same-slot and rewind
+  advances are rejected at runtime: `"advance_to_slot: target slot N is not greater
+  than current slot M"`. This is intentional — a same-slot advance is almost always
+  a scenario author mistake.
+
+### `tick_slots`
+
+Advances the current slot by a relative number of positions.
+
+```json
+{ "kind": "tick_slots", "count": 50 }
+```
+
+- `count` must be at least 1 (validated at parse time). Zero is degenerate.
+- The operation is atomic (`fetch_add`), so it is safe in parallel branches.
+
+Both steps work in client-mode and server-mode scenarios, and are legal inside
+`repeat` and `parallel` bodies.
+
+### `SlotAdvanced` trace event
+
+Every slot change emits a `slot_advanced` event:
+
+```json
+{
+  "kind": "slot_advanced",
+  "direction": "internal",
+  "slot": 200,
+  "payload": { "from_slot": 100, "to_slot": 200, "reason": "advance_to_slot" }
+}
+```
+
+`reason` is `"advance_to_slot"` or `"tick_slots"`. The top-level `slot` field equals
+`to_slot` — the event is pinned to the slot it just established.
+
+### Slot context on all events
+
+When a scenario has a `network` declaration, **every trace event** automatically
+carries a `slot` field reflecting the current imaginary-network slot at the moment
+of emission:
+
+```json
+{ "kind": "chain_sync_roll_forward", "slot": 250, "direction": "sent", ... }
+```
+
+This applies to wire events, internal meta-events, and `SlotAdvanced` itself.
+Events in scenarios without a `network` block omit the `slot` field entirely —
+the field is never present as `null`, only absent.
+
+**Ordering note.** The slot is read with `Relaxed` ordering: it is a logical
+counter for trace attribution, not a memory-ordering barrier. Events emitted
+nanoseconds before a slot change may carry the previous slot; the `SlotAdvanced`
+event is the authoritative record of when the transition occurred.
+
+---
+
 ## What future slices will change
 
 This slice introduces the vocabulary without changing the content model. In subsequent

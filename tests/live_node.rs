@@ -1068,3 +1068,37 @@ async fn network_declaration_emits_network_declared_trace_event() {
     assert!(ids.contains(&"adversary"));
 }
 
+#[tokio::test]
+#[ignore = "requires free TCP port 3022 and fixtures/devnet_genesis.jsonl; run with: cargo test --test live_node -- --ignored network_declaration"]
+async fn network_with_time_slot_context_on_wire_events() {
+    // The network_with_time scenario starts at slot 100, advances to 200 via
+    // advance_to_slot, then ticks 50 more to reach slot 250. After those two
+    // slot steps, it serves chain-sync. Every wire event should carry slot: 250.
+    let events = run_server_with_chain_sync_client(
+        "scenarios/network_with_time.json", 3022
+    ).await;
+
+    // Two SlotAdvanced events must appear.
+    let slot_events: Vec<&Value> = events.iter()
+        .filter(|e| e["kind"] == "slot_advanced")
+        .collect();
+    assert_eq!(slot_events.len(), 2, "expected two slot_advanced events");
+    assert_eq!(slot_events[0]["payload"]["from_slot"], 100);
+    assert_eq!(slot_events[0]["payload"]["to_slot"],   200);
+    assert_eq!(slot_events[0]["payload"]["reason"], "advance_to_slot");
+    assert_eq!(slot_events[1]["payload"]["from_slot"], 200);
+    assert_eq!(slot_events[1]["payload"]["to_slot"],   250);
+    assert_eq!(slot_events[1]["payload"]["reason"], "tick_slots");
+
+    // All chain-sync wire events (emitted at slot 250) must carry slot: 250.
+    let cs_wire: Vec<&Value> = events.iter()
+        .filter(|e| e["mini_protocol"] == "chain-sync"
+               && matches!(e["direction"].as_str(), Some("sent") | Some("received")))
+        .collect();
+    assert!(!cs_wire.is_empty(), "expected chain-sync wire events");
+    for e in &cs_wire {
+        assert_eq!(e["slot"], 250,
+            "chain-sync wire event must carry slot 250: {e}");
+    }
+}
+

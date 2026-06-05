@@ -1,0 +1,26 @@
+{
+  "name": "network_with_time",
+  "description": "Demonstrates the slot-evolution vocabulary. The imaginary network starts at slot 100, advances to slot 200 via advance_to_slot, then ticks 50 more via tick_slots (reaching slot 250). A single client is then served chain-sync attributed to 'block_producer'. Every trace event carries slot: 250 as context; SlotAdvanced events record the two explicit clock advances.",
+  "network_magic": 42,
+  "trace_output_path": "trace_network_with_time.jsonl",
+  "expected_outcome": "success",
+  "network": {
+    "start_slot": 100,
+    "slot_length_ms": 1000,
+    "peers": [
+      {
+        "id": "block_producer",
+        "chain_sync_fixture": "fixtures/devnet_genesis.jsonl",
+        "description": "The sole block producer for this imaginary network"
+      }
+    ]
+  },
+  "steps": [
+    { "kind": "advance_to_slot", "slot": 200 },
+    { "kind": "tick_slots", "count": 50 },
+    { "kind": "listen", "bind_address": "0.0.0.0:3022" },
+    { "kind": "accept_handshake", "as": "client" },
+    { "kind": "serve_chain_sync", "on": "client", "as_peer": "block_producer", "await_at_tip_secs": 1 },
+    { "kind": "close_listener" }
+  ]
+}

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -94,8 +95,9 @@ pub enum EventKind {
     ServerChainSyncStarted,
     ServerChainSyncCompleted,
 
-    // Network topology declaration
+    // Network topology declaration and time evolution
     NetworkDeclared,
+    SlotAdvanced,
 
     // Peer-identity / imaginary-network events (emitted by emit_peer_event step)
     PeerProducedBlock,
@@ -136,6 +138,10 @@ pub struct TraceEvent {
     /// verifiers of the imaginary-network model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_id: Option<String>,
+    /// Imaginary-network slot at the moment this event was emitted.
+    /// Present whenever the scenario has a network declaration; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mini_protocol: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,6 +159,7 @@ impl TraceEvent {
             direction,
             connection: None,
             peer_id: None,
+            slot: None,
             mini_protocol: None,
             state_before: None,
             state_after: None,
@@ -195,6 +202,13 @@ impl TraceEvent {
         self.peer_id = Some(peer_id.into());
         self
     }
+
+    /// Explicitly sets the slot on an event (e.g. for SlotAdvanced where the
+    /// to_slot is already known and should not be overwritten by the tracer).
+    pub fn with_slot(mut self, slot: u64) -> Self {
+        self.slot = Some(slot);
+        self
+    }
 }
 
 // ── Tracer ────────────────────────────────────────────────────────────────────
@@ -211,17 +225,17 @@ struct TracerInner {
 /// Multiple tasks may hold a `Tracer` clone and emit events concurrently.
 /// The async mutex ensures each event is a single coherent JSON-lines write.
 ///
-/// Each clone may carry an independent `peer_id` context (set via
-/// `for_peer_opt`). When `emit` is called on a tracer with `peer_id` set,
-/// that label is automatically propagated to every outgoing event unless the
-/// event already has an explicit `peer_id`.
+/// Each clone carries independent `peer_id` and `current_slot` context.
+/// When `emit` is called, both are automatically stamped onto outgoing events
+/// that don't already carry explicit values.
 #[derive(Clone)]
 pub struct Tracer {
-    inner:   Arc<Mutex<TracerInner>>,
-    /// Per-clone peer identity. Not inside the Arc so different clones
-    /// (e.g. parallel branches or different connections) carry distinct labels
-    /// while sharing the same underlying file handle.
-    peer_id: Option<String>,
+    inner:        Arc<Mutex<TracerInner>>,
+    /// Per-clone peer identity (set via `for_peer_opt`).
+    peer_id:      Option<String>,
+    /// Shared slot counter from RunnerState. Clones share the same Arc so
+    /// slot changes in one branch are immediately visible to all tracers.
+    current_slot: Option<Arc<AtomicU64>>,
 }
 
 impl Tracer {
@@ -237,24 +251,43 @@ impl Tracer {
                 file,
                 event_buffer: Vec::new(),
             })),
-            peer_id: None,
+            peer_id:      None,
+            current_slot: None,
         })
     }
 
-    /// Returns a clone of this tracer tagged with `peer_id`.
-    /// Passing `None` is a no-op: returns an untagged clone.
+    /// Returns a clone tagged with `peer_id`, propagating the slot tracker.
+    /// Passing `None` is a no-op for the peer_id field.
     pub fn for_peer_opt(&self, peer_id: Option<String>) -> Self {
         Self {
-            inner:   Arc::clone(&self.inner),
-            peer_id: peer_id.or_else(|| self.peer_id.clone()),
+            inner:        Arc::clone(&self.inner),
+            peer_id:      peer_id.or_else(|| self.peer_id.clone()),
+            current_slot: self.current_slot.clone(),
+        }
+    }
+
+    /// Returns a clone wired to the scenario's slot counter.
+    /// All events emitted through the clone are automatically stamped with the
+    /// current slot at emission time.
+    pub fn with_slot_tracker(&self, current_slot: Option<Arc<AtomicU64>>) -> Self {
+        Self {
+            inner:        Arc::clone(&self.inner),
+            peer_id:      self.peer_id.clone(),
+            current_slot: current_slot.or_else(|| self.current_slot.clone()),
         }
     }
 
     pub async fn emit(&self, mut event: TraceEvent) -> anyhow::Result<()> {
-        // Propagate the tracer's peer_id context onto events that don't
-        // already carry an explicit peer_id.
         if event.peer_id.is_none() {
             event.peer_id = self.peer_id.clone();
+        }
+        // Stamp the current slot on events that don't carry an explicit value.
+        // Relaxed ordering: slot is a logical counter for trace attribution, not a
+        // memory-ordering barrier. A reader seeing the previous slot on an event
+        // emitted nanoseconds before a slot advance is fine — the SlotAdvanced
+        // event provides the authoritative record of when the change occurred.
+        if event.slot.is_none() {
+            event.slot = self.current_slot.as_ref().map(|a| a.load(Ordering::Relaxed));
         }
         // Serialise outside the lock to minimise hold time.
         let v = serde_json::to_value(&event)?;

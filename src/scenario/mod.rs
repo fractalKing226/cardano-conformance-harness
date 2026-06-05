@@ -27,10 +27,17 @@ pub struct Peer {
 }
 
 /// Top-level imaginary-network declaration — a list of named peers with their
-/// assigned chains. Scenarios without this field behave exactly as before.
+/// assigned chains, and optional temporal parameters. Scenarios without this
+/// field behave exactly as before.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Network {
     pub peers: Vec<Peer>,
+    /// The slot the imaginary network starts at. Defaults to 0.
+    /// Initialized into `RunnerState::current_slot` at scenario start.
+    pub start_slot:     Option<u64>,
+    /// Wall-clock milliseconds per slot — vocabulary reserved for future
+    /// wall-clock-driven slot advancement. Not acted on in this slice.
+    pub slot_length_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +145,12 @@ pub enum StepKind {
     /// connection. Models imaginary-network state changes (a peer produced a
     /// block, cast a vote, etc.) as first-class trace entries.
     EmitPeerEvent,
+    /// Advance the imaginary network clock to an absolute slot number.
+    /// Errors if the target slot is not strictly greater than the current slot.
+    AdvanceToSlot,
+    /// Advance the imaginary network clock by a relative number of slots.
+    /// `count` must be at least 1.
+    TickSlots,
 }
 
 impl StepKind {
@@ -158,6 +171,8 @@ impl StepKind {
             StepKind::CloseListener   => "close_listener",
             StepKind::Parallel        => "parallel",
             StepKind::EmitPeerEvent   => "emit_peer_event",
+            StepKind::AdvanceToSlot   => "advance_to_slot",
+            StepKind::TickSlots       => "tick_slots",
         }
     }
 
@@ -258,6 +273,9 @@ pub struct StepParams {
     /// When present, the serving connection automatically acquires the peer's id
     /// as its `peer_id`, overriding any peer_id set at accept_handshake time.
     pub as_peer: Option<String>,
+
+    /// advance_to_slot: absolute target slot number.
+    pub slot: Option<u64>,
 }
 
 /// How Block-Fetch obtains its point list.
@@ -422,7 +440,8 @@ fn validate_connection_names(steps: &[StepDef], errors: &mut Vec<String>) {
                 // Body/branch validation is deferred; connection-name tracking
                 // across nested step lists is not enforced here.
             }
-            StepKind::Sleep | StepKind::EmitPeerEvent => {}
+            StepKind::Sleep | StepKind::EmitPeerEvent
+            | StepKind::AdvanceToSlot | StepKind::TickSlots => {}
         }
     }
     // Warn about unclosed connections (not an error — cleanup handles them).
@@ -665,6 +684,30 @@ fn validate_step(
             }
             if step.raw_params.get("event_kind").is_none() {
                 errors.push(format!("{pos}: emit_peer_event requires event_kind"));
+            }
+        }
+
+        StepKind::AdvanceToSlot => {
+            if step.raw_params.get("slot").is_none() {
+                errors.push(format!("{pos}: advance_to_slot requires slot"));
+            }
+            // Rewind validation (new_slot <= current) is a runtime check —
+            // the current slot is not known at parse time.
+        }
+
+        StepKind::TickSlots => {
+            let count_val = step.raw_params.get("count");
+            let is_ref = matches!(count_val, Some(Value::String(s)) if s.starts_with('$'));
+            if is_ref { /* variable reference — can't validate count at parse time */ }
+            else {
+                match count_val {
+                    None => errors.push(format!("{pos}: tick_slots requires count")),
+                    Some(v) => {
+                        if v.as_u64().map_or(true, |n| n < 1) {
+                            errors.push(format!("{pos}: tick_slots: count must be at least 1"));
+                        }
+                    }
+                }
             }
         }
 
@@ -1084,6 +1127,70 @@ mod tests {
         let s: Scenario = serde_json::from_str(&json).unwrap();
         let err = validate(&s).unwrap_err().to_string();
         assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    // ── Slot-evolution step validation tests ─────────────────────────────────
+
+    #[test]
+    fn advance_to_slot_requires_slot_param() {
+        let json = server_with_network(
+            r#"{ "peers": [{ "id": "p", "chain_sync_fixture": "f.jsonl" }] }"#,
+            r#"{ "kind": "listen" },
+               { "kind": "accept_handshake" },
+               { "kind": "advance_to_slot" }"#,
+        );
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("advance_to_slot requires slot"), "{err}");
+    }
+
+    #[test]
+    fn tick_slots_requires_count_param() {
+        let json = r#"{
+            "name":"t","network_magic":1,"trace_output_path":"t.jsonl",
+            "network":{"peers":[{"id":"p","chain_sync_fixture":"f.jsonl"}]},
+            "steps":[{"kind":"tick_slots"}]
+        }"#;
+        let s: Scenario = serde_json::from_str(json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("tick_slots requires count"), "{err}");
+    }
+
+    #[test]
+    fn tick_slots_rejects_count_zero() {
+        let json = r#"{
+            "name":"t","network_magic":1,"trace_output_path":"t.jsonl",
+            "network":{"peers":[{"id":"p","chain_sync_fixture":"f.jsonl"}]},
+            "steps":[{"kind":"tick_slots","count":0}]
+        }"#;
+        let s: Scenario = serde_json::from_str(json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("count must be at least 1"), "{err}");
+    }
+
+    #[test]
+    fn tick_slots_count_one_is_valid() {
+        let json = r#"{
+            "name":"t","network_magic":1,"trace_output_path":"t.jsonl",
+            "network":{"peers":[{"id":"p","chain_sync_fixture":"f.jsonl"}]},
+            "steps":[{"kind":"tick_slots","count":1}]
+        }"#;
+        let s: Scenario = serde_json::from_str(json).unwrap();
+        assert!(validate(&s).is_ok());
+    }
+
+    #[test]
+    fn network_start_slot_parses() {
+        let json = r#"{
+            "name":"t","network_magic":1,"trace_output_path":"t.jsonl",
+            "network":{"start_slot":500,"slot_length_ms":200,"peers":[{"id":"p","chain_sync_fixture":"f.jsonl"}]},
+            "steps":[{"kind":"tick_slots","count":1}]
+        }"#;
+        let s: Scenario = serde_json::from_str(json).unwrap();
+        assert!(validate(&s).is_ok());
+        let net = s.network.unwrap();
+        assert_eq!(net.start_slot, Some(500));
+        assert_eq!(net.slot_length_ms, Some(200));
     }
 
     #[test]
