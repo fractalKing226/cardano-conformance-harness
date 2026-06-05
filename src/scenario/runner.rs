@@ -56,17 +56,18 @@ async fn emit_production_events(
             }),
         )).await?;
         if !ev.skipped {
-            tracer.emit(TraceEvent::new(
-                EventKind::PeerChainExtended,
-                Direction::Internal,
-                json!({
-                    "peer_id":      ev.peer_id,
-                    "slot":         ev.slot,
-                    "block_hash":   ev.block_hash_hex,
-                    "block_number": ev.block_number,
-                    "source":       "production_rule",
-                }),
-            )).await?;
+            let mut payload = json!({
+                "peer_id":      ev.peer_id,
+                "slot":         ev.slot,
+                "block_hash":   ev.block_hash_hex,
+                "block_number": ev.block_number,
+                "source":       "production_rule",
+            });
+            if let Some(dk) = ev.defect_kind {
+                payload["defect_kind"] = dk.into();
+            }
+            tracer.emit(TraceEvent::new(EventKind::PeerChainExtended, Direction::Internal, payload))
+                .await?;
         }
     }
     Ok(())

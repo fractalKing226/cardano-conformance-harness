@@ -26,14 +26,47 @@ pub enum ProductionRule {
     EveryNSlots { first_slot: u64, interval: u64 },
     /// Produces at exactly the listed slots (must be strictly increasing).
     AtSlots { slots: Vec<u64> },
+    /// Like `EveryNSlots` until `fork_slot`, then mixes `fork_marker` into the hash
+    /// computation so the chain diverges from any peer with a different marker.
+    /// Two peers with the same `first_slot`/`interval`/`fork_slot` but different
+    /// markers agree on all pre-fork blocks and diverge from `fork_slot` onward.
+    ForkedFromSlot {
+        first_slot:  u64,
+        interval:    u64,
+        fork_slot:   u64,
+        /// Arbitrary string (non-empty, ≤ 256 bytes) mixed into the hash after
+        /// `fork_slot`. A null-byte separator prevents concatenation collisions.
+        fork_marker: String,
+    },
+    /// Like `EveryNSlots` but omits scheduled slots at the given 0-indexed positions.
+    /// Block numbers remain sequential; only slot values have gaps.
+    SkipsSlots {
+        first_slot:   u64,
+        interval:     u64,
+        /// 0-indexed positions in the full `EveryNSlots` sequence to skip
+        /// (must be strictly increasing).
+        skip_indices: Vec<usize>,
+    },
+    /// Like `EveryNSlots` but replaces `prev_hash` with `wrong_hash` from
+    /// `break_at_slot` onward, severing hash-chain integrity.
+    BrokenPrevHash {
+        first_slot:    u64,
+        interval:      u64,
+        break_at_slot: u64,
+        /// Literal hex hash (64 chars = 32 bytes) to substitute as `prev_hash`.
+        wrong_hash:    String,
+    },
 }
 
 impl ProductionRule {
     pub fn kind_str(&self) -> &'static str {
         match self {
-            ProductionRule::None          => "none",
+            ProductionRule::None               => "none",
             ProductionRule::EveryNSlots { .. } => "every_n_slots",
             ProductionRule::AtSlots { .. }     => "at_slots",
+            ProductionRule::ForkedFromSlot { .. } => "forked_from_slot",
+            ProductionRule::SkipsSlots { .. }     => "skips_slots",
+            ProductionRule::BrokenPrevHash { .. } => "broken_prev_hash",
         }
     }
 
@@ -45,27 +78,47 @@ impl ProductionRule {
         match self {
             ProductionRule::None => vec![],
             ProductionRule::EveryNSlots { first_slot, interval } => {
-                if *interval == 0 { return vec![]; }
-                let mut slots = Vec::new();
-                // First slot >= from
-                let start = if *first_slot >= from {
-                    *first_slot
-                } else {
-                    let steps = (from - first_slot + interval - 1) / interval;
-                    first_slot + steps * interval
-                };
-                let mut s = start;
-                while s <= to {
-                    slots.push(s);
-                    s = s.saturating_add(*interval);
-                }
-                slots
+                every_n_slots_range(*first_slot, *interval, from, to)
             }
             ProductionRule::AtSlots { slots } => {
                 slots.iter().copied().filter(|&s| s >= from && s <= to).collect()
             }
+            // Fork and broken-prev-hash fire at the same slots as EveryNSlots;
+            // only the block content differs.
+            ProductionRule::ForkedFromSlot { first_slot, interval, .. }
+            | ProductionRule::BrokenPrevHash { first_slot, interval, .. } => {
+                every_n_slots_range(*first_slot, *interval, from, to)
+            }
+            // SkipsSlots fires at EveryNSlots positions minus the skip_indices.
+            ProductionRule::SkipsSlots { first_slot, interval, skip_indices } => {
+                every_n_slots_range(*first_slot, *interval, from, to)
+                    .into_iter()
+                    .filter(|&s| {
+                        let global_idx = ((s - first_slot) / interval) as usize;
+                        !skip_indices.contains(&global_idx)
+                    })
+                    .collect()
+            }
         }
     }
+}
+
+/// Compute the ordered list of slots for an `EveryNSlots`-style rule in [from, to].
+fn every_n_slots_range(first_slot: u64, interval: u64, from: u64, to: u64) -> Vec<u64> {
+    if interval == 0 || from > to { return vec![]; }
+    let start = if first_slot >= from {
+        first_slot
+    } else {
+        let steps = (from - first_slot + interval - 1) / interval;
+        first_slot + steps * interval
+    };
+    let mut slots = Vec::new();
+    let mut s = start;
+    while s <= to {
+        slots.push(s);
+        s = s.saturating_add(interval);
+    }
+    slots
 }
 
 /// One peer in the imaginary network.
@@ -619,6 +672,81 @@ fn validate_network_declaration(scenario: &Scenario, errors: &mut Vec<String>) {
                             ));
                             break;
                         }
+                    }
+                }
+            }
+            Some(ProductionRule::ForkedFromSlot { first_slot, interval, fork_slot, fork_marker }) => {
+                if *interval == 0 {
+                    errors.push(format!("{pos}: production_rule interval must be at least 1 (got 0)"));
+                }
+                if *fork_slot < *first_slot {
+                    errors.push(format!(
+                        "{pos}: production_rule fork_slot {fork_slot} is before \
+                         first_slot {first_slot} — no blocks would be produced before the fork"
+                    ));
+                }
+                if fork_marker.is_empty() {
+                    errors.push(format!("{pos}: production_rule fork_marker must be non-empty"));
+                } else if fork_marker.len() > 256 {
+                    errors.push(format!(
+                        "{pos}: production_rule fork_marker must be at most 256 bytes \
+                         (got {} bytes)", fork_marker.len()
+                    ));
+                }
+                if let Some(start) = network.start_slot {
+                    if *first_slot < start {
+                        errors.push(format!(
+                            "{pos}: production_rule first_slot {first_slot} is before \
+                             network start_slot {start}"
+                        ));
+                    }
+                }
+            }
+            Some(ProductionRule::SkipsSlots { first_slot, interval, skip_indices }) => {
+                if *interval == 0 {
+                    errors.push(format!("{pos}: production_rule interval must be at least 1 (got 0)"));
+                }
+                for i in 1..skip_indices.len() {
+                    if skip_indices[i] <= skip_indices[i - 1] {
+                        errors.push(format!(
+                            "{pos}: production_rule skip_indices must be strictly increasing \
+                             (skip_indices[{i}]={} is not greater than skip_indices[{}]={})",
+                            skip_indices[i], i - 1, skip_indices[i - 1]
+                        ));
+                        break;
+                    }
+                }
+                if let Some(start) = network.start_slot {
+                    if *first_slot < start {
+                        errors.push(format!(
+                            "{pos}: production_rule first_slot {first_slot} is before \
+                             network start_slot {start}"
+                        ));
+                    }
+                }
+            }
+            Some(ProductionRule::BrokenPrevHash { first_slot, interval, break_at_slot, wrong_hash }) => {
+                if *interval == 0 {
+                    errors.push(format!("{pos}: production_rule interval must be at least 1 (got 0)"));
+                }
+                if *break_at_slot < *first_slot {
+                    errors.push(format!(
+                        "{pos}: production_rule break_at_slot {break_at_slot} is before \
+                         first_slot {first_slot}"
+                    ));
+                }
+                if wrong_hash.len() != 64 || wrong_hash.chars().any(|c| !c.is_ascii_hexdigit()) {
+                    errors.push(format!(
+                        "{pos}: production_rule wrong_hash must be 64 lowercase hex characters \
+                         (32 bytes), got {:?}", wrong_hash
+                    ));
+                }
+                if let Some(start) = network.start_slot {
+                    if *first_slot < start {
+                        errors.push(format!(
+                            "{pos}: production_rule first_slot {first_slot} is before \
+                             network start_slot {start}"
+                        ));
                     }
                 }
             }
@@ -1343,6 +1471,46 @@ mod tests {
         let s: Scenario = serde_json::from_str(&json).unwrap();
         let err = validate(&s).unwrap_err().to_string();
         assert!(err.contains("first_slot") && err.contains("start_slot"), "{err}");
+    }
+
+    #[test]
+    fn forked_from_slot_fork_before_first_rejected() {
+        let json = network_with_rule(r#"{"kind":"forked_from_slot","first_slot":100,"interval":5,"fork_slot":90,"fork_marker":"x"}"#);
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("fork_slot") && err.contains("first_slot"), "{err}");
+    }
+
+    #[test]
+    fn forked_from_slot_empty_marker_rejected() {
+        let json = network_with_rule(r#"{"kind":"forked_from_slot","first_slot":100,"interval":5,"fork_slot":110,"fork_marker":""}"#);
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("fork_marker must be non-empty"), "{err}");
+    }
+
+    #[test]
+    fn skips_slots_non_increasing_indices_rejected() {
+        let json = network_with_rule(r#"{"kind":"skips_slots","first_slot":100,"interval":5,"skip_indices":[2,1]}"#);
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("strictly increasing"), "{err}");
+    }
+
+    #[test]
+    fn broken_prev_hash_bad_hex_rejected() {
+        let json = network_with_rule(r#"{"kind":"broken_prev_hash","first_slot":100,"interval":5,"break_at_slot":110,"wrong_hash":"zzzz"}"#);
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("wrong_hash"), "{err}");
+    }
+
+    #[test]
+    fn broken_prev_hash_break_before_first_rejected() {
+        let json = network_with_rule(r#"{"kind":"broken_prev_hash","first_slot":100,"interval":5,"break_at_slot":90,"wrong_hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#);
+        let s: Scenario = serde_json::from_str(&json).unwrap();
+        let err = validate(&s).unwrap_err().to_string();
+        assert!(err.contains("break_at_slot") && err.contains("first_slot"), "{err}");
     }
 
     #[test]

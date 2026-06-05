@@ -74,6 +74,29 @@ pub struct ProductionEvent {
     /// Populated only when `!skipped`.
     pub block_number:  u64,
     pub block_hash_hex: String,
+    /// Describes the specific adversarial defect this block carries, if any.
+    /// `None` for honest production; present for adversarial rule variants.
+    /// Emitted on `peer_chain_extended` events to help verifiers identify
+    /// adversarial blocks without decoding rule parameters.
+    pub defect_kind:   Option<&'static str>,
+}
+
+/// Internal per-rule context carried from the immutable phase-1 scan into
+/// phase-2 block production. Captures only what's needed to modify `synthetic_hash`
+/// arguments — keeps phase-2 free of borrow conflicts.
+#[derive(Clone)]
+enum RuleContext {
+    Honest,
+    Forked   {
+        fork_slot:      u64,
+        fork_marker:    String,
+        /// Canonical identifier for pre-fork hash computation — derived from the
+        /// rule's timing params so two ForkedFromSlot rules with the same
+        /// first_slot/interval/fork_slot produce identical pre-fork chains.
+        canonical_root: String,
+    },
+    Broken   { break_at_slot: u64, wrong_hash_bytes: Vec<u8> },
+    Sparse,  // SkipsSlots: blocks are honest individually; defect_kind="sparse_chain"
 }
 
 /// Evaluate every peer's production rule for the slot range `(old_slot, new_slot]`
@@ -87,51 +110,87 @@ pub fn apply_production_rules(
     old_slot: u64,
     new_slot: u64,
 ) -> Vec<ProductionEvent> {
-    // Phase 1: collect (peer_id, rule, firing_slots) with an immutable pass
-    // so we can mutably update entries in phase 2 without borrow conflicts.
-    let tasks: Vec<(String, &'static str, Vec<u64>)> = peers
+    // Phase 1: immutable scan — collect firing slots and rule context per peer.
+    let tasks: Vec<(String, &'static str, Vec<u64>, RuleContext)> = peers
         .iter()
         .filter_map(|(id, ps)| {
             let rule = ps.production_rule.as_ref()?;
             if matches!(rule, ProductionRule::None) { return None; }
             let slots = rule.slots_in_range(old_slot + 1, new_slot);
             if slots.is_empty() { return None; }
-            Some((id.clone(), rule.kind_str(), slots))
+            let ctx = match rule {
+                ProductionRule::ForkedFromSlot { first_slot, interval, fork_slot, fork_marker } => {
+                    // Canonical root encodes the timing params so two peers with the
+                    // same rule shape (but different fork_markers) produce identical
+                    // pre-fork chains — enabling the diverging-forks test pattern.
+                    let canonical_root = format!("{first_slot}:{interval}:{fork_slot}");
+                    RuleContext::Forked { fork_slot: *fork_slot, fork_marker: fork_marker.clone(), canonical_root }
+                }
+                ProductionRule::BrokenPrevHash { break_at_slot, wrong_hash, .. } => {
+                    // decode_hex is infallible here — validation guarantees valid hex.
+                    let bytes = decode_hex(wrong_hash).unwrap_or_else(|_| vec![0u8; 32]);
+                    RuleContext::Broken { break_at_slot: *break_at_slot, wrong_hash_bytes: bytes }
+                }
+                ProductionRule::SkipsSlots { .. } => RuleContext::Sparse,
+                _ => RuleContext::Honest,
+            };
+            Some((id.clone(), rule.kind_str(), slots, ctx))
         })
         .collect();
 
-    // Phase 2: mutate peers, one slot at a time.
+    // Phase 2: mutable — append entries to each peer's chain.
     let mut events = Vec::new();
-    for (peer_id, rule_kind, slots) in tasks {
+    for (peer_id, rule_kind, slots, ctx) in tasks {
         let ps = peers.get_mut(&peer_id).expect("peer present from phase 1");
         for slot in slots {
-            // If the chain tip already covers this slot (e.g. an explicit
-            // peer_extends_chain ran first), skip silently and record it.
+            // Skip if the chain tip already covers this slot (explicit extension took priority).
             let skipped = ps.chain_tip_slot().map_or(false, |tip| tip >= slot);
-            let (block_number, block_hash_hex) = if skipped {
-                (0, String::new())
+            let (block_number, block_hash_hex, defect_kind) = if skipped {
+                (0, String::new(), None)
             } else {
-                let prev_hash = ps.chain_entries.last()
+                let actual_prev = ps.chain_entries.last()
                     .map(|e| e.block_hash.clone())
                     .unwrap_or_else(|| vec![0u8; 32]);
-                let bn = ps.chain_entries.last()
-                    .map(|e| e.block_number + 1)
-                    .unwrap_or(0);
-                let hash = synthetic_hash(&peer_id, slot, &prev_hash);
+                let bn = ps.chain_entries.last().map(|e| e.block_number + 1).unwrap_or(0);
+
+                // Rule context determines hash inputs and defect attribution.
+                let (hash_peer_id, hash_prev, defect) = match &ctx {
+                    // Pre-fork: use the canonical_root so two peers with the same
+                    // timing params produce identical chains before the fork point.
+                    RuleContext::Forked { fork_slot, canonical_root, .. } if slot < *fork_slot => {
+                        (canonical_root.clone(), actual_prev, None)
+                    }
+                    // Post-fork: fork_marker distinguishes chains; null-byte prevents
+                    // "foo"+"bar" == "fo"+"obar" collisions with canonical_root.
+                    RuleContext::Forked { fork_marker, .. } => {
+                        (format!("\x00{fork_marker}"), actual_prev, Some("fork_divergence"))
+                    }
+                    RuleContext::Broken { break_at_slot, wrong_hash_bytes } if slot >= *break_at_slot => {
+                        (peer_id.clone(), wrong_hash_bytes.clone(), Some("broken_prev_hash"))
+                    }
+                    RuleContext::Sparse => {
+                        (peer_id.clone(), actual_prev, Some("sparse_chain"))
+                    }
+                    _ => (peer_id.clone(), actual_prev, None),
+                };
+
+                let hash = synthetic_hash(&hash_peer_id, slot, &hash_prev);
                 let hash_hex = fixture::encode_hex(&hash);
                 let header_cbor = synthetic_header_cbor(bn, slot);
                 ps.chain_entries.push(ChainEntry {
                     slot,
-                    block_hash:  hash.clone(),
+                    block_hash:   hash.clone(),
                     block_number: bn,
                     header_cbor,
                     variant: DEFAULT_HEADER_VARIANT,
                 });
-                // Minimal empty-block body (CBOR empty map) for block_store.
                 ps.block_store.insert((slot, hash.clone()), vec![0xa0]);
-                (bn, hash_hex)
+                (bn, hash_hex, defect)
             };
-            events.push(ProductionEvent { peer_id: peer_id.clone(), slot, rule_kind, skipped, block_number, block_hash_hex });
+            events.push(ProductionEvent {
+                peer_id: peer_id.clone(), slot, rule_kind, skipped,
+                block_number, block_hash_hex, defect_kind,
+            });
         }
     }
     events
@@ -419,6 +478,152 @@ mod tests {
         ps.chain_entries.push(make_entry(10, 1));
         ps.chain_entries.push(make_entry(20, 2));
         assert_eq!(ps.chain_tip_slot(), Some(20));
+    }
+
+    // ── Adversarial rule tests ────────────────────────────────────────────────
+
+    #[test]
+    fn forked_slots_match_every_n_slots() {
+        let forked = ProductionRule::ForkedFromSlot {
+            first_slot: 100, interval: 5, fork_slot: 115, fork_marker: "x".into()
+        };
+        let honest = ProductionRule::EveryNSlots { first_slot: 100, interval: 5 };
+        assert_eq!(forked.slots_in_range(100, 130), honest.slots_in_range(100, 130),
+            "ForkedFromSlot fires at the same slots as EveryNSlots");
+    }
+
+    #[test]
+    fn pre_fork_hashes_match_between_same_timing_different_markers() {
+        // Two ForkedFromSlot peers with identical first_slot/interval/fork_slot but
+        // different fork_markers must produce identical pre-fork chains. This is the
+        // invariant that makes the conflicting-forks scenario meaningful: both chains
+        // share the same history up to fork_slot and diverge afterward.
+        let mut peers: HashMap<String, PeerState> = HashMap::new();
+        peers.insert("peer_a".into(), PeerState {
+            production_rule: Some(ProductionRule::ForkedFromSlot {
+                first_slot: 100, interval: 10, fork_slot: 130, fork_marker: "chain_a".into()
+            }), ..Default::default()
+        });
+        peers.insert("peer_b".into(), PeerState {
+            production_rule: Some(ProductionRule::ForkedFromSlot {
+                first_slot: 100, interval: 10, fork_slot: 130, fork_marker: "chain_b".into()
+            }), ..Default::default()
+        });
+        apply_production_rules(&mut peers, 99, 120);
+        let a_hashes: Vec<_> = peers["peer_a"].chain_entries.iter().map(|e| e.block_hash.clone()).collect();
+        let b_hashes: Vec<_> = peers["peer_b"].chain_entries.iter().map(|e| e.block_hash.clone()).collect();
+        assert_eq!(a_hashes, b_hashes, "pre-fork hashes must be identical across peers with same timing");
+    }
+
+    #[test]
+    fn post_fork_hashes_differ_with_different_markers() {
+        let mut make_peers = |marker: &str| {
+            let mut peers: HashMap<String, PeerState> = HashMap::new();
+            peers.insert("p".into(), PeerState {
+                production_rule: Some(ProductionRule::ForkedFromSlot {
+                    first_slot: 100, interval: 10, fork_slot: 110, fork_marker: marker.into()
+                }), ..Default::default()
+            });
+            apply_production_rules(&mut peers, 99, 130);
+            peers
+        };
+        let chain_a = make_peers("A");
+        let chain_b = make_peers("B");
+        // Slot 100: pre-fork, hashes must match
+        assert_eq!(chain_a["p"].chain_entries[0].block_hash, chain_b["p"].chain_entries[0].block_hash,
+            "pre-fork hash must be identical");
+        // Slot 110+: post-fork, hashes must differ
+        assert_ne!(chain_a["p"].chain_entries[1].block_hash, chain_b["p"].chain_entries[1].block_hash,
+            "post-fork hashes must diverge with different markers");
+    }
+
+    #[test]
+    fn skips_slots_omits_specified_indices() {
+        let mut peers: HashMap<String, PeerState> = HashMap::new();
+        peers.insert("p".into(), PeerState {
+            production_rule: Some(ProductionRule::SkipsSlots {
+                first_slot: 100, interval: 5, skip_indices: vec![1, 3]
+                // skips slot 105 (idx=1) and slot 115 (idx=3)
+            }), ..Default::default()
+        });
+        apply_production_rules(&mut peers, 99, 130);
+        let slots: Vec<u64> = peers["p"].chain_entries.iter().map(|e| e.slot).collect();
+        assert!(!slots.contains(&105), "slot 105 (idx=1) must be skipped");
+        assert!(!slots.contains(&115), "slot 115 (idx=3) must be skipped");
+        assert!(slots.contains(&100), "slot 100 (idx=0) must be present");
+        assert!(slots.contains(&110), "slot 110 (idx=2) must be present");
+    }
+
+    #[test]
+    fn skips_slots_block_numbers_are_sequential() {
+        let mut peers: HashMap<String, PeerState> = HashMap::new();
+        peers.insert("p".into(), PeerState {
+            production_rule: Some(ProductionRule::SkipsSlots {
+                first_slot: 100, interval: 5, skip_indices: vec![1, 3]
+            }), ..Default::default()
+        });
+        apply_production_rules(&mut peers, 99, 130);
+        let bns: Vec<u64> = peers["p"].chain_entries.iter().map(|e| e.block_number).collect();
+        let expected: Vec<u64> = (0..bns.len() as u64).collect();
+        assert_eq!(bns, expected, "block_numbers must be sequential despite slot gaps");
+    }
+
+    #[test]
+    fn broken_prev_hash_correct_before_break() {
+        let mut peers: HashMap<String, PeerState> = HashMap::new();
+        let wrong = "abcd".repeat(16); // 64 chars
+        peers.insert("p".into(), PeerState {
+            production_rule: Some(ProductionRule::BrokenPrevHash {
+                first_slot: 100, interval: 10, break_at_slot: 120, wrong_hash: wrong.clone()
+            }), ..Default::default()
+        });
+        apply_production_rules(&mut peers, 99, 130);
+        let entries = &peers["p"].chain_entries;
+        // Block at slot 100: prev = zeros (empty chain), hash = correct synthetic
+        let expected_hash_100 = synthetic_hash("p", 100, &vec![0u8; 32]);
+        assert_eq!(entries[0].block_hash, expected_hash_100, "pre-break hash must be correct");
+    }
+
+    #[test]
+    fn broken_prev_hash_wrong_after_break() {
+        let mut peers: HashMap<String, PeerState> = HashMap::new();
+        let wrong = "abcd".repeat(16); // 64 chars hex
+        peers.insert("p".into(), PeerState {
+            production_rule: Some(ProductionRule::BrokenPrevHash {
+                first_slot: 100, interval: 10, break_at_slot: 110, wrong_hash: wrong.clone()
+            }), ..Default::default()
+        });
+        apply_production_rules(&mut peers, 99, 130);
+        let entries = &peers["p"].chain_entries;
+        // Block at slot 110 (break_at_slot): prev should be wrong_hash bytes
+        let wrong_bytes = decode_hex(&wrong).unwrap();
+        let expected_hash_110 = synthetic_hash("p", 110, &wrong_bytes);
+        assert_eq!(entries[1].block_hash, expected_hash_110,
+            "post-break hash must use the wrong_hash as prev");
+    }
+
+    #[test]
+    fn defect_kind_populated_for_adversarial_rules() {
+        let mut peers: HashMap<String, PeerState> = HashMap::new();
+        peers.insert("forked".into(), PeerState {
+            production_rule: Some(ProductionRule::ForkedFromSlot {
+                first_slot: 100, interval: 10, fork_slot: 110, fork_marker: "f".into()
+            }), ..Default::default()
+        });
+        peers.insert("sparse".into(), PeerState {
+            production_rule: Some(ProductionRule::SkipsSlots {
+                first_slot: 100, interval: 10, skip_indices: vec![1]
+            }), ..Default::default()
+        });
+        let events = apply_production_rules(&mut peers, 99, 120);
+        let forked_events: Vec<_> = events.iter().filter(|e| e.peer_id == "forked").collect();
+        // Slot 100 (pre-fork): no defect
+        assert_eq!(forked_events[0].defect_kind, None);
+        // Slot 110 (at fork): defect_kind = "fork_divergence"
+        assert_eq!(forked_events[1].defect_kind, Some("fork_divergence"));
+        // SkipsSlots produced block: defect_kind = "sparse_chain"
+        let sparse_events: Vec<_> = events.iter().filter(|e| e.peer_id == "sparse" && !e.skipped).collect();
+        assert!(sparse_events.iter().all(|e| e.defect_kind == Some("sparse_chain")));
     }
 
     #[test]

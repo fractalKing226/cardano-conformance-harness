@@ -1285,3 +1285,114 @@ async fn auto_production_two_peers_different_rules() {
     assert_eq!(sparse_fired.len(), 3, "sparse_peer must produce 3 blocks at [102,107,117]");
 }
 
+// ── Adversarial production (slice 5) integration tests ────────────────────────
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3027; run with: cargo test --test live_node -- --ignored adversarial_production"]
+async fn conflicting_forks_chains_agree_pre_fork_diverge_post_fork() {
+    // peer_a and peer_b share first_slot/interval/fork_slot but have different
+    // fork_markers. The server trace carries peer_chain_extended events for both.
+    // Pre-fork blocks (slots 100, 105, 110) must have matching hashes.
+    // Post-fork blocks (slots 115+) must have different hashes for the two peers.
+    let events = run_server_with_chain_sync_client_n(
+        "scenarios/conflicting_forks.json", 3027, 7
+    ).await;
+
+    let chain_a: Vec<&Value> = events.iter()
+        .filter(|e| e["kind"] == "peer_chain_extended" && e["payload"]["peer_id"] == "peer_a")
+        .collect();
+    let chain_b: Vec<&Value> = events.iter()
+        .filter(|e| e["kind"] == "peer_chain_extended" && e["payload"]["peer_id"] == "peer_b")
+        .collect();
+    assert_eq!(chain_a.len(), 7, "peer_a must produce 7 blocks (slots 100-130 step 5)");
+    assert_eq!(chain_b.len(), 7, "peer_b must produce 7 blocks");
+
+    // Slots 100, 105, 110 are pre-fork — hashes must be identical.
+    for i in 0..3 {
+        assert_eq!(chain_a[i]["payload"]["block_hash"], chain_b[i]["payload"]["block_hash"],
+            "pre-fork block {} hashes must match", i);
+        assert_eq!(chain_a[i]["payload"]["defect_kind"], Value::Null,
+            "pre-fork blocks must have no defect_kind");
+    }
+    // Slots 115+ are post-fork — hashes must diverge.
+    for i in 3..7 {
+        assert_ne!(chain_a[i]["payload"]["block_hash"], chain_b[i]["payload"]["block_hash"],
+            "post-fork block {} hashes must diverge", i);
+        assert_eq!(chain_a[i]["payload"]["defect_kind"], "fork_divergence");
+        assert_eq!(chain_b[i]["payload"]["defect_kind"], "fork_divergence");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3028; run with: cargo test --test live_node -- --ignored adversarial_production"]
+async fn sparse_chain_has_slot_gaps_but_sequential_block_numbers() {
+    // skips_slots rule skips indices 1 (slot 105) and 3 (slot 115).
+    // Produced blocks: slots 100, 110, 120, 125, 130 = 5 blocks.
+    let events = run_server_with_chain_sync_client_n(
+        "scenarios/sparse_chain.json", 3028, 5
+    ).await;
+
+    let extended: Vec<&Value> = events.iter()
+        .filter(|e| e["kind"] == "peer_chain_extended")
+        .collect();
+    assert_eq!(extended.len(), 5, "5 blocks must be produced (2 slots skipped)");
+
+    // No block at slot 105 or 115.
+    let slots: Vec<u64> = extended.iter()
+        .map(|e| e["payload"]["slot"].as_u64().unwrap())
+        .collect();
+    assert!(!slots.contains(&105), "slot 105 must be skipped");
+    assert!(!slots.contains(&115), "slot 115 must be skipped");
+
+    // Block numbers are sequential 0-4.
+    let bns: Vec<u64> = extended.iter()
+        .map(|e| e["payload"]["block_number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(bns, vec![0, 1, 2, 3, 4], "block_numbers must be sequential");
+
+    // All produced blocks carry defect_kind: "sparse_chain".
+    assert!(extended.iter().all(|e| e["payload"]["defect_kind"] == "sparse_chain"));
+
+    // Server sent 5 roll_forward messages.
+    let rf = events.iter()
+        .filter(|e| e["kind"] == "chain_sync_roll_forward" && e["direction"] == "sent")
+        .count();
+    assert_eq!(rf, 5);
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3029; run with: cargo test --test live_node -- --ignored adversarial_production"]
+async fn broken_chain_integrity_defect_kind_present_from_break_slot() {
+    // broken_prev_hash rule breaks at slot 115.
+    // Blocks before 115: defect_kind absent (honest). Blocks at/after 115: defect_kind = "broken_prev_hash".
+    // The server produces 7 blocks (100, 105, ..., 130). Client behavior is a conformance finding.
+    let events = run_server_with_chain_sync_client_n(
+        "scenarios/broken_chain_integrity.json", 3029, 7
+    ).await;
+
+    let extended: Vec<&Value> = events.iter()
+        .filter(|e| e["kind"] == "peer_chain_extended")
+        .collect();
+    assert_eq!(extended.len(), 7, "7 blocks must be produced");
+
+    // First 3 blocks (slots 100, 105, 110) are pre-break: no defect.
+    for e in &extended[..3] {
+        assert_eq!(e["payload"]["defect_kind"], Value::Null,
+            "pre-break blocks must have no defect_kind");
+    }
+    // Remaining blocks (slots 115-130) are post-break: defect present.
+    for e in &extended[3..] {
+        assert_eq!(e["payload"]["defect_kind"], "broken_prev_hash",
+            "post-break blocks must carry defect_kind: broken_prev_hash");
+    }
+
+    // How many roll_forwards the client accepted is the conformance finding.
+    let rf = events.iter()
+        .filter(|e| e["kind"] == "chain_sync_roll_forward" && e["direction"] == "sent")
+        .count();
+    // Accept any count: 0 (client errors immediately), 3 (errors at break),
+    // or 7 (client doesn't validate hashes). Record what Pallas does.
+    eprintln!("broken_chain_integrity: Pallas accepted {rf} roll_forwards before the chain_sync ended");
+    assert!(rf <= 7, "client cannot receive more than 7 headers");
+}
+

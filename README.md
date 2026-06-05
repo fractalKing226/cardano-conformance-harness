@@ -750,6 +750,10 @@ Six tests, each pairing an adversarial server scenario with the `client_block_fe
 
 See `docs/block_fetch_conformance_results.md` for the results table.
 
+Conformance findings:
+- `docs/block_fetch_conformance_results.md` — Block-Fetch wire-protocol violations (Pallas 0.36.0).
+- `docs/adversarial_production.md` — Chain content defects via production rules (Pallas 0.36.0). Key finding: Pallas does not validate hash-chain linkage during chain-sync.
+
 #### Network declaration tests — require free TCP ports 3020–3021
 
 ```sh
@@ -806,7 +810,8 @@ fixtures/
   devnet_genesis.jsonl            — 20 chain-sync headers captured from local devnet
   devnet_blocks.jsonl             — 20 block bodies (produced by capture_blocks_for_fixture.json)
 docs/
-  block_fetch_conformance_results.md — adversarial test findings (Pallas 0.36.0 results populated)
+  block_fetch_conformance_results.md — Block-Fetch wire violations (Pallas 0.36.0 results populated)
+  adversarial_production.md         — Chain content defects via production rules (Pallas 0.36.0)
   network_declarations.md           — network/peer/slot/production vocabulary reference
 tests/
   live_node.rs                    — integration tests (devnet + adversarial)

@@ -1,0 +1,29 @@
+{
+  "name": "sparse_chain",
+  "description": "A peer with a skips_slots rule that omits every other scheduled slot (indices 1 and 3 of the every-5-slots sequence). The resulting chain has sequential block_numbers but non-contiguous slot values: blocks appear at slots 100, 110, 120, 125, 130 (slot 105 and 115 are skipped). Tests whether the client-under-test accepts a chain with deliberate slot gaps, which can arise legitimately in Cardano when slot leaders do not produce blocks for their scheduled slots.",
+  "network_magic": 42,
+  "trace_output_path": "trace_sparse_chain.jsonl",
+  "expected_outcome": "success",
+  "network": {
+    "start_slot": 99,
+    "peers": [
+      {
+        "id": "sparse_producer",
+        "description": "Skips slots 105 and 115 (positions 1 and 3 in the every-5-slots sequence)",
+        "production_rule": {
+          "kind": "skips_slots",
+          "first_slot": 100,
+          "interval": 5,
+          "skip_indices": [1, 3]
+        }
+      }
+    ]
+  },
+  "steps": [
+    { "kind": "advance_to_slot", "slot": 130 },
+    { "kind": "listen", "bind_address": "0.0.0.0:3028" },
+    { "kind": "accept_handshake", "as": "client" },
+    { "kind": "serve_chain_sync", "on": "client", "as_peer": "sparse_producer", "await_at_tip_secs": 2 },
+    { "kind": "close_listener" }
+  ]
+}

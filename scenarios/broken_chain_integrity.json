@@ -1,0 +1,30 @@
+{
+  "name": "broken_chain_integrity",
+  "description": "A peer that produces blocks normally until slot 115, then substitutes a wrong prev_hash from slot 115 onward. The individual blocks parse correctly and the header CBOR is syntactically valid, but the hash chain is broken: block at slot 115 claims a previous block that doesn't match what was actually produced at slot 110. Tests whether the client-under-test validates hash-chain continuity during chain-sync. If it does, it should error at slot 115. If it doesn't, it will silently accept the broken chain — either is a real conformance finding.",
+  "network_magic": 42,
+  "trace_output_path": "trace_broken_chain_integrity.jsonl",
+  "expected_outcome": "success",
+  "network": {
+    "start_slot": 99,
+    "peers": [
+      {
+        "id": "chain_breaker",
+        "description": "Produces honest blocks until slot 110; from slot 115 prev_hash is deliberately wrong",
+        "production_rule": {
+          "kind": "broken_prev_hash",
+          "first_slot": 100,
+          "interval": 5,
+          "break_at_slot": 115,
+          "wrong_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      }
+    ]
+  },
+  "steps": [
+    { "kind": "advance_to_slot", "slot": 130 },
+    { "kind": "listen", "bind_address": "0.0.0.0:3029" },
+    { "kind": "accept_handshake", "as": "client" },
+    { "kind": "serve_chain_sync", "on": "client", "as_peer": "chain_breaker", "await_at_tip_secs": 2 },
+    { "kind": "close_listener" }
+  ]
+}

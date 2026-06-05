@@ -1,0 +1,52 @@
+{
+  "name": "conflicting_forks",
+  "description": "Two peers configured with the same first_slot, interval, and fork_slot but different fork_markers. Before fork_slot 115 their chains are identical; from slot 115 onward their block hashes diverge. Two clients connect in parallel and each receives its peer's chain. This demonstrates that the harness can serve divergent histories attributed to named peers, which is the foundational scenario for testing how a node-under-test handles equivocation evidence.",
+  "network_magic": 42,
+  "trace_output_path": "trace_conflicting_forks.jsonl",
+  "expected_outcome": "success",
+  "network": {
+    "start_slot": 99,
+    "peers": [
+      {
+        "id": "peer_a",
+        "description": "Canonical chain",
+        "production_rule": {
+          "kind": "forked_from_slot",
+          "first_slot": 100,
+          "interval": 5,
+          "fork_slot": 115,
+          "fork_marker": "chain_a"
+        }
+      },
+      {
+        "id": "peer_b",
+        "description": "Equivocating chain — agrees with peer_a up to slot 110, diverges from slot 115",
+        "production_rule": {
+          "kind": "forked_from_slot",
+          "first_slot": 100,
+          "interval": 5,
+          "fork_slot": 115,
+          "fork_marker": "chain_b"
+        }
+      }
+    ]
+  },
+  "steps": [
+    { "kind": "advance_to_slot", "slot": 130 },
+    { "kind": "listen", "bind_address": "0.0.0.0:3027" },
+    {
+      "kind": "parallel",
+      "branches": [
+        [
+          { "kind": "accept_handshake", "as": "client_a" },
+          { "kind": "serve_chain_sync", "on": "client_a", "as_peer": "peer_a", "await_at_tip_secs": 2 }
+        ],
+        [
+          { "kind": "accept_handshake", "as": "client_b" },
+          { "kind": "serve_chain_sync", "on": "client_b", "as_peer": "peer_b", "await_at_tip_secs": 2 }
+        ]
+      ]
+    },
+    { "kind": "close_listener" }
+  ]
+}
