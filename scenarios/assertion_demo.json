@@ -1,7 +1,7 @@
 {
   "name": "assertion_demo",
   "description": "Demonstrates expect clauses: verifies key events are present and errors are absent",
-  "target_address": "localhost:3001",
+  "target_address": "localhost:3002",
   "network_magic": 42,
   "trace_output_path": "trace_client.jsonl",
   "expected_outcome": "success",
@@ -19,7 +19,10 @@
       "count": 3,
       "expect": {
         "min_events": 3,
-        "must_contain_kind": ["chain_sync_roll_forward", "chain_sync_session_summary"],
+        "must_contain_kind": [
+          "chain_sync_roll_forward",
+          "chain_sync_session_summary"
+        ],
         "must_not_contain_kind": ["error"]
       }
     },
@@ -27,7 +30,10 @@
       "kind": "block_fetch",
       "points": "from_chain_sync",
       "expect": {
-        "must_contain_kind": ["block_fetch_block", "block_fetch_session_summary"],
+        "must_contain_kind": [
+          "block_fetch_block",
+          "block_fetch_session_summary"
+        ],
         "must_not_contain_kind": ["block_fetch_no_blocks", "error"]
       }
     },

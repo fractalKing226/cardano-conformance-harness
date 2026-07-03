@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::ToSocketAddrs;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,7 +8,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use futures::future::try_join_all;
-use pallas_network::miniprotocols::chainsync::{N2NClient, Tip};
+use net_core::bearer::tcp::TcpBearer;
+use net_core::mux::scheduler::{AnyScheduler, TrafficClass};
+use net_core::mux::{CodecRecv, CodecSend, Mux, MuxConfig, ProtocolConfig, RunningMux, MODE_INITIATOR};
+use net_core::protocols::chainsync as nc_chainsync;
+use net_core::protocols::{Role, Runner};
+use net_core::types::Point as NcPoint;
+use pallas_network::miniprotocols::chainsync::Tip;
 use pallas_network::miniprotocols::handshake::{RefuseReason, Server as HandshakeServer};
 use pallas_network::miniprotocols::{Point, PROTOCOL_N2N_HANDSHAKE, PROTOCOL_N2N_KEEP_ALIVE as PROTOCOL_N2N_KEEP_ALIVE_SERVER};
 use pallas_network::multiplexer::{AgentChannel, Bearer, Plexer, RunningPlexer};
@@ -17,10 +24,12 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::miniprotocols::blockfetch::{run_block_fetch, BLOCK_FETCH_PROTOCOL};
-use crate::miniprotocols::chainsync::{run_chain_sync, CHAIN_SYNC_PROTOCOL};
+use crate::miniprotocols::chainsync::{run_chain_sync, to_nc_point, CHAIN_SYNC_PROTOCOL};
 use crate::miniprotocols::blockfetch_server::execute_block_fetch_script;
 use crate::miniprotocols::chainsync_server::execute_response_script;
-use crate::miniprotocols::handshake::handshake_on_channel;
+use crate::miniprotocols::handshake::handshake_on_channels;
+use crate::miniprotocols::leios_notify::{run_leios_notify, LEIOS_NOTIFY_PROTOCOL};
+use crate::miniprotocols::leios_fetch::{run_leios_fetch, LEIOS_FETCH_PROTOCOL};
 use crate::scenario::block_fixture;
 use crate::scenario::response_rules::{generate_for_block_fetch, generate_from_fixture, rule_def_to_script};
 use crate::miniprotocols::keepalive::{run_keepalive, run_keepalive_server, KEEP_ALIVE_INTERVAL, KEEP_ALIVE_PROTOCOL};
@@ -35,6 +44,19 @@ use crate::scenario::{BlockFetchPoints, Network, Peer, Scenario, StepDef, StepKi
 use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
 
 use super::parse_point;
+
+/// Sentinel error type used so the main run loop can distinguish a step
+/// assertion failure (step returned Ok but assertions did not pass) from a
+/// genuine step execution error, and emit the correct `scenario_completed`
+/// outcome accordingly.
+#[derive(Debug)]
+struct StepAssertionFailure;
+impl std::fmt::Display for StepAssertionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "step assertion failure")
+    }
+}
+impl std::error::Error for StepAssertionFailure {}
 
 // ── Network peer lookup ───────────────────────────────────────────────────────
 
@@ -110,16 +132,15 @@ fn lookup_peer<'a>(network: &'a Option<Arc<Network>>, peer_id: &str) -> anyhow::
 
 // ── Protocol subscription ─────────────────────────────────────────────────────
 
-/// Returns the set of N2N protocol IDs to subscribe on every connection.
-///
-/// When Pallas adds `PROTOCOL_N2N_PEER_SHARING` (not present in 0.36.0),
-/// add: `if negotiated_version >= PEER_SHARING_MIN_VERSION { ... }`
+/// Returns the set of N2N protocol IDs registered on every client connection.
 pub fn subscribed_protocols(_negotiated_version: u64) -> Vec<u16> {
     vec![
         CHAIN_SYNC_PROTOCOL,
         BLOCK_FETCH_PROTOCOL,
         TX_SUBMISSION_PROTOCOL,
         KEEP_ALIVE_PROTOCOL,
+        LEIOS_NOTIFY_PROTOCOL,
+        LEIOS_FETCH_PROTOCOL,
     ]
 }
 
@@ -261,13 +282,18 @@ impl ScenarioRunner {
                 Err(e) => {
                     steps_failed += 1;
                     cleanup(&mut state, &tracer).await;
+                    let outcome = if e.downcast_ref::<StepAssertionFailure>().is_some() {
+                        "assertion_failed"
+                    } else {
+                        "step_error"
+                    };
                     emit_completed(
                         &tracer,
                         &self.scenario.name,
                         steps_passed,
                         steps_failed,
                         started_at,
-                        "step_error",
+                        outcome,
                     )
                     .await;
                     return Err(e);
@@ -348,13 +374,15 @@ impl<V> Drop for CheckedOut<V> {
 
 /// State for one outgoing (client-mode) connection, indexed by name.
 struct ClientConnection {
-    plexer: RunningPlexer,
-    hs_channel: Option<AgentChannel>,
-    cs_channel: Option<AgentChannel>,
-    bf_channel: Option<AgentChannel>,
+    mux: RunningMux,
+    hs_channels: Option<(CodecSend, CodecRecv)>,
+    cs_channels: Option<(CodecSend, CodecRecv)>,
+    bf_channels: Option<(CodecSend, CodecRecv)>,
     /// Stored at connect; consumed at handshake to spawn background loops.
-    ka_channel: Option<AgentChannel>,
-    ts_channel: Option<AgentChannel>,
+    ka_channels: Option<(CodecSend, CodecRecv)>,
+    ts_channels: Option<(CodecSend, CodecRecv)>,
+    ln_channels: Option<(CodecSend, CodecRecv)>,
+    lf_channels: Option<(CodecSend, CodecRecv)>,
     ka_handle: Option<JoinHandle<()>>,
     ts_handle: Option<JoinHandle<()>>,
     #[allow(dead_code)]
@@ -548,10 +576,7 @@ fn run_step<'a>(
                         json!({ "index": step_idx, "outcome": "assertion_failed" }),
                     ))
                     .await?;
-                anyhow::bail!(
-                    "step {step_idx} ({}) failed assertions",
-                    step.kind.as_str()
-                )
+                return Err(anyhow::Error::new(StepAssertionFailure));
             }
             (Err(e), _) => {
                 let _ = tracer
@@ -589,12 +614,17 @@ fn execute_step<'a>(
             StepKind::Connect => {
                 let conn_name = step.as_name.as_deref().unwrap_or("default").to_string();
                 // Phase 1 of the two-phase connection lifecycle: structural setup.
-                // Subscribe every protocol channel and spawn the multiplexer.
+                // Register every protocol channel with the Mux and spawn it.
                 // No mini-protocol traffic is sent here — the Cardano N2N spec
                 // requires Handshake to complete before any other protocol can be
                 // used. Background workers are started in the Handshake arm below.
                 let addr = params.target_address.as_deref().unwrap_or(target_address);
-                let bearer = Bearer::connect_tcp(addr)
+                let socket_addr = addr
+                    .to_socket_addrs()
+                    .with_context(|| format!("failed to resolve {addr}"))?
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("no address resolved for {addr}"))?;
+                let bearer = TcpBearer::connect(socket_addr)
                     .await
                     .with_context(|| format!("failed to connect to {addr}"))?;
                 tracer
@@ -604,20 +634,59 @@ fn execute_step<'a>(
                         json!({ "addr": addr }),
                     ).with_connection(&conn_name))
                     .await?;
-                let mut plexer = Plexer::new(bearer);
-                let hs_ch = plexer.subscribe_client(PROTOCOL_N2N_HANDSHAKE);
-                let cs_ch = plexer.subscribe_client(CHAIN_SYNC_PROTOCOL);
-                let bf_ch = plexer.subscribe_client(BLOCK_FETCH_PROTOCOL);
-                let ts_ch = plexer.subscribe_client(TX_SUBMISSION_PROTOCOL);
-                let ka_ch = plexer.subscribe_client(KEEP_ALIVE_PROTOCOL);
-                let plexer = plexer.spawn();
+                let mut mux = Mux::new(MuxConfig::default(), AnyScheduler::default(), MODE_INITIATOR);
+                let (hs_send, hs_recv) = mux.register(&ProtocolConfig {
+                    id: net_core::protocols::handshake::PROTOCOL_ID,
+                    traffic_class: TrafficClass::Priority,
+                    ingress_limit: net_core::protocols::handshake::SIZE_LIMIT,
+                    egress_queue_size: 4,
+                });
+                let (cs_send, cs_recv) = mux.register(&ProtocolConfig {
+                    id: CHAIN_SYNC_PROTOCOL,
+                    traffic_class: TrafficClass::Default(1),
+                    ingress_limit: net_core::protocols::chainsync::INGRESS_LIMIT,
+                    egress_queue_size: 16,
+                });
+                let (bf_send, bf_recv) = mux.register(&ProtocolConfig {
+                    id: BLOCK_FETCH_PROTOCOL,
+                    traffic_class: TrafficClass::Default(1),
+                    ingress_limit: net_core::protocols::blockfetch::INGRESS_LIMIT,
+                    egress_queue_size: 16,
+                });
+                let (ts_send, ts_recv) = mux.register(&ProtocolConfig {
+                    id: TX_SUBMISSION_PROTOCOL,
+                    traffic_class: TrafficClass::Default(1),
+                    ingress_limit: net_core::protocols::txsubmission::INGRESS_LIMIT,
+                    egress_queue_size: 16,
+                });
+                let (ka_send, ka_recv) = mux.register(&ProtocolConfig {
+                    id: KEEP_ALIVE_PROTOCOL,
+                    traffic_class: TrafficClass::Default(1),
+                    ingress_limit: net_core::protocols::keepalive::INGRESS_LIMIT,
+                    egress_queue_size: 4,
+                });
+                let (ln_send, ln_recv) = mux.register(&ProtocolConfig {
+                    id: LEIOS_NOTIFY_PROTOCOL,
+                    traffic_class: TrafficClass::Default(1),
+                    ingress_limit: net_core::protocols::leios_notify::INGRESS_LIMIT,
+                    egress_queue_size: 16,
+                });
+                let (lf_send, lf_recv) = mux.register(&ProtocolConfig {
+                    id: LEIOS_FETCH_PROTOCOL,
+                    traffic_class: TrafficClass::Default(1),
+                    ingress_limit: net_core::protocols::leios_fetch::INGRESS_LIMIT,
+                    egress_queue_size: 16,
+                });
+                let running = mux.run(bearer);
                 state.connections.lock().unwrap().insert(conn_name, ClientConnection {
-                    plexer,
-                    hs_channel: Some(hs_ch),
-                    cs_channel: Some(cs_ch),
-                    bf_channel: Some(bf_ch),
-                    ts_channel: Some(ts_ch),
-                    ka_channel: Some(ka_ch),
+                    mux: running,
+                    hs_channels: Some((CodecSend::new(hs_send), CodecRecv::new(hs_recv))),
+                    cs_channels: Some((CodecSend::new(cs_send), CodecRecv::new(cs_recv))),
+                    bf_channels: Some((CodecSend::new(bf_send), CodecRecv::new(bf_recv))),
+                    ts_channels: Some((CodecSend::new(ts_send), CodecRecv::new(ts_recv))),
+                    ka_channels: Some((CodecSend::new(ka_send), CodecRecv::new(ka_recv))),
+                    ln_channels: Some((CodecSend::new(ln_send), CodecRecv::new(ln_recv))),
+                    lf_channels: Some((CodecSend::new(lf_send), CodecRecv::new(lf_recv))),
                     ka_handle: None,
                     ts_handle: None,
                     negotiated_version: None,
@@ -630,26 +699,25 @@ fn execute_step<'a>(
             StepKind::Handshake => {
                 let conn_name = step.on_name.as_deref().unwrap_or("default");
                 // Phase 2 of the two-phase connection lifecycle: version negotiation
-                // and worker activation. Only after handshake_on_channel returns
+                // and worker activation. Only after handshake_on_channels returns
                 // successfully do we know the negotiated version and that the node
                 // will accept traffic on other channels. Background tasks are spawned
                 // here, never in Connect, so they cannot send messages prematurely.
                 let mut co = CheckedOut::take(&state.connections, conn_name)?;
                 let conn = co.get_mut();
-                let channel = conn.hs_channel.take()
-                    .ok_or_else(|| anyhow::anyhow!("handshake: no channel (already used?)"))?;
+                let (hs_send, hs_recv) = conn.hs_channels.take()
+                    .ok_or_else(|| anyhow::anyhow!("handshake: no channels (already used?)"))?;
                 let eff_trc = tracer.for_peer_opt(conn.peer_id.clone());
-                let version = handshake_on_channel(channel, network_magic, &eff_trc).await?;
+                let version = handshake_on_channels(hs_send, hs_recv, network_magic, &eff_trc).await?;
                 conn.negotiated_version = Some(version);
 
                 let mut spawned_protocols: Vec<&str> = Vec::new();
-                if let Some(ka_channel) = conn.ka_channel.take() {
-                    let ka_client = pallas_network::miniprotocols::keepalive::Client::new(ka_channel);
-                    conn.ka_handle = Some(tokio::spawn(run_keepalive(ka_client, tracer.clone(), KEEP_ALIVE_INTERVAL)));
+                if let Some((ka_send, ka_recv)) = conn.ka_channels.take() {
+                    conn.ka_handle = Some(tokio::spawn(run_keepalive(ka_send, ka_recv, tracer.clone(), KEEP_ALIVE_INTERVAL)));
                     spawned_protocols.push("keep-alive");
                 }
-                if let Some(ts_channel) = conn.ts_channel.take() {
-                    conn.ts_handle = Some(tokio::spawn(run_tx_submission(ts_channel, tracer.clone())));
+                if let Some((ts_send, ts_recv)) = conn.ts_channels.take() {
+                    conn.ts_handle = Some(tokio::spawn(run_tx_submission(ts_send, ts_recv, tracer.clone())));
                     spawned_protocols.push("tx-submission");
                 }
                 tracer
@@ -691,8 +759,8 @@ fn execute_step<'a>(
                 let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
                 let mut co = CheckedOut::take(&state.connections, &conn_name)?;
                 let conn = co.get_mut();
-                let channel = conn.cs_channel.take()
-                    .ok_or_else(|| anyhow::anyhow!("chain_sync: no channel (already used?)"))?;
+                let (cs_send, cs_recv) = conn.cs_channels.take()
+                    .ok_or_else(|| anyhow::anyhow!("chain_sync: no channels (already used?)"))?;
 
                 let origin = vec!["origin".to_string()];
                 let raw_pts = params.intersection_points.as_deref().unwrap_or(origin.as_slice());
@@ -702,7 +770,7 @@ fn execute_step<'a>(
                 let await_secs = params.await_timeout_secs.unwrap_or(30);
 
                 let eff_trc = tracer.for_peer_opt(conn.peer_id.clone());
-                let summary = run_chain_sync(channel, intersection_points, count,
+                let summary = run_chain_sync(cs_send, cs_recv, intersection_points, count,
                     Duration::from_secs(await_secs), &eff_trc).await?;
 
                 let n = summary.collected_points.len();
@@ -742,8 +810,8 @@ fn execute_step<'a>(
                 let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
                 let mut co = CheckedOut::take(&state.connections, &conn_name)?;
                 let conn = co.get_mut();
-                let channel = conn.bf_channel.take()
-                    .ok_or_else(|| anyhow::anyhow!("block_fetch: no channel (already used?)"))?;
+                let (bf_send, bf_recv) = conn.bf_channels.take()
+                    .ok_or_else(|| anyhow::anyhow!("block_fetch: no channels (already used?)"))?;
 
                 let points: Vec<Point> =
                     match params.points.as_ref().unwrap_or(&BlockFetchPoints::FromChainSync) {
@@ -758,7 +826,7 @@ fn execute_step<'a>(
 
                 let batch_size = params.batch_size.unwrap_or(1);
                 let eff_trc = tracer.for_peer_opt(conn.peer_id.clone());
-                let summary = run_block_fetch(channel, points.clone(), batch_size, &eff_trc).await?;
+                let summary = run_block_fetch(bf_send, bf_recv, points.clone(), batch_size, &eff_trc).await?;
 
                 if let Some(ref bfp) = state.capture_block_fixture_path {
                     if !summary.captured_blocks.is_empty() {
@@ -776,6 +844,44 @@ fn execute_step<'a>(
                     }
                 }
                 info!(blocks = summary.blocks_received, conn = conn_name, "Block-fetch complete");
+                Ok(())
+            }
+
+            StepKind::LeiosNotify => {
+                let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
+                let mut co = CheckedOut::take(&state.connections, &conn_name)?;
+                let conn = co.get_mut();
+                let (ln_send, ln_recv) = conn.ln_channels.take()
+                    .ok_or_else(|| anyhow::anyhow!("leios_notify: no channels (already used?)"))?;
+
+                let count = params.count.unwrap_or(5);
+                let await_secs = params.await_timeout_secs.unwrap_or(30);
+                let eff_trc = tracer.for_peer_opt(conn.peer_id.clone());
+                run_leios_notify(ln_send, ln_recv, count, Duration::from_secs(await_secs), &eff_trc).await?;
+                info!(count, conn = conn_name, "LeiosNotify complete");
+                Ok(())
+            }
+
+            StepKind::LeiosFetch => {
+                let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
+                let mut co = CheckedOut::take(&state.connections, &conn_name)?;
+                let conn = co.get_mut();
+                let (lf_send, lf_recv) = conn.lf_channels.take()
+                    .ok_or_else(|| anyhow::anyhow!("leios_fetch: no channels (already used?)"))?;
+
+                let points: Vec<NcPoint> =
+                    match params.points.as_ref().ok_or_else(|| anyhow::anyhow!("leios_fetch: points is required"))? {
+                        BlockFetchPoints::FromChainSync => {
+                            anyhow::bail!("leios_fetch: points = \"from_chain_sync\" is not supported; use an explicit array or a $varname reference");
+                        }
+                        BlockFetchPoints::Explicit(strings) => strings.iter()
+                            .map(|s| parse_point(s).map(|p| to_nc_point(&p)))
+                            .collect::<anyhow::Result<Vec<NcPoint>>>()?,
+                    };
+
+                let eff_trc = tracer.for_peer_opt(conn.peer_id.clone());
+                run_leios_fetch(lf_send, lf_recv, points, &eff_trc).await?;
+                info!(conn = conn_name, "LeiosFetch complete");
                 Ok(())
             }
 
@@ -850,11 +956,13 @@ fn execute_step<'a>(
                 let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
                 let mut conn = state.connections.lock().unwrap().remove(&conn_name)
                     .ok_or_else(|| anyhow::anyhow!("disconnect: connection \"{conn_name}\" not found"))?;
-                conn.ka_channel.take();
-                conn.ts_channel.take();
+                conn.ka_channels.take();
+                conn.ts_channels.take();
+                conn.ln_channels.take();
+                conn.lf_channels.take();
                 if let Some(h) = conn.ka_handle.take() { h.abort(); }
                 if let Some(h) = conn.ts_handle.take() { h.abort(); }
-                conn.plexer.abort().await;
+                conn.mux.abort();
                 tracer
                     .emit(TraceEvent::new(EventKind::ConnectionClosed, Direction::Internal, json!({}))
                         .with_connection(&conn_name))
@@ -1411,31 +1519,66 @@ fn execute_step<'a>(
 
 /// Opens a temporary TCP connection to `target_address`, performs a handshake,
 /// then does a minimal Chain-Sync round-trip to obtain the current chain tip.
-/// All wire events are logged to the shared tracer.
+/// Returns `(point, block_number)`.
 async fn fetch_tip(target_address: &str, network_magic: u64, tracer: &Tracer) -> anyhow::Result<Tip> {
-    let bearer = Bearer::connect_tcp(target_address)
+    use net_core::protocols::chainsync::ChainSync;
+
+    let socket_addr = target_address
+        .to_socket_addrs()
+        .with_context(|| format!("query_tip: failed to resolve {target_address}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("query_tip: no address for {target_address}"))?;
+
+    let bearer = TcpBearer::connect(socket_addr)
         .await
         .with_context(|| format!("query_tip: failed to connect to {target_address}"))?;
 
-    let mut plexer = Plexer::new(bearer);
-    let hs_channel = plexer.subscribe_client(PROTOCOL_N2N_HANDSHAKE);
-    let cs_channel = plexer.subscribe_client(CHAIN_SYNC_PROTOCOL);
-    let plexer_handle = plexer.spawn();
+    let mut mux = Mux::new(MuxConfig::default(), AnyScheduler::default(), MODE_INITIATOR);
+    let (hs_send, hs_recv) = mux.register(&ProtocolConfig {
+        id: net_core::protocols::handshake::PROTOCOL_ID,
+        traffic_class: TrafficClass::Priority,
+        ingress_limit: net_core::protocols::handshake::SIZE_LIMIT,
+        egress_queue_size: 4,
+    });
+    let (cs_send, cs_recv) = mux.register(&ProtocolConfig {
+        id: CHAIN_SYNC_PROTOCOL,
+        traffic_class: TrafficClass::Default(1),
+        ingress_limit: net_core::protocols::chainsync::INGRESS_LIMIT,
+        egress_queue_size: 16,
+    });
+    let running = mux.run(bearer);
 
-    handshake_on_channel(hs_channel, network_magic, tracer)
-        .await
-        .context("query_tip: handshake failed")?;
+    handshake_on_channels(
+        CodecSend::new(hs_send),
+        CodecRecv::new(hs_recv),
+        network_magic,
+        tracer,
+    )
+    .await
+    .context("query_tip: handshake failed")?;
 
-    let mut cs = N2NClient::new(cs_channel);
+    let mut runner = Runner::<ChainSync>::new(
+        Role::Client,
+        CodecSend::new(cs_send),
+        CodecRecv::new(cs_recv),
+    );
 
-    // FindIntersect at origin — the response includes the current tip directly.
-    let (_, tip) = cs
-        .find_intersect(vec![Point::Origin])
-        .await
-        .context("query_tip: find_intersect failed")?;
+    // FindIntersect at Origin — server always responds with IntersectFound(Origin, tip).
+    let tip = match nc_chainsync::find_intersection(&mut runner, vec![NcPoint::Origin]).await {
+        Ok(Some((_, nc_tip))) => {
+            let nc_point = &nc_tip.point;
+            let pallas_point = match nc_point {
+                NcPoint::Origin => Point::Origin,
+                NcPoint::Specific { slot, hash } => Point::Specific(*slot, hash.to_vec()),
+            };
+            Tip(pallas_point, nc_tip.block_no)
+        }
+        Ok(None) => Tip(Point::Origin, 0),
+        Err(e) => return Err(anyhow::anyhow!("query_tip: find_intersect failed: {e}")),
+    };
 
-    cs.send_done().await.ok(); // best-effort clean close
-    plexer_handle.abort().await;
+    nc_chainsync::done(&mut runner).await.ok();
+    running.abort();
 
     Ok(tip)
 }
@@ -1460,11 +1603,13 @@ async fn cleanup(state: &mut RunnerState, tracer: &Tracer) {
     let conns: Vec<(String, ClientConnection)> =
         state.connections.lock().unwrap().drain().collect();
     for (name, mut cc) in conns {
-        cc.ka_channel.take();
-        cc.ts_channel.take();
+        cc.ka_channels.take();
+        cc.ts_channels.take();
+        cc.ln_channels.take();
+        cc.lf_channels.take();
         if let Some(h) = cc.ka_handle.take() { h.abort(); }
         if let Some(h) = cc.ts_handle.take() { h.abort(); }
-        cc.plexer.abort().await;
+        cc.mux.abort();
         let _ = tracer.emit(TraceEvent::new(EventKind::ConnectionClosed, Direction::Internal,
             json!({ "reason": "scenario_aborted" })).with_connection(&name)).await;
     }
@@ -1661,15 +1806,12 @@ mod tests {
 
     #[test]
     fn subscribed_protocols_contains_full_n2n_suite() {
-        use pallas_network::miniprotocols::{
-            PROTOCOL_N2N_KEEP_ALIVE, PROTOCOL_N2N_TX_SUBMISSION,
-        };
         for &version in &[7u64, 11, 13, 14] {
             let ps = subscribed_protocols(version);
-            assert!(ps.contains(&CHAIN_SYNC_PROTOCOL),        "v{version}: missing chain-sync");
-            assert!(ps.contains(&BLOCK_FETCH_PROTOCOL),       "v{version}: missing block-fetch");
-            assert!(ps.contains(&PROTOCOL_N2N_TX_SUBMISSION), "v{version}: missing tx-submission");
-            assert!(ps.contains(&PROTOCOL_N2N_KEEP_ALIVE),    "v{version}: missing keep-alive");
+            assert!(ps.contains(&CHAIN_SYNC_PROTOCOL),   "v{version}: missing chain-sync");
+            assert!(ps.contains(&BLOCK_FETCH_PROTOCOL),  "v{version}: missing block-fetch");
+            assert!(ps.contains(&TX_SUBMISSION_PROTOCOL), "v{version}: missing tx-submission");
+            assert!(ps.contains(&KEEP_ALIVE_PROTOCOL),    "v{version}: missing keep-alive");
         }
     }
 
@@ -1754,10 +1896,10 @@ mod tests {
         {
             let guard = state.connections.lock().unwrap();
             let conn = guard.get("default").expect("default connection");
-            assert!(conn.ka_handle.is_none(),  "ka_handle must be None after Connect");
-            assert!(conn.ts_handle.is_none(),  "ts_handle must be None after Connect");
-            assert!(conn.ka_channel.is_some(), "ka_channel must be Some after Connect");
-            assert!(conn.ts_channel.is_some(), "ts_channel must be Some after Connect");
+            assert!(conn.ka_handle.is_none(),   "ka_handle must be None after Connect");
+            assert!(conn.ts_handle.is_none(),   "ts_handle must be None after Connect");
+            assert!(conn.ka_channels.is_some(), "ka_channels must be Some after Connect");
+            assert!(conn.ts_channels.is_some(), "ts_channels must be Some after Connect");
         }
 
         let handshake = StepDef {
@@ -1775,17 +1917,17 @@ mod tests {
         {
             let guard = state.connections.lock().unwrap();
             let conn = guard.get("default").expect("default connection");
-            assert!(conn.ka_handle.is_some(),  "ka_handle must be Some after Handshake");
-            assert!(conn.ts_handle.is_some(),  "ts_handle must be Some after Handshake");
-            assert!(conn.ka_channel.is_none(), "ka_channel must be None after Handshake (consumed)");
-            assert!(conn.ts_channel.is_none(), "ts_channel must be None after Handshake (consumed)");
+            assert!(conn.ka_handle.is_some(),   "ka_handle must be Some after Handshake");
+            assert!(conn.ts_handle.is_some(),   "ts_handle must be Some after Handshake");
+            assert!(conn.ka_channels.is_none(), "ka_channels must be None after Handshake (consumed)");
+            assert!(conn.ts_channels.is_none(), "ts_channels must be None after Handshake (consumed)");
         }
 
         // Cleanup.
         let mut conn = state.connections.lock().unwrap().remove("default").unwrap();
         if let Some(h) = conn.ka_handle.take() { h.abort(); }
         if let Some(h) = conn.ts_handle.take() { h.abort(); }
-        conn.plexer.abort().await;
+        conn.mux.abort();
     }
 
     // ── Slot-evolution runtime tests ──────────────────────────────────────────

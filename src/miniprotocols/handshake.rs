@@ -1,18 +1,20 @@
+use std::net::ToSocketAddrs;
+
 use anyhow::Context;
-use pallas_network::miniprotocols::handshake::n2n::{VersionData, VersionTable};
-use pallas_network::miniprotocols::handshake::{Client, Confirmation};
-use pallas_network::miniprotocols::PROTOCOL_N2N_HANDSHAKE;
-use pallas_network::multiplexer::{AgentChannel, Bearer, Plexer};
+use net_core::bearer::tcp::TcpBearer;
+use net_core::mux::scheduler::{AnyScheduler, TrafficClass};
+use net_core::mux::{CodecRecv, CodecSend, Mux, MuxConfig, ProtocolConfig, MODE_INITIATOR};
+use net_core::protocols::handshake::{self, n2n, HandshakeResult};
 use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
 
-/// Runs the NodeToNode Handshake on a pre-allocated multiplexer channel.
-/// The caller is responsible for the Bearer, Plexer lifecycle, and the
-/// ConnectionOpened / ConnectionClosed trace events.
-pub async fn handshake_on_channel(
-    channel: AgentChannel,
+/// Runs the NodeToNode Handshake on a pre-allocated codec pair.
+/// Returns the negotiated version number.
+pub async fn handshake_on_channels(
+    codec_send: CodecSend,
+    codec_recv: CodecRecv,
     magic: u64,
     tracer: &Tracer,
 ) -> anyhow::Result<u64> {
@@ -24,10 +26,14 @@ pub async fn handshake_on_channel(
         ))
         .await?;
 
-    let mut client: Client<VersionData> = Client::new(channel);
+    let versions = n2n::version_table(&n2n::VersionData {
+        network_magic: magic,
+        initiator_only_diffusion_mode: true,
+        peer_sharing: 1,
+        query: false,
+    });
 
-    let version_table = VersionTable::v7_and_above(magic);
-    let mut proposed_versions: Vec<u64> = version_table.values.keys().cloned().collect();
+    let mut proposed_versions: Vec<u64> = versions.keys().cloned().collect();
     proposed_versions.sort();
 
     tracer
@@ -40,51 +46,23 @@ pub async fn handshake_on_channel(
 
     debug!(?proposed_versions, "Sending ProposeVersions");
 
-    if let Err(e) = client.send_propose(version_table).await {
-        let msg = e.to_string();
-        let _ = tracer
-            .emit(TraceEvent::new(
-                EventKind::Error,
-                Direction::Internal,
-                json!({ "phase": "send_propose", "error": msg }),
-            ))
-            .await;
-        return Err(anyhow::anyhow!("send_propose failed: {e}"));
-    }
+    let result = handshake::run_client(codec_send, codec_recv, versions)
+        .await
+        .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
 
-    debug!("Awaiting handshake confirmation");
-
-    let confirmation = match client.recv_while_confirm().await {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = e.to_string();
-            let _ = tracer
-                .emit(TraceEvent::new(
-                    EventKind::Error,
-                    Direction::Internal,
-                    json!({ "phase": "recv_while_confirm", "error": msg }),
-                ))
-                .await;
-            return Err(anyhow::anyhow!("recv_while_confirm failed: {e}"));
-        }
-    };
-
-    let negotiated = match confirmation {
-        Confirmation::Accepted(version, ref data) => {
-            info!(version, "Handshake accepted");
+    let negotiated = match result {
+        HandshakeResult::Accepted { version_number, .. } => {
+            info!(version_number, "Handshake accepted");
             tracer
                 .emit(TraceEvent::new(
                     EventKind::HandshakeVersionAccepted,
                     Direction::Received,
-                    json!({
-                        "version": version,
-                        "peer_data": format!("{data:?}"),
-                    }),
+                    json!({ "version": version_number }),
                 ))
                 .await?;
-            version
+            version_number
         }
-        Confirmation::Rejected(ref reason) => {
+        HandshakeResult::Refused(reason) => {
             warn!(?reason, "Handshake rejected by peer");
             tracer
                 .emit(TraceEvent::new(
@@ -95,7 +73,7 @@ pub async fn handshake_on_channel(
                 .await?;
             return Err(anyhow::anyhow!("handshake rejected: {reason:?}"));
         }
-        Confirmation::QueryReply(_) => {
+        HandshakeResult::QueryReply(_) => {
             return Err(anyhow::anyhow!(
                 "unexpected QueryReply during initiator handshake"
             ));
@@ -115,12 +93,17 @@ pub async fn handshake_on_channel(
 }
 
 /// Standalone handshake probe: opens its own TCP connection, performs the
-/// handshake, and closes cleanly. Used by unit tests and the handshake-only
-/// code path.
+/// handshake, and closes cleanly. Used by unit tests and the handshake-only code path.
 pub async fn run_handshake(addr: &str, magic: u64, tracer: &Tracer) -> anyhow::Result<u64> {
     info!(%addr, "Opening TCP connection");
 
-    let bearer = Bearer::connect_tcp(addr)
+    let socket_addr = addr
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve {addr}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no address resolved for {addr}"))?;
+
+    let bearer = TcpBearer::connect(socket_addr)
         .await
         .with_context(|| format!("failed to connect to {addr}"))?;
 
@@ -132,14 +115,27 @@ pub async fn run_handshake(addr: &str, magic: u64, tracer: &Tracer) -> anyhow::R
         ))
         .await?;
 
-    let mut plexer = Plexer::new(bearer);
-    let hs_channel = plexer.subscribe_client(PROTOCOL_N2N_HANDSHAKE);
-    let plexer_handle = plexer.spawn();
+    let hs_proto = ProtocolConfig {
+        id: handshake::PROTOCOL_ID,
+        traffic_class: TrafficClass::Priority,
+        ingress_limit: handshake::SIZE_LIMIT,
+        egress_queue_size: 4,
+    };
 
-    let version = match handshake_on_channel(hs_channel, magic, tracer).await {
+    let mut mux = Mux::new(MuxConfig::default(), AnyScheduler::default(), MODE_INITIATOR);
+    let (hs_send, hs_recv) = mux.register(&hs_proto);
+    let _running = mux.run(bearer);
+
+    let version = match handshake_on_channels(
+        CodecSend::new(hs_send),
+        CodecRecv::new(hs_recv),
+        magic,
+        tracer,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
-            plexer_handle.abort().await;
             tracer
                 .emit(TraceEvent::new(
                     EventKind::ConnectionClosed,
@@ -150,8 +146,6 @@ pub async fn run_handshake(addr: &str, magic: u64, tracer: &Tracer) -> anyhow::R
             return Err(e);
         }
     };
-
-    plexer_handle.abort().await;
 
     tracer
         .emit(TraceEvent::new(

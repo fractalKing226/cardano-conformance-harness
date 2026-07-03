@@ -114,6 +114,22 @@ pub enum EventKind {
     PeerLeftNetwork,
     /// Catch-all for unknown event_kind strings passed to emit_peer_event.
     PeerNetworkEvent,
+
+    // LeiosNotify mini-protocol (protocol ID 18)
+    LeiosNotifyStarted,
+    LeiosNotifyBlockAnnouncement,
+    LeiosNotifyBlockOffer,
+    LeiosNotifyBlockTxsOffer,
+    LeiosNotifyVotes,
+    LeiosNotifyDone,
+    LeiosNotifySessionSummary,
+
+    // LeiosFetch mini-protocol (protocol ID 19)
+    LeiosFetchStarted,
+    LeiosFetchBlockRequest,
+    LeiosFetchBlock,
+    LeiosFetchDone,
+    LeiosFetchSessionSummary,
 }
 
 /// Direction of a trace event relative to the harness.

@@ -12,6 +12,10 @@ name = "cardano_conformance_harness"
 path = "src/lib.rs"
 
 [dependencies]
+net-core = { path = "../leios-tools/net-rs/net-core" }
+shared-consensus = { path = "../leios-tools/shared-rs/consensus" }
+minicbor = { version = "0.25", features = ["std"] }
+blake2b_simd = "1"
 pallas-network = "0.36.0"
 pallas-codec = "0.36.0"
 pallas-crypto = "0.36.0"

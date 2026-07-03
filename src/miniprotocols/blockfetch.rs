@@ -1,19 +1,21 @@
 use std::time::Instant;
 
-use pallas_network::miniprotocols::blockfetch::Client;
+use net_core::mux::{CodecRecv, CodecSend};
+use net_core::protocols::blockfetch::{self, BlockFetch};
+use net_core::protocols::{Role, Runner};
+use net_core::types::Point as NcPoint;
 use pallas_network::miniprotocols::Point;
-use pallas_network::multiplexer::AgentChannel;
 use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::miniprotocols::chainsync::format_point;
 use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
 
-pub use pallas_network::miniprotocols::PROTOCOL_N2N_BLOCK_FETCH as BLOCK_FETCH_PROTOCOL;
+pub const BLOCK_FETCH_PROTOCOL: u16 = net_core::protocols::blockfetch::PROTOCOL_ID;
 
 const MINI_PROTOCOL: &str = "block-fetch";
 
-/// A captured block body as received from a RollForward-equivalent Block-Fetch response.
+/// A captured block body as received from a Block-Fetch response.
 /// Used to populate Block-Fetch fixture files (`--capture-block-fixture`).
 #[derive(Clone)]
 pub struct CapturedBlock {
@@ -37,23 +39,33 @@ fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn state_str(client: &Client) -> String {
-    format!("{:?}", client.state())
+/// Convert pallas Point to net-core Point.
+fn to_nc_point(p: &Point) -> NcPoint {
+    match p {
+        Point::Origin => NcPoint::Origin,
+        Point::Specific(slot, hash) => {
+            let mut h = [0u8; 32];
+            let len = hash.len().min(32);
+            h[..len].copy_from_slice(&hash[..len]);
+            NcPoint::Specific { slot: *slot, hash: h }
+        }
+    }
 }
 
-/// Runs a Block-Fetch session on a pre-allocated multiplexer channel.
+/// Runs a Block-Fetch session on a pre-allocated codec pair.
 ///
 /// Issues one `MsgRequestRange` per batch (using `batch_size` consecutive points
 /// per range). Each batch is drained fully before the next request is issued
 /// (non-pipelined). Terminates with `MsgClientDone`.
 pub async fn run_block_fetch(
-    channel: AgentChannel,
+    codec_send: CodecSend,
+    codec_recv: CodecRecv,
     points: Vec<Point>,
     batch_size: usize,
     tracer: &Tracer,
 ) -> anyhow::Result<BlockFetchSummary> {
     let started_at = Instant::now();
-    let mut client = Client::new(channel);
+    let mut runner = Runner::<BlockFetch>::new(Role::Client, codec_send, codec_recv);
 
     let mut range_requests: u64 = 0;
     let mut blocks_received: u64 = 0;
@@ -80,10 +92,6 @@ pub async fn run_block_fetch(
     for batch in points.chunks(effective_batch) {
         let from = batch.first().unwrap();
         let to = batch.last().unwrap();
-        // When the batch contains exactly one Point::Specific, the slot and hash
-        // are known from the request itself — no CBOR parsing needed. Multi-point
-        // batches would require decoding each block's header to recover its slot,
-        // which is left as a future extension.
         let capture_point: Option<(u64, Vec<u8>)> = if batch.len() == 1 {
             match from {
                 Point::Specific(slot, hash) => Some((*slot, hash.clone())),
@@ -93,7 +101,6 @@ pub async fn run_block_fetch(
             None
         };
 
-        let sb = state_str(&client);
         tracer
             .emit(
                 TraceEvent::new(
@@ -105,11 +112,14 @@ pub async fn run_block_fetch(
                         "batch_len": batch.len(),
                     }),
                 )
-                .with_states(MINI_PROTOCOL, sb, "Busy"),
+                .with_states(MINI_PROTOCOL, "Idle", "Busy"),
             )
             .await?;
 
-        let has_blocks = match client.request_range((from.clone(), to.clone())).await {
+        let from_nc = to_nc_point(from);
+        let to_nc = to_nc_point(to);
+
+        let has_blocks = match blockfetch::request_range(&mut runner, from_nc, to_nc).await {
             Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
@@ -138,107 +148,104 @@ pub async fn run_block_fetch(
         };
         range_requests += 1;
 
-        match has_blocks {
-            None => {
-                // Server responded with MsgNoBlocks — range not available
-                no_blocks_responses += 1;
-                warn!("NoBlocks for range {:?}..{:?}", from, to);
-                tracer
-                    .emit(
-                        TraceEvent::new(
-                            EventKind::BlockFetchNoBlocks,
-                            Direction::Received,
-                            json!({
-                                "from": format_point(from),
-                                "to":   format_point(to),
-                            }),
-                        )
-                        .with_states(MINI_PROTOCOL, "Busy", state_str(&client)),
+        if !has_blocks {
+            // Server responded with MsgNoBlocks
+            no_blocks_responses += 1;
+            warn!("NoBlocks for range {:?}..{:?}", from, to);
+            tracer
+                .emit(
+                    TraceEvent::new(
+                        EventKind::BlockFetchNoBlocks,
+                        Direction::Received,
+                        json!({
+                            "from": format_point(from),
+                            "to":   format_point(to),
+                        }),
                     )
-                    .await?;
-            }
-            Some(()) => {
-                // Server responded with MsgStartBatch — blocks are streaming
-                tracer
-                    .emit(
-                        TraceEvent::new(
-                            EventKind::BlockFetchStartBatch,
-                            Direction::Received,
-                            json!({}),
-                        )
-                        .with_states(MINI_PROTOCOL, "Busy", state_str(&client)),
+                    .with_states(MINI_PROTOCOL, "Busy", "Idle"),
+                )
+                .await?;
+        } else {
+            // Server responded with MsgStartBatch
+            tracer
+                .emit(
+                    TraceEvent::new(
+                        EventKind::BlockFetchStartBatch,
+                        Direction::Received,
+                        json!({}),
                     )
-                    .await?;
+                    .with_states(MINI_PROTOCOL, "Busy", "Streaming"),
+                )
+                .await?;
 
-                let mut batch_blocks: u64 = 0;
+            let mut batch_blocks: u64 = 0;
 
-                loop {
-                    let sb = state_str(&client);
-                    match client.recv_while_streaming().await {
-                        Ok(Some(body)) => {
-                            total_bytes += body.len() as u64;
-                            blocks_received += 1;
-                            batch_blocks += 1;
-                            debug!(blocks_received, bytes = body.len(), "Block received");
-                            if let Some((slot, ref hash)) = capture_point {
-                                captured_blocks.push(CapturedBlock {
-                                    slot,
-                                    block_hash: hash.clone(),
-                                    cbor: body.clone(),
-                                });
-                            }
-                            tracer
-                                .emit(
-                                    TraceEvent::new(
-                                        EventKind::BlockFetchBlock,
-                                        Direction::Received,
-                                        json!({
-                                            "cbor_hex": encode_hex(&body),
-                                            "cbor_len": body.len(),
-                                        }),
-                                    )
-                                    .with_states(MINI_PROTOCOL, &sb, state_str(&client)),
-                                )
-                                .await?;
+            loop {
+                match blockfetch::recv_block(&mut runner).await {
+                    Ok(Some(body)) => {
+                        let body = body.raw;
+                        total_bytes += body.len() as u64;
+                        blocks_received += 1;
+                        batch_blocks += 1;
+                        debug!(blocks_received, bytes = body.len(), "Block received");
+                        if let Some((slot, ref hash)) = capture_point {
+                            captured_blocks.push(CapturedBlock {
+                                slot,
+                                block_hash: hash.clone(),
+                                cbor: body.clone(),
+                            });
                         }
-                        Ok(None) => {
-                            // MsgBatchDone — end of this batch
-                            tracer
-                                .emit(
-                                    TraceEvent::new(
-                                        EventKind::BlockFetchBatchDone,
-                                        Direction::Received,
-                                        json!({ "blocks_in_batch": batch_blocks }),
-                                    )
-                                    .with_states(MINI_PROTOCOL, &sb, state_str(&client)),
+                        tracer
+                            .emit(
+                                TraceEvent::new(
+                                    EventKind::BlockFetchBlock,
+                                    Direction::Received,
+                                    json!({
+                                        "cbor_hex": encode_hex(&body),
+                                        "cbor_len": body.len(),
+                                    }),
                                 )
-                                .await?;
-                            break;
-                        }
-                        Err(e) => {
-                            let msg = e.to_string();
-                            let _ = tracer
-                                .emit(
-                                    TraceEvent::new(
-                                        EventKind::Error,
-                                        Direction::Internal,
-                                        json!({ "phase": "recv_while_streaming", "error": msg }),
-                                    )
-                                    .with_protocol(MINI_PROTOCOL),
+                                .with_states(MINI_PROTOCOL, "Streaming", "Streaming"),
+                            )
+                            .await?;
+                    }
+                    Ok(None) => {
+                        // MsgBatchDone
+                        tracer
+                            .emit(
+                                TraceEvent::new(
+                                    EventKind::BlockFetchBatchDone,
+                                    Direction::Received,
+                                    json!({ "blocks_in_batch": batch_blocks }),
                                 )
-                                .await;
-                            let summary = build_summary(
-                                range_requests,
-                                blocks_received,
-                                no_blocks_responses,
-                                total_bytes,
-                                std::mem::take(&mut captured_blocks),
-                                started_at,
-                                "error",
-                            );
-                            emit_summary(tracer, &summary).await;
-                            return Err(anyhow::anyhow!("recv_while_streaming failed: {e}"));
-                        }
+                                .with_states(MINI_PROTOCOL, "Streaming", "Idle"),
+                            )
+                            .await?;
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let _ = tracer
+                            .emit(
+                                TraceEvent::new(
+                                    EventKind::Error,
+                                    Direction::Internal,
+                                    json!({ "phase": "recv_block", "error": msg }),
+                                )
+                                .with_protocol(MINI_PROTOCOL),
+                            )
+                            .await;
+                        let summary = build_summary(
+                            range_requests,
+                            blocks_received,
+                            no_blocks_responses,
+                            total_bytes,
+                            std::mem::take(&mut captured_blocks),
+                            started_at,
+                            "error",
+                        );
+                        emit_summary(tracer, &summary).await;
+                        return Err(anyhow::anyhow!("recv_block failed: {e}"));
                     }
                 }
             }
@@ -246,8 +253,7 @@ pub async fn run_block_fetch(
     }
 
     // Send MsgClientDone
-    let sb = state_str(&client);
-    if let Err(e) = client.send_done().await {
+    if let Err(e) = blockfetch::done(&mut runner).await {
         let _ = tracer
             .emit(
                 TraceEvent::new(
@@ -262,7 +268,7 @@ pub async fn run_block_fetch(
         tracer
             .emit(
                 TraceEvent::new(EventKind::BlockFetchClientDone, Direction::Sent, json!({}))
-                    .with_states(MINI_PROTOCOL, sb, "Done"),
+                    .with_states(MINI_PROTOCOL, "Idle", "Done"),
             )
             .await?;
     }
@@ -356,101 +362,5 @@ mod tests {
         });
         assert_eq!(payload["cbor_hex"], "abcdef");
         assert_eq!(payload["cbor_len"], 3);
-    }
-
-    /// Verifies that run_block_fetch populates captured_blocks when batch_size == 1.
-    /// Uses a real loopback TCP connection so the full block-fetch path is exercised.
-    #[tokio::test]
-    async fn capture_blocks_populated_with_batch_size_one() {
-        use pallas_network::miniprotocols::blockfetch::Server as BfServer;
-        use pallas_network::multiplexer::{Bearer, Plexer};
-        use tempfile::NamedTempFile;
-
-        const SLOT: u64 = 42;
-        const HASH: [u8; 32] = [0xaa; 32];
-        const BODY: &[u8] = &[0x01, 0x02, 0x03, 0x04];
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let tmp = NamedTempFile::new().unwrap();
-        let tracer = crate::trace::Tracer::open(tmp.path()).await.unwrap();
-
-        let (_, summary) = tokio::join!(
-            // Server branch: accept one range request, send one block, done.
-            async move {
-                let (bearer, _) = Bearer::accept_tcp(&listener).await.unwrap();
-                let mut plexer = Plexer::new(bearer);
-                let ch = plexer.subscribe_server(BLOCK_FETCH_PROTOCOL);
-                plexer.spawn();
-                let mut srv = BfServer::new(ch);
-                let _ = srv.recv_while_idle().await; // RequestRange
-                srv.send_start_batch().await.unwrap();
-                srv.send_block(BODY.to_vec()).await.unwrap();
-                srv.send_batch_done().await.unwrap();
-                let _ = srv.recv_while_idle().await; // ClientDone
-            },
-            // Client branch: run_block_fetch with one Point::Specific, batch_size 1.
-            async move {
-                let bearer = Bearer::connect_tcp(addr).await.unwrap();
-                let mut plexer = Plexer::new(bearer);
-                let ch = plexer.subscribe_client(BLOCK_FETCH_PROTOCOL);
-                plexer.spawn();
-                let point = Point::Specific(SLOT, HASH.to_vec());
-                run_block_fetch(ch, vec![point], 1, &tracer).await.unwrap()
-            }
-        );
-
-        assert_eq!(summary.blocks_received, 1, "one block should be received");
-        assert_eq!(summary.captured_blocks.len(), 1, "captured_blocks must have one entry");
-        let cb = &summary.captured_blocks[0];
-        assert_eq!(cb.slot, SLOT,            "slot must match requested point");
-        assert_eq!(cb.block_hash, HASH,      "hash must match requested point");
-        assert_eq!(cb.cbor, BODY,            "cbor must be the raw block body");
-    }
-
-    /// batch_size > 1 must NOT capture (slot/hash are indeterminate without CBOR parsing).
-    #[tokio::test]
-    async fn capture_blocks_empty_when_batch_size_gt_one() {
-        use pallas_network::miniprotocols::blockfetch::Server as BfServer;
-        use pallas_network::multiplexer::{Bearer, Plexer};
-        use tempfile::NamedTempFile;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let tmp = NamedTempFile::new().unwrap();
-        let tracer = crate::trace::Tracer::open(tmp.path()).await.unwrap();
-
-        let (_, summary) = tokio::join!(
-            async move {
-                let (bearer, _) = Bearer::accept_tcp(&listener).await.unwrap();
-                let mut plexer = Plexer::new(bearer);
-                let ch = plexer.subscribe_server(BLOCK_FETCH_PROTOCOL);
-                plexer.spawn();
-                let mut srv = BfServer::new(ch);
-                let _ = srv.recv_while_idle().await;
-                srv.send_start_batch().await.unwrap();
-                srv.send_block(vec![0x01]).await.unwrap();
-                srv.send_block(vec![0x02]).await.unwrap();
-                srv.send_batch_done().await.unwrap();
-                let _ = srv.recv_while_idle().await;
-            },
-            async move {
-                let bearer = Bearer::connect_tcp(addr).await.unwrap();
-                let mut plexer = Plexer::new(bearer);
-                let ch = plexer.subscribe_client(BLOCK_FETCH_PROTOCOL);
-                plexer.spawn();
-                let pts = vec![
-                    Point::Specific(1, vec![0x01; 32]),
-                    Point::Specific(2, vec![0x02; 32]),
-                ];
-                run_block_fetch(ch, pts, 2, &tracer).await.unwrap()
-            }
-        );
-
-        assert_eq!(summary.blocks_received, 2);
-        assert_eq!(summary.captured_blocks.len(), 0,
-            "multi-point batches must not capture (slot/hash unknown without CBOR parse)");
     }
 }

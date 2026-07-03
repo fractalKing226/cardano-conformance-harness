@@ -10,7 +10,7 @@ separate verifier will check those traces against Agda specifications.
 
 Reads a scenario JSON file at startup and executes its steps in order. Supports:
 
-- **Client mode** — connect, handshake, chain-sync, block-fetch, query-tip, sleep, disconnect
+- **Client mode** — connect, handshake, chain-sync, block-fetch, query-tip, leios-notify, leios-fetch, sleep, disconnect
 - **Server mode** — listen, accept incoming connections, serve scripted Chain-Sync and Block-Fetch responses (honest or adversarial)
 - **Parallel execution** — run branches of steps concurrently; abort all if any branch fails
 - **Named connections** — multiple outgoing or accepted connections in the same scenario, each with an explicit name
@@ -191,6 +191,8 @@ Opens a TCP connection and subscribes the full N2N mini-protocol suite.
 | Block-Fetch | 3 | Active — `block_fetch` step |
 | Tx-Submission | 4 | Subscribed, idle |
 | Keep-Alive | 8 | Active — background loop sends periodic pings |
+| LeiosNotify | 18 | Active — `leios_notify` step |
+| LeiosFetch | 19 | Active — `leios_fetch` step |
 
 #### `handshake`
 
@@ -233,6 +235,36 @@ Opens a temporary TCP connection, performs a handshake, and does a minimal Chain
 ```json
 { "kind": "query_tip", "output": "tip" }
 ```
+
+#### `leios_notify`
+
+Long-poll client for LeiosNotify (protocol 18). Calls `request_next` up to `count` times; each call blocks until the server has Leios data to push. Terminates cleanly with `MsgDone`.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `count` | `5` | Maximum number of notification events to consume |
+| `await_timeout_secs` | `30` | Per-request timeout in seconds (0 = wait indefinitely) |
+
+Emits typed trace events for each event kind received:
+
+| Event kind | Meaning |
+|------------|---------|
+| `leios_notify_block_announcement` | Server announced a new EB header |
+| `leios_notify_block_offer` | Server offered an EB by point and byte-size |
+| `leios_notify_block_txs_offer` | Server offered an EB's transactions by point |
+| `leios_notify_votes` | Server pushed a batch of BLS votes |
+
+The session also emits `leios_notify_started` (internal) and `leios_notify_session_summary` (internal, with `events_received`, per-kind counts, `exit_reason`, and `duration_ms`). `exit_reason` is `"completed"` (count reached), `"await_timeout"` (per-request wall-clock expired), or `"error"`.
+
+#### `leios_fetch`
+
+Request/response client for LeiosFetch (protocol 19). Fetches the raw bytes of each named EB in turn, then terminates with `MsgDone`.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `points` | yes | Array of `"slot:hex_hash"` strings identifying the EBs to fetch. Variable references (`"$varname"`) are supported. `"from_chain_sync"` is **not** supported for this protocol. |
+
+Emits `leios_fetch_started` (internal), `leios_fetch_block_request` (sent) and `leios_fetch_block` (received) per point, `leios_fetch_done` (sent), and `leios_fetch_session_summary` (internal) with `blocks_requested`, `blocks_received`, `exit_reason`, and `duration_ms`.
 
 #### `sleep`
 
@@ -683,6 +715,18 @@ Each line is a self-contained JSON object.
 | `block_fetch_no_blocks` | received | MsgNoBlocks |
 | `block_fetch_client_done` | sent | MsgClientDone |
 | `block_fetch_session_summary` | internal | Block-Fetch statistics |
+| `leios_notify_started` | internal | LeiosNotify session begins |
+| `leios_notify_block_announcement` | received | Server announced an EB header |
+| `leios_notify_block_offer` | received | Server offered an EB (includes `eb_size`) |
+| `leios_notify_block_txs_offer` | received | Server offered an EB's transactions |
+| `leios_notify_votes` | received | Server pushed a vote batch (includes `vote_count`) |
+| `leios_notify_done` | sent | MsgDone sent to server |
+| `leios_notify_session_summary` | internal | LeiosNotify statistics |
+| `leios_fetch_started` | internal | LeiosFetch session begins |
+| `leios_fetch_block_request` | sent | MsgLeiosBlockRequest for one point |
+| `leios_fetch_block` | received | Raw EB bytes received (includes `block_len`) |
+| `leios_fetch_done` | sent | MsgDone sent to server |
+| `leios_fetch_session_summary` | internal | LeiosFetch statistics |
 | `parallel_started` | internal | `parallel` step begins |
 | `parallel_branch_started` | internal | One branch starts |
 | `parallel_branch_completed` | internal | Branch finished normally |
@@ -716,7 +760,7 @@ Each line is a self-contained JSON object.
 cargo test
 ```
 
-133 unit tests covering:
+143 unit tests covering:
 
 - `trace::tests` — serialisation, `direction`, `with_protocol`/`with_states`, `peer_id`/`slot` propagation, concurrent emit
 - `scenario::tests` — parsing, validation, `parse_point`, per-step `target_address`, `peer_id` rules, production_rule validation
@@ -795,6 +839,9 @@ src/
     blockfetch.rs                 — Block-Fetch N2N client + fixture capture        [unit tests]
     blockfetch_server.rs          — Block-Fetch response script executor
     keepalive.rs                  — Keep-Alive client + server
+    leios_notify.rs               — LeiosNotify N2N client (protocol 18)
+    leios_fetch.rs                — LeiosFetch N2N client (protocol 19)
+    peersharing.rs                — Peer-Sharing stub
     txsubmission.rs               — Tx-Submission (passive receive)
   scenario/
     mod.rs                        — Scenario, StepDef, StepKind, Network, ProductionRule, validation  [unit tests]
@@ -821,9 +868,10 @@ scripts/
 
 ## What's next
 
-- Cryptographically valid block content — real KES signatures and VRF proofs for produced blocks (slice 6+)
+- **Piranha integration** — LeiosNotify and LeiosFetch step handlers are implemented; live testing against a Piranha node is blocked on protocol-format alignment between `ouroboros-leios/net-rs` and `leios-tools/net-rs` (the latter is ~5 weeks ahead and the formats are wire-incompatible)
+- **Leios adversarial scenarios** — wire-level violation test cases for LeiosNotify and LeiosFetch (wrong-state messages, malformed CBOR, truncated vote batches), derived from the Agda formal spec
+- Cryptographically valid block content — real KES signatures and VRF proofs for produced blocks
 - Cross-peer state interaction — peer A's chain visible to peer B's production rule
 - Parse slot/hash/block_number from Block-Fetch block body CBOR to enable `batch_size > 1` fixture capture
-- Peer-Sharing mini-protocol (once pallas-network exposes it; version ≥ 13)
 - Tx-Submission step handler
 - Agda specification verifier integration — consume trace files and check against formal spec

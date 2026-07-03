@@ -267,6 +267,12 @@ pub enum StepKind {
     /// chain tip slot. Any `serve_chain_sync as_peer:` step that runs after this
     /// will see the extended chain.
     PeerExtendsChain,
+    /// Receive `count` Leios notifications (block announcements, EB offers,
+    /// vote messages) from the server via LeiosNotify (protocol 18).
+    LeiosNotify,
+    /// Fetch endorser blocks by point from the server via LeiosFetch (protocol 19).
+    /// Params: `points` (array of "slot:hex_hash" strings or a `$varname` reference).
+    LeiosFetch,
 }
 
 impl StepKind {
@@ -290,6 +296,8 @@ impl StepKind {
             StepKind::AdvanceToSlot    => "advance_to_slot",
             StepKind::TickSlots        => "tick_slots",
             StepKind::PeerExtendsChain => "peer_extends_chain",
+            StepKind::LeiosNotify      => "leios_notify",
+            StepKind::LeiosFetch       => "leios_fetch",
         }
     }
 
@@ -302,6 +310,8 @@ impl StepKind {
                 | StepKind::BlockFetch
                 | StepKind::QueryTip
                 | StepKind::Disconnect
+                | StepKind::LeiosNotify
+                | StepKind::LeiosFetch
         )
     }
 
@@ -536,7 +546,9 @@ fn validate_connection_names(steps: &[StepDef], errors: &mut Vec<String>) {
             StepKind::Handshake
             | StepKind::ChainSync
             | StepKind::BlockFetch
-            | StepKind::QueryTip => {
+            | StepKind::QueryTip
+            | StepKind::LeiosNotify
+            | StepKind::LeiosFetch => {
                 if !open_clients.contains(&on_name) {
                     errors.push(format!(
                         "{pos}: no connection named \"{on_name}\" (create it with `connect as: \"{on_name}\"`)"
@@ -983,6 +995,32 @@ fn validate_step(
                     Some(v) => {
                         if v.as_u64().map_or(true, |n| n < 1) {
                             errors.push(format!("{pos}: tick_slots: count must be at least 1"));
+                        }
+                    }
+                }
+            }
+        }
+
+        StepKind::LeiosNotify => {
+            // count and await_timeout_secs are optional (defaults applied at runtime).
+        }
+
+        StepKind::LeiosFetch => {
+            let points_val = step.raw_params.get("points");
+            let is_ref = matches!(points_val, Some(Value::String(s)) if s.starts_with('$'));
+            if points_val.is_none() {
+                errors.push(format!("{pos}: leios_fetch requires points"));
+            } else if !is_ref {
+                if let Some(Value::Array(pts)) = points_val {
+                    for (j, pv) in pts.iter().enumerate() {
+                        if let Value::String(s) = pv {
+                            if !s.starts_with('$') {
+                                if let Err(e) = parse_point(s) {
+                                    errors.push(format!(
+                                        "{pos}: points[{j}] \"{s}\" is invalid: {e}"
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
