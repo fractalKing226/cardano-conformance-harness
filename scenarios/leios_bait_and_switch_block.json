@@ -1,0 +1,45 @@
+{
+  "name": "leios_bait_and_switch_block",
+  "description": "The server advertises EB1 via LeiosNotify block_offer (slot=100, hash=ab...) and then delivers a different block body via LeiosFetch when the client requests it. The delivered bytes are a CBOR empty map (0xa0) whose blake2b-256 hash is not ab..., so the block cannot possibly be the one that was offered. A conforming node must hash the received block bytes and verify the result matches the point it requested before storing or forwarding the block. Accepting the substituted content would allow a malicious peer to deliver arbitrary bytes under a trusted advertised identity and have them treated as a valid EB. The verifier should observe the node logging a hash mismatch and rejecting the block.",
+  "network_magic": 42,
+  "trace_output_path": "trace_leios_bait_and_switch.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3033"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client_conn",
+      "peer_id": "bait_and_switch_server"
+    },
+    {
+      "kind": "serve_leios_notify",
+      "on": "client_conn",
+      "notifications": [
+        {
+          "kind": "block_offer",
+          "point": "100:abababababababababababababababababababababababababababababababab",
+          "eb_size": 512
+        }
+      ]
+    },
+    {
+      "kind": "serve_leios_fetch",
+      "on": "client_conn",
+      "responses": [
+        {
+          "on": "fetch_block",
+          "send": {
+            "kind": "block",
+            "block_bytes": "a0"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "close_listener"
+    }
+  ]
+}

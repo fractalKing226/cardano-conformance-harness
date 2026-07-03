@@ -1,0 +1,83 @@
+{
+  "name": "leios_voter_votes_two_ebs",
+  "description": "Voter 5 votes for EB1 (slot=100, hash=ab...) in the first batch, then for EB2 (slot=101, hash=cd...) in the second batch. These are two distinct endorsement blocks so both votes are legitimate \u2014 each voter is entitled to cast one vote per EB. A node that deduplicates by voter_id alone, rather than the full (voter_id, slot, eb_hash) triple, will incorrectly discard voter 5's vote for EB2 as a duplicate of their EB1 vote. This is the false-positive failure mode of a naive deduplication implementation: it silently under-counts the vote tally for EB2, causing a correctly-voted EB to fail a threshold check it should have passed. A conforming node must accept both votes from voter 5 and count them toward their respective EBs.",
+  "network_magic": 42,
+  "trace_output_path": "trace_leios_voter_votes_two_ebs.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3031"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client_conn",
+      "peer_id": "two_eb_vote_server"
+    },
+    {
+      "kind": "serve_leios_notify",
+      "on": "client_conn",
+      "notifications": [
+        {
+          "kind": "block_offer",
+          "point": "100:abababababababababababababababababababababababababababababababab",
+          "eb_size": 512
+        },
+        {
+          "kind": "block_offer",
+          "point": "101:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "eb_size": 512
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": 100,
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 3,
+              "signature": "aabb"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 4,
+              "signature": "ccdd"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 5,
+              "signature": "eeff"
+            }
+          ]
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": 101,
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 5,
+              "signature": "1122"
+            },
+            {
+              "slot": 101,
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 6,
+              "signature": "3344"
+            },
+            {
+              "slot": 101,
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 7,
+              "signature": "5566"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "close_listener"
+    }
+  ]
+}

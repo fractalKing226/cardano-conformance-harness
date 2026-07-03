@@ -1,0 +1,78 @@
+{
+  "name": "leios_vote_for_unannounced_eb",
+  "description": "The server sends one legitimate vote batch for EB1 (slot=100, hash=ab...), which was properly advertised via block_offer. It then sends a second batch referencing an EB that was never announced or offered in this session (slot=200, hash=ef...). A conforming node must track which EBs it has been made aware of before counting votes toward them. Accepting votes for an unseen EB would allow a malicious peer to pre-accumulate phantom vote tallies for blocks that may never arrive, or to correlate vote batches with block deliveries from a different peer. The verifier should observe the node flagging the second batch as referencing an unknown EB.",
+  "network_magic": 42,
+  "trace_output_path": "trace_leios_vote_for_unannounced_eb.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3032"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client_conn",
+      "peer_id": "unannounced_eb_server"
+    },
+    {
+      "kind": "serve_leios_notify",
+      "on": "client_conn",
+      "notifications": [
+        {
+          "kind": "block_offer",
+          "point": "100:abababababababababababababababababababababababababababababababab",
+          "eb_size": 512
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": 100,
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 1,
+              "signature": "aabb"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 2,
+              "signature": "ccdd"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 3,
+              "signature": "eeff"
+            }
+          ]
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": 200,
+              "eb_hash": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+              "voter_id": 4,
+              "signature": "1122"
+            },
+            {
+              "slot": 200,
+              "eb_hash": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+              "voter_id": 5,
+              "signature": "3344"
+            },
+            {
+              "slot": 200,
+              "eb_hash": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+              "voter_id": 6,
+              "signature": "5566"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "close_listener"
+    }
+  ]
+}
