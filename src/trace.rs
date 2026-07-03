@@ -115,6 +115,14 @@ pub enum EventKind {
     /// Catch-all for unknown event_kind strings passed to emit_peer_event.
     PeerNetworkEvent,
 
+    // Server-side LeiosNotify session lifecycle
+    ServerLeiosNotifyStarted,
+    ServerLeiosNotifyCompleted,
+
+    // Server-side LeiosFetch session lifecycle
+    ServerLeiosFetchStarted,
+    ServerLeiosFetchCompleted,
+
     // LeiosNotify mini-protocol (protocol ID 18)
     LeiosNotifyStarted,
     LeiosNotifyBlockAnnouncement,

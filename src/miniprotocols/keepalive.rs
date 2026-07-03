@@ -1,9 +1,8 @@
 use std::time::Duration;
 
 use net_core::mux::{CodecRecv, CodecSend};
-use net_core::protocols::keepalive::{self, KeepAlive};
+use net_core::protocols::keepalive::{self, KeepAlive, Message};
 use net_core::protocols::{Role, Runner};
-use pallas_network::miniprotocols::keepalive::Server as KaServer;
 use serde_json::json;
 
 use crate::trace::{Direction, EventKind, TraceEvent, Tracer};
@@ -63,17 +62,24 @@ pub async fn run_keepalive(
 }
 
 /// Server-side keep-alive: respond to MsgKeepAlive pings from the peer.
-/// As the TCP acceptor (responder), we echo cookies back.
-/// Uses pallas since the server-side connection is still pallas-based.
-pub async fn run_keepalive_server(mut server: KaServer) {
+pub async fn run_keepalive_server(codec_send: CodecSend, codec_recv: CodecRecv) {
+    let mut runner = Runner::<KeepAlive>::new(Role::Server, codec_send, codec_recv);
     loop {
-        if let Err(e) = server.recv_keepalive_request().await {
-            tracing::debug!("keepalive server recv failed (connection closed): {e}");
-            break;
-        }
-        if let Err(e) = server.send_keepalive_response().await {
-            tracing::debug!("keepalive server send failed (connection closed): {e}");
-            break;
+        match runner.recv().await {
+            Ok(Message::MsgKeepAlive { cookie }) => {
+                if let Err(e) = runner.send(&Message::MsgKeepAliveResponse { cookie }).await {
+                    tracing::debug!("keepalive server send failed (connection closed): {e}");
+                    break;
+                }
+            }
+            Ok(Message::MsgDone) => break,
+            Ok(other) => {
+                tracing::warn!("keepalive server: unexpected message {other:?}");
+            }
+            Err(e) => {
+                tracing::debug!("keepalive server recv failed (connection closed): {e}");
+                break;
+            }
         }
     }
 }

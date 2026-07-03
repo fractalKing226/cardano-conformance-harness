@@ -7,7 +7,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use pallas_crypto::hash::Hasher;
 use pallas_network::miniprotocols::Point;
 
 use crate::scenario::block_fixture::BlockFixtureChain;
@@ -204,7 +203,7 @@ fn synthetic_hash(peer_id: &str, slot: u64, prev_hash: &[u8]) -> Vec<u8> {
     input.extend_from_slice(peer_id.as_bytes());
     input.extend_from_slice(&slot.to_be_bytes());
     input.extend_from_slice(prev_hash);
-    Hasher::<256>::hash(&input).as_ref().to_vec()
+    blake2b_simd::Params::new().hash_length(32).hash(&input).as_bytes().to_vec()
 }
 
 /// Minimal valid Conway header CBOR for wire consumption.

@@ -273,6 +273,12 @@ pub enum StepKind {
     /// Fetch endorser blocks by point from the server via LeiosFetch (protocol 19).
     /// Params: `points` (array of "slot:hex_hash" strings or a `$varname` reference).
     LeiosFetch,
+    /// Serve Leios notifications to the connected client via LeiosNotify (protocol 18).
+    /// Params: `notifications` (array of notification actions to send in sequence).
+    ServeLeiosNotify,
+    /// Serve Leios block fetches to the connected client via LeiosFetch (protocol 19).
+    /// Params: `responses` (array of response rules keyed by request type).
+    ServeLeiosFetch,
 }
 
 impl StepKind {
@@ -296,8 +302,10 @@ impl StepKind {
             StepKind::AdvanceToSlot    => "advance_to_slot",
             StepKind::TickSlots        => "tick_slots",
             StepKind::PeerExtendsChain => "peer_extends_chain",
-            StepKind::LeiosNotify      => "leios_notify",
-            StepKind::LeiosFetch       => "leios_fetch",
+            StepKind::LeiosNotify        => "leios_notify",
+            StepKind::LeiosFetch         => "leios_fetch",
+            StepKind::ServeLeiosNotify   => "serve_leios_notify",
+            StepKind::ServeLeiosFetch    => "serve_leios_fetch",
         }
     }
 
@@ -322,6 +330,8 @@ impl StepKind {
                 | StepKind::AcceptHandshake
                 | StepKind::ServeChainSync
                 | StepKind::ServeBlockFetch
+                | StepKind::ServeLeiosNotify
+                | StepKind::ServeLeiosFetch
                 | StepKind::CloseListener
         )
     }
@@ -563,7 +573,8 @@ fn validate_connection_names(steps: &[StepDef], errors: &mut Vec<String>) {
                 }
                 open_clients.remove(&on_name);
             }
-            StepKind::ServeChainSync | StepKind::ServeBlockFetch => {
+            StepKind::ServeChainSync | StepKind::ServeBlockFetch
+            | StepKind::ServeLeiosNotify | StepKind::ServeLeiosFetch => {
                 if !open_servers.contains(&on_name) {
                     errors.push(format!(
                         "{pos}: no server connection named \"{on_name}\" (create it with `accept_handshake as: \"{on_name}\"`)"
@@ -1025,6 +1036,10 @@ fn validate_step(
                     }
                 }
             }
+        }
+
+        StepKind::ServeLeiosNotify | StepKind::ServeLeiosFetch => {
+            // notifications/responses are optional — no required params to validate at parse time.
         }
 
         StepKind::ServeChainSync => {

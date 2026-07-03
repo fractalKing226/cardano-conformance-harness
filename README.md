@@ -11,7 +11,7 @@ separate verifier will check those traces against Agda specifications.
 Reads a scenario JSON file at startup and executes its steps in order. Supports:
 
 - **Client mode** — connect, handshake, chain-sync, block-fetch, query-tip, leios-notify, leios-fetch, sleep, disconnect
-- **Server mode** — listen, accept incoming connections, serve scripted Chain-Sync and Block-Fetch responses (honest or adversarial)
+- **Server mode** — listen, accept incoming connections, serve scripted Chain-Sync, Block-Fetch, LeiosNotify, and LeiosFetch responses (honest or adversarial)
 - **Parallel execution** — run branches of steps concurrently; abort all if any branch fails
 - **Named connections** — multiple outgoing or accepted connections in the same scenario, each with an explicit name
 - **Peer identity** — connections carry an optional `peer_id` label that propagates to every wire event for trace attribution
@@ -418,6 +418,55 @@ Executes a response script against the client's Block-Fetch session.
 
 At least one of `block_fetch_fixture_path` (with auto-generation) or `responses` is required.
 
+#### `serve_leios_notify`
+
+Executes a scripted LeiosNotify server session. For each `MsgLeiosNotificationRequestNext` from the client, the next action from the `notifications` list is executed. When the list is exhausted or `MsgDone` is received the session ends.
+
+| Parameter | Form | Description |
+|-----------|------|-------------|
+| `notifications` | explicit | Ordered list of notification actions (see below). If absent the server immediately closes. |
+
+**Action kinds:**
+
+| Kind | Key fields | Description |
+|------|-----------|-------------|
+| `block_announcement` | `header_bytes: <hex>` | Send `MsgLeiosBlockAnnouncement` with a raw header |
+| `block_offer` | `point: "slot:hex_hash"`, `eb_size: N` | Send `MsgLeiosBlockOffer` |
+| `block_txs_offer` | `point: "slot:hex_hash"` | Send `MsgLeiosBlockTxsOffer` |
+| `votes` | `votes: [{slot, eb_hash, voter_id, signature}, …]` | Send `MsgLeiosVotes` |
+| `wait` | `duration_secs: N` | Pause without sending |
+| `disconnect` | — | Drop the connection immediately |
+| `raw_bytes` | `bytes: <hex>` | Send arbitrary bytes — malformed CBOR, wrong-state messages, etc. |
+
+Emits `server_leios_notify_started` (internal) and `server_leios_notify_completed` (internal, with `notifications_sent`, `exit_reason`, and `duration_ms`).
+
+#### `serve_leios_fetch`
+
+Executes a scripted LeiosFetch server session. For each `MsgLeiosBlockRequest` from the client, the first unconsumed matching rule fires. `MsgDone` from the client ends the session.
+
+| Parameter | Form | Description |
+|-----------|------|-------------|
+| `responses` | explicit | Ordered list of response rules (see below). If absent the server closes without sending. |
+
+**Rule structure:**
+
+| Field | Description |
+|-------|-------------|
+| `on` | Trigger: `"fetch_block"`, `"done"`, or `"any"` |
+| `send` | One send object (see kinds below) |
+| `repeatable` | `true` to re-match on every subsequent request without advancing the rule index |
+
+**Send kinds:**
+
+| Kind | Key fields | Description |
+|------|-----------|-------------|
+| `block` | `block_bytes: <hex>` | Send `MsgLeiosBlock` with raw EB bytes |
+| `wait` | `duration_secs: N` | Pause without sending |
+| `disconnect` | — | Drop the connection immediately |
+| `raw_bytes` | `bytes: <hex>` | Send arbitrary bytes verbatim |
+
+Emits `server_leios_fetch_started` (internal) and `server_leios_fetch_completed` (internal, with `blocks_served`, `exit_reason`, and `duration_ms`).
+
 #### `close_listener`
 
 Stops the TCP listener. Active server connections remain open until their `serve_*` step completes. No parameters.
@@ -743,6 +792,10 @@ Each line is a self-contained JSON object.
 | `server_handshake_accepted` | internal | Responder-side handshake complete |
 | `server_block_fetch_started` | internal | Block-Fetch script begins |
 | `server_block_fetch_completed` | internal | Block-Fetch script ends; `payload.blocks_served`, `payload.exit_reason` |
+| `server_leios_notify_started` | internal | LeiosNotify server session begins |
+| `server_leios_notify_completed` | internal | LeiosNotify server session ends; `payload.notifications_sent`, `payload.exit_reason`, `payload.duration_ms` |
+| `server_leios_fetch_started` | internal | LeiosFetch server session begins |
+| `server_leios_fetch_completed` | internal | LeiosFetch server session ends; `payload.blocks_served`, `payload.exit_reason`, `payload.duration_ms` |
 | `response_rule_applied` | internal | One script rule fired; `payload.rule_index`, `payload.on`, `payload.send` |
 | `network_declared` | internal | Emitted once at scenario start when a `network` block is present; lists declared peers |
 | `slot_advanced` | internal | `advance_to_slot` or `tick_slots` fired; `payload.from_slot`, `payload.to_slot`, `payload.reason` |
@@ -840,7 +893,9 @@ src/
     blockfetch_server.rs          — Block-Fetch response script executor
     keepalive.rs                  — Keep-Alive client + server
     leios_notify.rs               — LeiosNotify N2N client (protocol 18)
+    leios_notify_server.rs        — LeiosNotify response script executor (server)
     leios_fetch.rs                — LeiosFetch N2N client (protocol 19)
+    leios_fetch_server.rs         — LeiosFetch response script executor (server)
     peersharing.rs                — Peer-Sharing stub
     txsubmission.rs               — Tx-Submission (passive receive)
   scenario/
@@ -868,8 +923,8 @@ scripts/
 
 ## What's next
 
-- **Piranha integration** — LeiosNotify and LeiosFetch step handlers are implemented; live testing against a Piranha node is blocked on protocol-format alignment between `ouroboros-leios/net-rs` and `leios-tools/net-rs` (the latter is ~5 weeks ahead and the formats are wire-incompatible)
-- **Leios adversarial scenarios** — wire-level violation test cases for LeiosNotify and LeiosFetch (wrong-state messages, malformed CBOR, truncated vote batches), derived from the Agda formal spec
+- **Piranha integration** — client-side LeiosNotify and LeiosFetch are implemented; live testing against a Piranha node is blocked on protocol-format alignment between `ouroboros-leios/net-rs` and `leios-tools/net-rs` (the latter is ~5 weeks ahead and the formats are wire-incompatible)
+- **Leios adversarial scenarios** — server-side `serve_leios_notify` and `serve_leios_fetch` handlers are now implemented; the next step is authoring wire-level violation test scenarios (wrong-state messages, malformed CBOR, truncated vote batches) to collect conformance evidence against Pallas
 - Cryptographically valid block content — real KES signatures and VRF proofs for produced blocks
 - Cross-peer state interaction — peer A's chain visible to peer B's production rule
 - Parse slot/hash/block_number from Block-Fetch block body CBOR to enable `batch_size > 1` fixture capture

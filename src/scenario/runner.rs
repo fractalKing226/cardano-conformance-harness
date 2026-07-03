@@ -10,14 +10,13 @@ use anyhow::Context as _;
 use futures::future::try_join_all;
 use net_core::bearer::tcp::TcpBearer;
 use net_core::mux::scheduler::{AnyScheduler, TrafficClass};
-use net_core::mux::{CodecRecv, CodecSend, Mux, MuxConfig, ProtocolConfig, RunningMux, MODE_INITIATOR};
+use net_core::mux::{CodecRecv, CodecSend, Mux, MuxConfig, ProtocolConfig, RunningMux, MODE_INITIATOR, MODE_RESPONDER};
 use net_core::protocols::chainsync as nc_chainsync;
+use net_core::protocols::handshake::{self as nc_handshake, n2n};
 use net_core::protocols::{Role, Runner};
 use net_core::types::Point as NcPoint;
 use pallas_network::miniprotocols::chainsync::Tip;
-use pallas_network::miniprotocols::handshake::{RefuseReason, Server as HandshakeServer};
-use pallas_network::miniprotocols::{Point, PROTOCOL_N2N_HANDSHAKE, PROTOCOL_N2N_KEEP_ALIVE as PROTOCOL_N2N_KEEP_ALIVE_SERVER};
-use pallas_network::multiplexer::{AgentChannel, Bearer, Plexer, RunningPlexer};
+use pallas_network::miniprotocols::Point;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -30,6 +29,8 @@ use crate::miniprotocols::chainsync_server::execute_response_script;
 use crate::miniprotocols::handshake::handshake_on_channels;
 use crate::miniprotocols::leios_notify::{run_leios_notify, LEIOS_NOTIFY_PROTOCOL};
 use crate::miniprotocols::leios_fetch::{run_leios_fetch, LEIOS_FETCH_PROTOCOL};
+use crate::miniprotocols::leios_notify_server::{execute_leios_notify_script, LeiosNotifyAction};
+use crate::miniprotocols::leios_fetch_server::{execute_leios_fetch_script, LeiosFetchRule};
 use crate::scenario::block_fixture;
 use crate::scenario::response_rules::{generate_for_block_fetch, generate_from_fixture, rule_def_to_script};
 use crate::miniprotocols::keepalive::{run_keepalive, run_keepalive_server, KEEP_ALIVE_INTERVAL, KEEP_ALIVE_PROTOCOL};
@@ -406,12 +407,14 @@ struct ServerListener {
 
 /// State for one accepted (server-mode) connection, indexed by name.
 struct ServerConnection {
-    plexer: RunningPlexer,
-    cs_channel: Option<AgentChannel>,
-    bf_channel: Option<AgentChannel>,
-    /// Idle but must stay alive — dropping it causes the demuxer to exit.
+    mux: RunningMux,
+    cs_channels: Option<(CodecSend, CodecRecv)>,
+    bf_channels: Option<(CodecSend, CodecRecv)>,
+    /// Idle but must stay alive — dropping closes the demuxer channel.
     #[allow(dead_code)]
-    ts_channel: Option<AgentChannel>,
+    ts_channels: Option<(CodecSend, CodecRecv)>,
+    ln_channels: Option<(CodecSend, CodecRecv)>,
+    lf_channels: Option<(CodecSend, CodecRecv)>,
     ka_handle: Option<JoinHandle<()>>,
     peer_id: Option<String>,
 }
@@ -1004,9 +1007,9 @@ fn execute_step<'a>(
                         .ok_or_else(|| anyhow::anyhow!("accept_handshake: listener \"{listener_name}\" not found"))?;
                     Arc::clone(&sl.listener)
                 };
-                let (bearer, peer_addr) = Bearer::accept_tcp(&listener_arc)
+                let (bearer, peer_addr) = TcpBearer::accept(&listener_arc)
                     .await
-                    .context("accept_handshake: Bearer::accept_tcp failed")?;
+                    .context("accept_handshake: TcpBearer::accept failed")?;
 
                 tracer
                     .emit(TraceEvent::new(EventKind::ServerBearerAccepted, Direction::Internal,
@@ -1014,50 +1017,90 @@ fn execute_step<'a>(
                         .with_connection(&conn_name))
                     .await?;
 
-                // Phase 1: subscribe all server-side channels, spawn plexer.
-                // We subscribe manually (not via PeerServer) so we retain the raw
-                // AgentChannel for chain-sync, which is needed for execute_response_script.
-                let mut plexer = Plexer::new(bearer);
-                let hs_channel = plexer.subscribe_server(PROTOCOL_N2N_HANDSHAKE);
-                let cs_channel = plexer.subscribe_server(CHAIN_SYNC_PROTOCOL);
-                let ka_channel = plexer.subscribe_server(PROTOCOL_N2N_KEEP_ALIVE_SERVER);
-                // Subscribe TX_SUBMISSION so the demuxer can route frames from the peer.
-                // Must be stored in state — if dropped, the demuxer task exits, killing all channels.
-                let ts_server_channel = plexer.subscribe_server(TX_SUBMISSION_PROTOCOL);
-                let bf_server_channel = plexer.subscribe_server(BLOCK_FETCH_PROTOCOL);
-                let server_plexer = plexer.spawn();
+                // Phase 1: register all server-side channels with the mux and spawn it.
+                let mut mux = Mux::new(MuxConfig::default(), AnyScheduler::default(), MODE_RESPONDER);
+                let (hs_send, hs_recv) = mux.register(&ProtocolConfig {
+                    id: net_core::protocols::handshake::PROTOCOL_ID,
+                    traffic_class: TrafficClass::Priority,
+                    ingress_limit: net_core::protocols::handshake::SIZE_LIMIT,
+                    egress_queue_size: 4,
+                });
+                let (cs_send, cs_recv) = mux.register(&ProtocolConfig {
+                    id: CHAIN_SYNC_PROTOCOL,
+                    traffic_class: TrafficClass::Default(1),
+                    ingress_limit: net_core::protocols::chainsync::INGRESS_LIMIT,
+                    egress_queue_size: 16,
+                });
+                let (bf_send, bf_recv) = mux.register(&ProtocolConfig {
+                    id: BLOCK_FETCH_PROTOCOL,
+                    traffic_class: TrafficClass::Default(1),
+                    ingress_limit: net_core::protocols::blockfetch::INGRESS_LIMIT,
+                    egress_queue_size: 16,
+                });
+                let (ts_send, ts_recv) = mux.register(&ProtocolConfig {
+                    id: TX_SUBMISSION_PROTOCOL,
+                    traffic_class: TrafficClass::Default(1),
+                    ingress_limit: net_core::protocols::txsubmission::INGRESS_LIMIT,
+                    egress_queue_size: 16,
+                });
+                let (ka_send, ka_recv) = mux.register(&ProtocolConfig {
+                    id: KEEP_ALIVE_PROTOCOL,
+                    traffic_class: TrafficClass::Default(1),
+                    ingress_limit: net_core::protocols::keepalive::INGRESS_LIMIT,
+                    egress_queue_size: 4,
+                });
+                let (ln_send, ln_recv) = mux.register(&ProtocolConfig {
+                    id: LEIOS_NOTIFY_PROTOCOL,
+                    traffic_class: TrafficClass::Default(1),
+                    ingress_limit: net_core::protocols::leios_notify::INGRESS_LIMIT,
+                    egress_queue_size: 16,
+                });
+                let (lf_send, lf_recv) = mux.register(&ProtocolConfig {
+                    id: LEIOS_FETCH_PROTOCOL,
+                    traffic_class: TrafficClass::Default(1),
+                    ingress_limit: net_core::protocols::leios_fetch::INGRESS_LIMIT,
+                    egress_queue_size: 16,
+                });
+                let server_mux = mux.run(bearer);
 
                 // Phase 2: complete the handshake as responder.
-                let mut hs = HandshakeServer::<pallas_network::miniprotocols::handshake::n2n::VersionData>::new(hs_channel);
-                let client_table = hs.receive_proposed_versions().await
-                    .context("accept_handshake: receive_proposed_versions failed")?;
-                let mut proposed_versions: Vec<u64> = client_table.values.keys().cloned().collect();
-                proposed_versions.sort();
+                let proposed_versions = Arc::new(Mutex::new(Vec::<u64>::new()));
+                let pv_capture = Arc::clone(&proposed_versions);
+                let server_data = n2n::VersionData {
+                    network_magic,
+                    initiator_only_diffusion_mode: false,
+                    peer_sharing: 0,
+                    query: false,
+                };
+                let hs_result = nc_handshake::run_server(
+                    CodecSend::new(hs_send),
+                    CodecRecv::new(hs_recv),
+                    move |client_table| {
+                        *pv_capture.lock().unwrap() = client_table.keys().cloned().collect();
+                        n2n::negotiate(client_table, &server_data)
+                    },
+                ).await;
+
+                let mut proposed_vers = proposed_versions.lock().unwrap().clone();
+                proposed_vers.sort();
 
                 tracer
                     .emit(TraceEvent::new(EventKind::HandshakeVersionProposed, Direction::Received,
-                        json!({ "versions": proposed_versions, "magic": network_magic }))
+                        json!({ "versions": proposed_vers, "magic": network_magic }))
                         .with_connection(&conn_name))
                     .await?;
 
-                let server_supported: Vec<u64> = (7u64..=14).collect();
-                let mut client_pairs: Vec<(u64, _)> = client_table.values.into_iter().collect();
-                client_pairs.sort_by(|a, b| b.0.cmp(&a.0));
-                let (version, client_data): (u64, pallas_network::miniprotocols::handshake::n2n::VersionData) =
-                    match client_pairs.into_iter().find(|(v, _)| server_supported.contains(v)) {
-                        Some(pair) => pair,
-                        None => {
-                            let _ = hs.refuse(RefuseReason::VersionMismatch(server_supported)).await;
-                            anyhow::bail!("accept_handshake: no common version (proposed: {proposed_versions:?})");
-                        }
-                    };
-
-                hs.accept_version(version, client_data.clone()).await
-                    .context("accept_handshake: accept_version failed")?;
+                let version = match hs_result {
+                    Ok((v, _)) => v,
+                    Err(e) => {
+                        server_mux.abort();
+                        anyhow::bail!("accept_handshake: handshake failed: {e}");
+                    }
+                };
 
                 tracer
                     .emit(TraceEvent::new(EventKind::HandshakeVersionAccepted, Direction::Sent,
-                        json!({ "version": version, "peer_data": format!("{client_data:?}") }))
+                        json!({ "version": version }))
                         .with_connection(&conn_name))
                     .await?;
                 tracer
@@ -1066,8 +1109,10 @@ fn execute_step<'a>(
                         .with_connection(&conn_name))
                     .await?;
 
-                let ka_server = pallas_network::miniprotocols::keepalive::Server::new(ka_channel);
-                let ka_handle = tokio::spawn(run_keepalive_server(ka_server));
+                let ka_handle = tokio::spawn(run_keepalive_server(
+                    CodecSend::new(ka_send),
+                    CodecRecv::new(ka_recv),
+                ));
                 tracer
                     .emit(TraceEvent::new(EventKind::ProtocolWorkersStarted, Direction::Internal,
                         json!({ "protocols": ["keep-alive"] }))
@@ -1076,10 +1121,12 @@ fn execute_step<'a>(
 
                 info!(version, %peer_addr, conn = conn_name, "Handshake accepted as server");
                 state.server_connections.lock().unwrap().insert(conn_name, ServerConnection {
-                    plexer: server_plexer,
-                    cs_channel: Some(cs_channel),
-                    bf_channel: Some(bf_server_channel),
-                    ts_channel: Some(ts_server_channel),
+                    mux: server_mux,
+                    cs_channels: Some((CodecSend::new(cs_send), CodecRecv::new(cs_recv))),
+                    bf_channels: Some((CodecSend::new(bf_send), CodecRecv::new(bf_recv))),
+                    ts_channels: Some((CodecSend::new(ts_send), CodecRecv::new(ts_recv))),
+                    ln_channels: Some((CodecSend::new(ln_send), CodecRecv::new(ln_recv))),
+                    lf_channels: Some((CodecSend::new(lf_send), CodecRecv::new(lf_recv))),
                     ka_handle: Some(ka_handle),
                     peer_id: params.peer_id.clone(),
                 });
@@ -1090,7 +1137,7 @@ fn execute_step<'a>(
                 let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
                 let mut co = CheckedOut::take(&state.server_connections, &conn_name)?;
                 let sc = co.get_mut();
-                let mut cs_channel = sc.cs_channel.take()
+                let (cs_send, mut cs_recv) = sc.cs_channels.take()
                     .ok_or_else(|| anyhow::anyhow!("serve_chain_sync: no chain-sync channel"))?;
 
                 // as_peer: clone the peer's current chain (filtered by slot) from PeerState
@@ -1155,7 +1202,8 @@ fn execute_step<'a>(
                 };
 
                 let summary = execute_response_script(
-                    &mut cs_channel,
+                    &cs_send,
+                    &mut cs_recv,
                     &script,
                     fixture_opt.as_ref(),
                     &eff_trc,
@@ -1175,7 +1223,7 @@ fn execute_step<'a>(
                 let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
                 let mut co = CheckedOut::take(&state.server_connections, &conn_name)?;
                 let sc = co.get_mut();
-                let mut bf_channel = sc.bf_channel.take()
+                let (bf_send, mut bf_recv) = sc.bf_channels.take()
                     .ok_or_else(|| anyhow::anyhow!("serve_block_fetch: no block-fetch channel"))?;
 
                 // as_peer: clone the peer's block_store from PeerState and override peer_id.
@@ -1226,7 +1274,8 @@ fn execute_step<'a>(
                 };
 
                 let summary = execute_block_fetch_script(
-                    &mut bf_channel,
+                    &bf_send,
+                    &mut bf_recv,
                     &script,
                     bf_fixture_opt.as_ref(),
                     &eff_trc,
@@ -1238,6 +1287,40 @@ fn execute_step<'a>(
                     duration_ms   = summary.duration_ms,
                     "serve_block_fetch step complete"
                 );
+                Ok(())
+            }
+
+            StepKind::ServeLeiosNotify => {
+                let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
+                let mut co = CheckedOut::take(&state.server_connections, &conn_name)?;
+                let sc = co.get_mut();
+                let (ln_send, ln_recv) = sc.ln_channels.take()
+                    .ok_or_else(|| anyhow::anyhow!("serve_leios_notify: no leios-notify channel"))?;
+                let actions: Vec<LeiosNotifyAction> = match step.raw_params.get("notifications") {
+                    Some(v) => serde_json::from_value((*v).clone())
+                        .context("serve_leios_notify: parsing notifications")?,
+                    None => vec![],
+                };
+                let eff_trc = tracer.for_peer_opt(sc.peer_id.clone());
+                let summary = execute_leios_notify_script(ln_send, ln_recv, actions, &eff_trc).await?;
+                info!(notifications_sent = summary.notifications_sent, "serve_leios_notify complete");
+                Ok(())
+            }
+
+            StepKind::ServeLeiosFetch => {
+                let conn_name = step.on_name.as_deref().unwrap_or("default").to_string();
+                let mut co = CheckedOut::take(&state.server_connections, &conn_name)?;
+                let sc = co.get_mut();
+                let (lf_send, lf_recv) = sc.lf_channels.take()
+                    .ok_or_else(|| anyhow::anyhow!("serve_leios_fetch: no leios-fetch channel"))?;
+                let rules: Vec<LeiosFetchRule> = match step.raw_params.get("responses") {
+                    Some(v) => serde_json::from_value((*v).clone())
+                        .context("serve_leios_fetch: parsing responses")?,
+                    None => vec![],
+                };
+                let eff_trc = tracer.for_peer_opt(sc.peer_id.clone());
+                let summary = execute_leios_fetch_script(lf_send, lf_recv, rules, &eff_trc).await?;
+                info!(blocks_served = summary.blocks_served, "serve_leios_fetch complete");
                 Ok(())
             }
 
@@ -1593,7 +1676,7 @@ async fn cleanup(state: &mut RunnerState, tracer: &Tracer) {
         state.server_connections.lock().unwrap().drain().collect();
     for (name, mut sc) in server_conns {
         if let Some(h) = sc.ka_handle.take() { h.abort(); }
-        sc.plexer.abort().await;
+        sc.mux.abort();
         let _ = tracer.emit(TraceEvent::new(EventKind::ConnectionClosed, Direction::Internal,
             json!({ "reason": "scenario_aborted" })).with_connection(&name)).await;
     }

@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
-use pallas_codec::minicbor;
+use bytes::Bytes;
+use net_core::mux::{CodecRecv, CodecSend};
 use pallas_network::miniprotocols::blockfetch::Message;
 use pallas_network::miniprotocols::Point;
-use pallas_network::multiplexer::{AgentChannel, Error as PlexerError, MAX_SEGMENT_PAYLOAD_LENGTH};
 use serde_json::json;
 use tracing::{debug, info, warn};
 
@@ -74,12 +74,12 @@ pub struct BlockFetchServerSummary {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-/// Execute a Block-Fetch response script on a raw server-side channel.
+/// Execute a Block-Fetch response script on a server-side channel.
 ///
 /// The harness has no opinion about whether responses are spec-conformant.
-/// Every send uses `enqueue_chunk` directly, bypassing Pallas's state machine.
 pub async fn execute_block_fetch_script(
-    channel: &mut AgentChannel,
+    codec_send: &CodecSend,
+    codec_recv: &mut CodecRecv,
     rules: &[ScriptRule],
     fixture: Option<&BlockFixtureChain>,
     tracer: &Tracer,
@@ -107,7 +107,7 @@ pub async fn execute_block_fetch_script(
         .await?;
 
     loop {
-        let request = match recv_request(channel).await {
+        let request = match recv_request(codec_recv).await {
             Ok(r) => r,
             Err(e) => {
                 warn!("Block-Fetch server recv error: {e}");
@@ -161,7 +161,7 @@ pub async fn execute_block_fetch_script(
         let done = execute_send(
             &rule.send,
             &request,
-            channel,
+            codec_send,
             fixture,
             tracer,
             state,
@@ -211,7 +211,7 @@ pub async fn execute_block_fetch_script(
 async fn execute_send(
     send: &ScriptSend,
     request: &BlockFetchRequest,
-    channel: &mut AgentChannel,
+    codec_send: &CodecSend,
     fixture: Option<&BlockFixtureChain>,
     tracer: &Tracer,
     state_before: ServerBfState,
@@ -222,20 +222,20 @@ async fn execute_send(
     if let ScriptSend::SendSequence { sends } = send {
         for sub_send in sends {
             let sub_before = *state;
-            if execute_single_send(sub_send, request, channel, fixture, tracer, sub_before, state, blocks_served, no_blocks_responses).await? {
+            if execute_single_send(sub_send, request, codec_send, fixture, tracer, sub_before, state, blocks_served, no_blocks_responses).await? {
                 return Ok(true);
             }
         }
         return Ok(false);
     }
-    execute_single_send(send, request, channel, fixture, tracer, state_before, state, blocks_served, no_blocks_responses).await
+    execute_single_send(send, request, codec_send, fixture, tracer, state_before, state, blocks_served, no_blocks_responses).await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_single_send(
     send: &ScriptSend,
     request: &BlockFetchRequest,
-    channel: &mut AgentChannel,
+    codec_send: &CodecSend,
     fixture: Option<&BlockFixtureChain>,
     tracer: &Tracer,
     state_before: ServerBfState,
@@ -245,7 +245,7 @@ async fn execute_single_send(
 ) -> anyhow::Result<bool> {
     match send {
         ScriptSend::NoBlocks => {
-            send_message(channel, &Message::NoBlocks).await?;
+            send_message(codec_send, &Message::NoBlocks).await?;
             *state = ServerBfState::Idle;
             *no_blocks_responses += 1;
             tracer
@@ -257,7 +257,7 @@ async fn execute_single_send(
         }
 
         ScriptSend::StartBatch => {
-            send_message(channel, &Message::StartBatch).await?;
+            send_message(codec_send, &Message::StartBatch).await?;
             *state = ServerBfState::Streaming;
             tracer
                 .emit(
@@ -270,7 +270,7 @@ async fn execute_single_send(
         ScriptSend::Block { source } => {
             let body = block_source_bytes(source);
             let (slot, hash) = block_source_ident(source);
-            send_message(channel, &Message::Block { body }).await?;
+            send_message(codec_send, &Message::Block { body }).await?;
             *blocks_served += 1;
             debug!(slot, "Served block");
             tracer
@@ -286,7 +286,7 @@ async fn execute_single_send(
         }
 
         ScriptSend::BatchDone => {
-            send_message(channel, &Message::BatchDone).await?;
+            send_message(codec_send, &Message::BatchDone).await?;
             *state = ServerBfState::Idle;
             tracer
                 .emit(
@@ -313,14 +313,12 @@ async fn execute_single_send(
                                 .iter()
                                 .map(|e| {
                                     let bytes = e.body_bytes();
-                                    let len = bytes.len();
-                                    let _ = len;
                                     (bytes, e.slot, e.block_hash.clone())
                                 })
                                 .collect(),
                             None => {
                                 // Unsatisfiable range → send NoBlocks.
-                                send_message(channel, &Message::NoBlocks).await?;
+                                send_message(codec_send, &Message::NoBlocks).await?;
                                 *state = ServerBfState::Idle;
                                 *no_blocks_responses += 1;
                                 tracer
@@ -339,7 +337,7 @@ async fn execute_single_send(
             };
 
             if entries.is_empty() {
-                send_message(channel, &Message::NoBlocks).await?;
+                send_message(codec_send, &Message::NoBlocks).await?;
                 *state = ServerBfState::Idle;
                 *no_blocks_responses += 1;
                 tracer
@@ -352,7 +350,7 @@ async fn execute_single_send(
             }
 
             // StartBatch
-            send_message(channel, &Message::StartBatch).await?;
+            send_message(codec_send, &Message::StartBatch).await?;
             *state = ServerBfState::Streaming;
             tracer
                 .emit(
@@ -364,7 +362,7 @@ async fn execute_single_send(
             let batch_count = entries.len() as u64;
             for (body, slot, hash) in &entries {
                 let cbor_len = body.len();
-                send_message(channel, &Message::Block { body: body.clone() }).await?;
+                send_message(codec_send, &Message::Block { body: body.clone() }).await?;
                 *blocks_served += 1;
                 debug!(slot, "Served block in stream_batch");
                 tracer
@@ -380,7 +378,7 @@ async fn execute_single_send(
             }
 
             // BatchDone
-            send_message(channel, &Message::BatchDone).await?;
+            send_message(codec_send, &Message::BatchDone).await?;
             *state = ServerBfState::Idle;
             tracer
                 .emit(
@@ -405,7 +403,7 @@ async fn execute_single_send(
         }
 
         ScriptSend::RawBytes { bytes } => {
-            send_raw(channel, bytes).await?;
+            send_raw(codec_send, bytes).await?;
             tracer
                 .emit(TraceEvent::new(
                     EventKind::Error,
@@ -429,43 +427,30 @@ async fn execute_single_send(
 
 // ── Raw channel I/O ───────────────────────────────────────────────────────────
 
-async fn recv_request(channel: &mut AgentChannel) -> anyhow::Result<BlockFetchRequest> {
-    let mut buf = Vec::new();
-    loop {
-        let chunk = channel
-            .dequeue_chunk()
-            .await
-            .map_err(|e: PlexerError| anyhow::anyhow!("bf channel recv: {e}"))?;
-        buf.extend_from_slice(&chunk);
-        let mut decoder = minicbor::Decoder::new(&buf);
-        match decoder.decode::<Message>() {
-            Ok(msg) => {
-                return Ok(match msg {
-                    Message::RequestRange { range: (from, to) } => BlockFetchRequest::RequestRange(from, to),
-                    Message::ClientDone                          => BlockFetchRequest::ClientDone,
-                    other => anyhow::bail!("unexpected Block-Fetch client message: {other:?}"),
-                });
-            }
-            Err(ref e) if e.is_end_of_input() => continue,
-            Err(e) => anyhow::bail!("Block-Fetch decode error: {e}"),
-        }
+async fn recv_request(codec_recv: &mut CodecRecv) -> anyhow::Result<BlockFetchRequest> {
+    let msg = codec_recv
+        .recv::<Message>(1 << 20)
+        .await
+        .map_err(|e| anyhow::anyhow!("block-fetch server recv: {e}"))?;
+    match msg {
+        Message::RequestRange { range: (from, to) } => Ok(BlockFetchRequest::RequestRange(from, to)),
+        Message::ClientDone                          => Ok(BlockFetchRequest::ClientDone),
+        other => anyhow::bail!("unexpected Block-Fetch client message: {other:?}"),
     }
 }
 
-async fn send_message(channel: &mut AgentChannel, msg: &Message) -> anyhow::Result<()> {
-    let bytes = minicbor::to_vec(msg)
-        .map_err(|e| anyhow::anyhow!("Block-Fetch CBOR encode: {e}"))?;
-    send_raw(channel, &bytes).await
+async fn send_message(codec_send: &CodecSend, msg: &Message) -> anyhow::Result<()> {
+    codec_send
+        .send(msg)
+        .await
+        .map_err(|e| anyhow::anyhow!("block-fetch server send: {e}"))
 }
 
-async fn send_raw(channel: &mut AgentChannel, bytes: &[u8]) -> anyhow::Result<()> {
-    for chunk in bytes.chunks(MAX_SEGMENT_PAYLOAD_LENGTH) {
-        channel
-            .enqueue_chunk(chunk.to_vec())
-            .await
-            .map_err(|e: PlexerError| anyhow::anyhow!("bf channel send: {e}"))?;
-    }
-    Ok(())
+async fn send_raw(codec_send: &CodecSend, bytes: &[u8]) -> anyhow::Result<()> {
+    codec_send
+        .send_raw(Bytes::from(bytes.to_vec()))
+        .await
+        .map_err(|e| anyhow::anyhow!("block-fetch server send_raw: {e}"))
 }
 
 // ── Receive event emission ────────────────────────────────────────────────────

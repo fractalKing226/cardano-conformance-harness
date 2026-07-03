@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
-use pallas_codec::minicbor;
+use bytes::Bytes;
+use net_core::mux::{CodecRecv, CodecSend};
 use pallas_network::miniprotocols::chainsync::{HeaderContent, Message, Tip};
 use pallas_network::miniprotocols::Point;
-use pallas_network::multiplexer::{AgentChannel, Error as PlexerError, MAX_SEGMENT_PAYLOAD_LENGTH};
 use serde_json::json;
 use tracing::{debug, info, warn};
 
@@ -17,10 +17,10 @@ const MINI_PROTOCOL: &str = "chain-sync";
 
 /// Independent protocol state tracker for trace annotation.
 ///
-/// The serve loop maintains this explicitly because `enqueue_chunk` bypasses
-/// Pallas's typed state machine. If a rule sends a message that is illegal in
-/// the tracked state, the annotation reflects that — which is exactly the
-/// diagnostic information a verifier needs to detect protocol violations.
+/// The serve loop maintains this explicitly because we bypass the typed state
+/// machine. If a rule sends a message illegal in the tracked state, the
+/// annotation reflects that — exactly the diagnostic information a verifier
+/// needs to detect protocol violations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerCsState {
     Idle,
@@ -99,7 +99,6 @@ impl ReceivedRequest {
             (ReceivedRequest::RequestNext, On::RequestNext)         => true,
             (ReceivedRequest::Done, On::Done)                       => true,
             _ => false,
-            // On::RequestRange never matches a Chain-Sync request.
         }
     }
 }
@@ -117,17 +116,18 @@ pub struct ChainSyncServerSummary {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-/// Execute a response script on a raw Chain-Sync channel.
+/// Execute a response script on a Chain-Sync server channel.
 ///
 /// This is the single execution path for both fixture-generated honest scripts
 /// and user-specified adversarial scripts. The `rules` slice is consumed in
 /// order; `cursor` and `fixture` are only consulted by `CursorFindIntersect`
 /// and `CursorAdvance` rules.
 ///
-/// All sends use `enqueue_chunk` directly, bypassing Pallas's typed state
-/// machine. The harness has no opinion on whether a rule is spec-correct.
+/// All sends bypass the typed state machine. The harness has no opinion on
+/// whether a rule is spec-correct.
 pub async fn execute_response_script(
-    channel: &mut AgentChannel,
+    codec_send: &CodecSend,
+    codec_recv: &mut CodecRecv,
     rules: &[ScriptRule],
     fixture: Option<&FixtureChain>,
     tracer: &Tracer,
@@ -157,7 +157,7 @@ pub async fn execute_response_script(
 
     loop {
         // Receive the next message from the client.
-        let request = match recv_request(channel).await {
+        let request = match recv_request(codec_recv).await {
             Ok(r) => r,
             Err(e) => {
                 warn!("Chain-Sync server recv error: {e}");
@@ -184,7 +184,6 @@ pub async fn execute_response_script(
 
         let rule = match rule_pos {
             Some(pos) => {
-                // Only advance past the rule if it is not marked repeatable.
                 if !rules[pos].repeatable {
                     rule_idx = pos + 1;
                 }
@@ -199,7 +198,6 @@ pub async fn execute_response_script(
             }
         };
 
-        // Emit ResponseRuleApplied before executing.
         tracer
             .emit(TraceEvent::new(
                 EventKind::ResponseRuleApplied,
@@ -215,11 +213,10 @@ pub async fn execute_response_script(
 
         let state_before_send = state;
 
-        // Execute the rule.
         let done = execute_send(
             rule,
             &request,
-            channel,
+            codec_send,
             cursor.as_mut(),
             fixture,
             tracer,
@@ -281,7 +278,7 @@ pub async fn execute_response_script(
 async fn execute_send(
     rule: &ScriptRule,
     request: &ReceivedRequest,
-    channel: &mut AgentChannel,
+    codec_send: &CodecSend,
     cursor: Option<&mut Cursor<'_>>,
     fixture: Option<&FixtureChain>,
     tracer: &Tracer,
@@ -304,7 +301,7 @@ async fn execute_send(
                     cursor.set_pos(pos);
                     let found_pt = cursor.current_point();
                     let msg = Message::<HeaderContent>::IntersectFound(found_pt.clone(), tip.clone());
-                    send_message(channel, &msg).await?;
+                    send_message(codec_send, &msg).await?;
                     tracer
                         .emit(
                             TraceEvent::new(
@@ -321,7 +318,7 @@ async fn execute_send(
                 }
                 None => {
                     let msg = Message::<HeaderContent>::IntersectNotFound(tip.clone());
-                    send_message(channel, &msg).await?;
+                    send_message(codec_send, &msg).await?;
                     tracer
                         .emit(
                             TraceEvent::new(
@@ -343,7 +340,7 @@ async fn execute_send(
                 Some(entry) => {
                     let hc = entry_to_header_content(entry);
                     let msg = Message::RollForward(hc, tip.clone());
-                    send_message(channel, &msg).await?;
+                    send_message(codec_send, &msg).await?;
                     *headers_served += 1;
                     debug!(slot = entry.slot, "Served header via CursorAdvance");
                     tracer
@@ -364,10 +361,9 @@ async fn execute_send(
                         .await?;
                 }
                 None => {
-                    // Cursor at tip — send AwaitReply (same as AwaitReply with hold=0).
                     *await_triggered = true;
                     let msg = Message::<HeaderContent>::AwaitReply;
-                    send_message(channel, &msg).await?;
+                    send_message(codec_send, &msg).await?;
                     tracer
                         .emit(
                             TraceEvent::new(
@@ -388,7 +384,7 @@ async fn execute_send(
             let hc = header_source_to_content(source);
             let (slot, hash, block_number) = extract_header_info(source);
             let msg = Message::RollForward(hc, wire_tip.clone());
-            send_message(channel, &msg).await?;
+            send_message(codec_send, &msg).await?;
             *headers_served += 1;
             tracer
                 .emit(
@@ -412,7 +408,7 @@ async fn execute_send(
             let wire_tip = tip_spec_to_tip(tip.as_ref(), fixture_tip.as_ref());
             let pt = parse_point_str(point)?;
             let msg = Message::<HeaderContent>::RollBackward(pt.clone(), wire_tip.clone());
-            send_message(channel, &msg).await?;
+            send_message(codec_send, &msg).await?;
             tracer
                 .emit(
                     TraceEvent::new(
@@ -433,7 +429,7 @@ async fn execute_send(
             let wire_tip = tip_spec_to_tip(tip.as_ref(), fixture_tip.as_ref());
             let pt = parse_point_str(point)?;
             let msg = Message::<HeaderContent>::IntersectFound(pt.clone(), wire_tip.clone());
-            send_message(channel, &msg).await?;
+            send_message(codec_send, &msg).await?;
             *intersects_handled += 1;
             tracer
                 .emit(
@@ -454,7 +450,7 @@ async fn execute_send(
             let fixture_tip = fixture.map(|f| f.tip());
             let wire_tip = tip_spec_to_tip(tip.as_ref(), fixture_tip.as_ref());
             let msg = Message::<HeaderContent>::IntersectNotFound(wire_tip.clone());
-            send_message(channel, &msg).await?;
+            send_message(codec_send, &msg).await?;
             tracer
                 .emit(
                     TraceEvent::new(
@@ -470,7 +466,7 @@ async fn execute_send(
         ScriptSend::AwaitReply { hold_secs } => {
             *await_triggered = true;
             let msg = Message::<HeaderContent>::AwaitReply;
-            send_message(channel, &msg).await?;
+            send_message(codec_send, &msg).await?;
             tracer
                 .emit(
                     TraceEvent::new(
@@ -489,7 +485,6 @@ async fn execute_send(
         ScriptSend::Wait { duration_secs } => {
             info!(secs = duration_secs, "Script wait");
             tokio::time::sleep(Duration::from_secs(*duration_secs)).await;
-            // No wire event emitted; no state change.
             return Ok(false);
         }
 
@@ -499,7 +494,7 @@ async fn execute_send(
         }
 
         ScriptSend::RawBytes { bytes } => {
-            send_raw(channel, bytes).await?;
+            send_raw(codec_send, bytes).await?;
             tracer
                 .emit(TraceEvent::new(
                     EventKind::Error,
@@ -520,53 +515,37 @@ async fn execute_send(
 
 // ── Raw channel I/O ───────────────────────────────────────────────────────────
 
-/// Receive one complete Chain-Sync message from the raw channel.
-async fn recv_request(channel: &mut AgentChannel) -> anyhow::Result<ReceivedRequest> {
-    let mut buf = Vec::new();
-    loop {
-        let chunk = channel.dequeue_chunk().await
-            .map_err(|e: PlexerError| anyhow::anyhow!("channel recv: {e}"))?;
-        buf.extend_from_slice(&chunk);
-        let mut decoder = minicbor::Decoder::new(&buf);
-        match decoder.decode::<Message<HeaderContent>>() {
-            Ok(msg) => {
-                return Ok(match msg {
-                    Message::FindIntersect(pts) => ReceivedRequest::FindIntersect(pts),
-                    Message::RequestNext        => ReceivedRequest::RequestNext,
-                    Message::Done               => ReceivedRequest::Done,
-                    other => anyhow::bail!(
-                        "unexpected Chain-Sync client message in server loop: {other:?}"
-                    ),
-                });
-            }
-            Err(ref e) if e.is_end_of_input() => {
-                // Incomplete — wait for more chunks.
-                continue;
-            }
-            Err(e) => anyhow::bail!("Chain-Sync decode error: {e}"),
-        }
+/// Receive one complete Chain-Sync message from the codec.
+async fn recv_request(codec_recv: &mut CodecRecv) -> anyhow::Result<ReceivedRequest> {
+    let msg = codec_recv
+        .recv::<Message<HeaderContent>>(1 << 20)
+        .await
+        .map_err(|e| anyhow::anyhow!("chain-sync server recv: {e}"))?;
+    match msg {
+        Message::FindIntersect(pts) => Ok(ReceivedRequest::FindIntersect(pts)),
+        Message::RequestNext        => Ok(ReceivedRequest::RequestNext),
+        Message::Done               => Ok(ReceivedRequest::Done),
+        other => anyhow::bail!("unexpected Chain-Sync client message in server loop: {other:?}"),
     }
 }
 
-/// CBOR-encode a Chain-Sync message and send it as one or more chunks.
+/// CBOR-encode a Chain-Sync message and send it.
 async fn send_message(
-    channel: &mut AgentChannel,
+    codec_send: &CodecSend,
     msg: &Message<HeaderContent>,
 ) -> anyhow::Result<()> {
-    let bytes = minicbor::to_vec(msg)
-        .map_err(|e| anyhow::anyhow!("CBOR encode: {e}"))?;
-    send_raw(channel, &bytes).await
+    codec_send
+        .send(msg)
+        .await
+        .map_err(|e| anyhow::anyhow!("chain-sync server send: {e}"))
 }
 
-/// Send arbitrary bytes, chunking at the multiplexer segment limit.
-pub async fn send_raw(channel: &mut AgentChannel, bytes: &[u8]) -> anyhow::Result<()> {
-    for chunk in bytes.chunks(MAX_SEGMENT_PAYLOAD_LENGTH) {
-        channel
-            .enqueue_chunk(chunk.to_vec())
-            .await
-            .map_err(|e: PlexerError| anyhow::anyhow!("channel send: {e}"))?;
-    }
-    Ok(())
+/// Send arbitrary pre-encoded bytes (for adversarial raw_bytes rules).
+pub async fn send_raw(codec_send: &CodecSend, bytes: &[u8]) -> anyhow::Result<()> {
+    codec_send
+        .send_raw(Bytes::from(bytes.to_vec()))
+        .await
+        .map_err(|e| anyhow::anyhow!("chain-sync server send_raw: {e}"))
 }
 
 // ── Receive event emission ────────────────────────────────────────────────────

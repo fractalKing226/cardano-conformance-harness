@@ -1,4 +1,5 @@
 /target
+/doc
 /devnet
 *.jsonl
 /fixtures/*.jsonl

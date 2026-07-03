@@ -5,6 +5,8 @@ pub mod chainsync_server;
 pub mod handshake;
 pub mod keepalive;
 pub mod leios_fetch;
+pub mod leios_fetch_server;
 pub mod leios_notify;
+pub mod leios_notify_server;
 pub mod peersharing;
 pub mod txsubmission;
