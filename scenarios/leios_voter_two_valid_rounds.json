@@ -1,20 +1,20 @@
 {
-  "name": "leios_voter_votes_two_ebs",
-  "description": "Voter 5 votes for EB1 (hash=ab..) and EB2 (hash=cd..) in the same pipeline slot. Both EBs are distinct endorsement blocks so both votes are legitimate — the deduplication key is (voter_id, slot, eb_hash) and the differing eb_hash makes these two different entries. A node that deduplicates by (voter_id, slot) alone, ignoring the eb_hash dimension, will incorrectly discard voter 5's vote for EB2 as a duplicate of their EB1 vote. This is the false-positive failure mode of a deduplication implementation that omits the EB hash from the key: it silently under-counts the vote tally for EB2, causing a correctly-voted EB to fail a threshold check it should have passed. A conforming node must accept both votes and count them toward their respective EBs.",
+  "name": "leios_voter_two_valid_rounds",
+  "description": "Voter 7 votes legitimately in two distinct pipeline rounds: the current round ($current_slot) for EB1 (hash=abab..) and a past round ($current_slot_minus_100) for EB2 (hash=cdcd..). These are different (slot, eb_hash) tuples so both votes are independently valid — the Leios spec only prohibits a voter from voting twice for the SAME (slot, eb_hash). The vote deduplication key is (voter_id, slot, eb_hash); an implementation that uses only (voter_id, eb_hash) as the key, omitting the slot dimension, would incorrectly reject voter 7's second vote because EB1 and EB2 have different hashes. More importantly, an implementation deduplicating by (voter_id, slot) and ignoring the eb_hash would reject the second vote because the slots differ. A conforming node must accept both votes and credit voter 7's weight once toward each respective EB tally. This scenario is the valid complement of leios_voter_votes_two_ebs, which tests the case where the same voter votes for two EBs in the same pipeline slot.",
   "network_magic": 42,
-  "trace_output_path": "trace_leios_voter_votes_two_ebs.jsonl",
+  "trace_output_path": "trace_leios_voter_two_valid_rounds.jsonl",
   "expected_outcome": "success",
   "sut_genesis_time_unix": 1783591775,
   "sut_slot_duration_ms": 1000,
   "steps": [
     {
       "kind": "listen",
-      "bind_address": "0.0.0.0:3031"
+      "bind_address": "0.0.0.0:3039"
     },
     {
       "kind": "accept_handshake",
       "as": "client_conn",
-      "peer_id": "two_eb_vote_server"
+      "peer_id": "two_valid_rounds_server"
     },
     {
       "kind": "serve_leios_notify",
@@ -27,7 +27,7 @@
         },
         {
           "kind": "block_offer",
-          "point": "${current_slot}:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "point": "${current_slot_minus_100}:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
           "eb_size": 512
         },
         {
@@ -36,20 +36,20 @@
             {
               "slot": "$current_slot",
               "eb_hash": "abababababababababababababababababababababababababababababababab",
-              "voter_id": 3,
-              "signature": "aabb"
-            },
-            {
-              "slot": "$current_slot",
-              "eb_hash": "abababababababababababababababababababababababababababababababab",
-              "voter_id": 4,
-              "signature": "ccdd"
-            },
-            {
-              "slot": "$current_slot",
-              "eb_hash": "abababababababababababababababababababababababababababababababab",
               "voter_id": 5,
-              "signature": "eeff"
+              "signature": "aa05"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 6,
+              "signature": "aa06"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 7,
+              "signature": "aa07"
             }
           ]
         },
@@ -57,22 +57,22 @@
           "kind": "votes",
           "votes": [
             {
-              "slot": "$current_slot",
+              "slot": "$current_slot_minus_100",
               "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
               "voter_id": 5,
-              "signature": "1122"
+              "signature": "bb05"
             },
             {
-              "slot": "$current_slot",
+              "slot": "$current_slot_minus_100",
               "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
               "voter_id": 6,
-              "signature": "3344"
+              "signature": "bb06"
             },
             {
-              "slot": "$current_slot",
+              "slot": "$current_slot_minus_100",
               "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
               "voter_id": 7,
-              "signature": "5566"
+              "signature": "bb07"
             }
           ]
         }

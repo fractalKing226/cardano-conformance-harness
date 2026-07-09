@@ -74,6 +74,17 @@ fn substitute_inner(
     out: &mut Vec<(String, &'static str)>,
 ) -> anyhow::Result<()> {
     match v {
+        // Template interpolation: "${varname}" embedded within a larger string.
+        // Produces a string; use for compound values like "${current_slot}:hash".
+        Value::String(s) if s.contains("${") => {
+            let (new_s, expanded) = expand_template(s, vars)?;
+            for name in expanded {
+                out.push((format!("${{{name}}}"), "string"));
+            }
+            *v = Value::String(new_s);
+        }
+        // Whole-value substitution: "$varname" replaces the entire JSON value.
+        // Use for typed fields like "slot": "$current_slot" → JSON number.
         Value::String(s) if s.starts_with('$') => {
             let expr = s.clone();
             let resolved = resolve_ref(&expr, vars)
@@ -95,6 +106,39 @@ fn substitute_inner(
         _ => {}
     }
     Ok(())
+}
+
+/// Expands `${varname}` placeholders in `template` using `vars`.
+///
+/// Each `${name}` is replaced with the variable's string representation:
+/// numbers become their decimal string, strings are used as-is.
+/// Returns `(expanded_string, list_of_expanded_variable_names)`.
+fn expand_template(template: &str, vars: &VarStore) -> anyhow::Result<(String, Vec<String>)> {
+    let mut result = String::with_capacity(template.len());
+    let mut expanded = Vec::new();
+    let mut remaining = template;
+    while let Some(open) = remaining.find("${") {
+        result.push_str(&remaining[..open]);
+        let after = &remaining[open + 2..];
+        let close = after.find('}')
+            .ok_or_else(|| anyhow::anyhow!("unclosed '${{' in template string: {template:?}"))?;
+        let name = &after[..close];
+        let val = vars.get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown variable \"{name}\" in template string"))?;
+        let rendered = match val {
+            Value::Number(n) => n.to_string(),
+            Value::String(s) => s.clone(),
+            other => anyhow::bail!(
+                "variable \"{name}\" of type {} cannot be interpolated into a string",
+                json_type_name(other)
+            ),
+        };
+        expanded.push(name.to_string());
+        result.push_str(&rendered);
+        remaining = &after[close + 1..];
+    }
+    result.push_str(remaining);
+    Ok((result, expanded))
 }
 
 fn json_type_name(v: &Value) -> &'static str {
@@ -222,6 +266,56 @@ mod tests {
         let vars = VarStore::new();
         let mut v = json!("$missing");
         assert!(substitute_in_value(&mut v, &vars).is_err());
+    }
+
+    // ── template interpolation ────────────────────────────────────────────────
+
+    #[test]
+    fn template_expands_number_into_compound_string() {
+        let vars = store(&[("current_slot", json!(5424u64))]);
+        let mut v = json!("${current_slot}:abcdef");
+        substitute_in_value(&mut v, &vars).unwrap();
+        assert_eq!(v, json!("5424:abcdef"));
+    }
+
+    #[test]
+    fn template_expands_string_variable() {
+        let vars = store(&[("prefix", json!("hello"))]);
+        let mut v = json!("${prefix}_world");
+        substitute_in_value(&mut v, &vars).unwrap();
+        assert_eq!(v, json!("hello_world"));
+    }
+
+    #[test]
+    fn template_multiple_placeholders() {
+        let vars = store(&[("a", json!(1u64)), ("b", json!(2u64))]);
+        let mut v = json!("${a}:${b}");
+        substitute_in_value(&mut v, &vars).unwrap();
+        assert_eq!(v, json!("1:2"));
+    }
+
+    #[test]
+    fn template_unknown_var_gives_error() {
+        let vars = VarStore::new();
+        let mut v = json!("${missing}:hash");
+        assert!(substitute_in_value(&mut v, &vars).is_err());
+    }
+
+    #[test]
+    fn template_unclosed_brace_gives_error() {
+        let vars = store(&[("x", json!(1u64))]);
+        let mut v = json!("${x:hash");
+        assert!(substitute_in_value(&mut v, &vars).is_err());
+    }
+
+    #[test]
+    fn whole_string_ref_still_returns_number_not_string() {
+        // $current_slot (whole-value ref) → JSON number, not string "5424"
+        let vars = store(&[("current_slot", json!(5424u64))]);
+        let mut v = json!("$current_slot");
+        substitute_in_value(&mut v, &vars).unwrap();
+        assert_eq!(v, json!(5424u64));
+        assert!(v.is_number());
     }
 
     // ── point_to_str ──────────────────────────────────────────────────────────

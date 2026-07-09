@@ -1,0 +1,179 @@
+{
+  "name": "leios_interleaved_votes_two_ebs",
+  "description": "The server offers EB1 (slot=100, hash=ab..) and EB2 (slot=101, hash=cd..) then delivers votes interleaved across four batches: batch 1 votes EB1 from voters 1-5, batch 2 votes EB2 from voters 1-5, batch 3 votes EB1 from voters 6-10, batch 4 votes EB2 from voters 6-10. Each voter appears once for EB1 and once for EB2; since these are distinct EBs both votes are legitimate (the spec only prohibits voting twice for the SAME EB). A conforming node must maintain per-EB vote tallies so that EB1 accumulates exactly 10 votes and EB2 accumulates exactly 10 votes independently. A node using a global vote counter or keying only on voter_id would conflate the two tallies, incorrectly reporting each EB as having 20 votes and potentially triggering certificate formation for an EB that did not actually reach the threshold from legitimate per-EB votes.",
+  "network_magic": 42,
+  "trace_output_path": "trace_leios_interleaved_votes_two_ebs.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3036"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client_conn",
+      "peer_id": "interleaved_vote_server"
+    },
+    {
+      "kind": "serve_leios_notify",
+      "on": "client_conn",
+      "notifications": [
+        {
+          "kind": "block_offer",
+          "point": "${current_slot}:abababababababababababababababababababababababababababababababab",
+          "eb_size": 512
+        },
+        {
+          "kind": "block_offer",
+          "point": "${current_slot}:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "eb_size": 512
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 1,
+              "signature": "aa01"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 2,
+              "signature": "aa02"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 3,
+              "signature": "aa03"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 4,
+              "signature": "aa04"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 5,
+              "signature": "aa05"
+            }
+          ]
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 1,
+              "signature": "bb01"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 2,
+              "signature": "bb02"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 3,
+              "signature": "bb03"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 4,
+              "signature": "bb04"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 5,
+              "signature": "bb05"
+            }
+          ]
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 6,
+              "signature": "cc06"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 7,
+              "signature": "cc07"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 8,
+              "signature": "cc08"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 9,
+              "signature": "cc09"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 10,
+              "signature": "cc0a"
+            }
+          ]
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 6,
+              "signature": "dd06"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 7,
+              "signature": "dd07"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 8,
+              "signature": "dd08"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 9,
+              "signature": "dd09"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 10,
+              "signature": "dd0a"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "close_listener"
+    }
+  ],
+  "sut_genesis_time_unix": 1783591775,
+  "sut_slot_duration_ms": 1000
+}

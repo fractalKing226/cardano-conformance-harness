@@ -1,9 +1,11 @@
 {
   "name": "leios_double_vote",
-  "description": "Voter 7 casts votes for the same (slot=100, EB) pair in two separate MsgLeiosVotes messages delivered across consecutive RequestNext cycles. The second batch deliberately mingles the repeat vote with legitimate new voters (8, 9) so the duplicate is not immediately obvious. In the Leios voting protocol each voter_id carries a fixed voting weight; a client that accumulates both batches without deduplication will count voter 7's weight twice, inflating the apparent vote tally for the EB and potentially crossing a threshold that was not legitimately reached. A conforming client must maintain a per-session set of seen (voter_id, slot, eb_hash) triples across all received MsgLeiosVotes messages and reject or discard any vote whose key has already been recorded.",
+  "description": "Voter 7 casts votes for the same (slot, EB) pair in two separate MsgLeiosVotes messages delivered across consecutive RequestNext cycles. The second batch deliberately mingles the repeat vote with legitimate new voters (8, 9) so the duplicate is not immediately obvious. In the Leios voting protocol each voter_id carries a fixed voting weight; a client that accumulates both batches without deduplication will count voter 7's weight twice, inflating the apparent vote tally for the EB and potentially crossing a threshold that was not legitimately reached. A conforming client must maintain a per-session set of seen (voter_id, slot, eb_hash) triples across all received MsgLeiosVotes messages and reject or discard any vote whose key has already been recorded.",
   "network_magic": 42,
   "trace_output_path": "trace_leios_double_vote.jsonl",
   "expected_outcome": "success",
+  "sut_genesis_time_unix": 1783591775,
+  "sut_slot_duration_ms": 1000,
   "steps": [
     {
       "kind": "listen",
@@ -22,19 +24,19 @@
           "kind": "votes",
           "votes": [
             {
-              "slot": 100,
+              "slot": "$current_slot",
               "eb_hash": "abababababababababababababababababababababababababababababababab",
               "voter_id": 1,
               "signature": "aabb"
             },
             {
-              "slot": 100,
+              "slot": "$current_slot",
               "eb_hash": "abababababababababababababababababababababababababababababababab",
               "voter_id": 2,
               "signature": "ccdd"
             },
             {
-              "slot": 100,
+              "slot": "$current_slot",
               "eb_hash": "abababababababababababababababababababababababababababababababab",
               "voter_id": 7,
               "signature": "eeff"
@@ -45,19 +47,19 @@
           "kind": "votes",
           "votes": [
             {
-              "slot": 100,
+              "slot": "$current_slot",
               "eb_hash": "abababababababababababababababababababababababababababababababab",
               "voter_id": 7,
               "signature": "1122"
             },
             {
-              "slot": 100,
+              "slot": "$current_slot",
               "eb_hash": "abababababababababababababababababababababababababababababababab",
               "voter_id": 8,
               "signature": "3344"
             },
             {
-              "slot": 100,
+              "slot": "$current_slot",
               "eb_hash": "abababababababababababababababababababababababababababababababab",
               "voter_id": 9,
               "signature": "5566"

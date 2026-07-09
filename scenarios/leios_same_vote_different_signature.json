@@ -1,0 +1,63 @@
+{
+  "name": "leios_same_vote_different_signature",
+  "description": "Voter 5 appears twice within the SAME MsgLeiosVotes batch for the same (slot, eb_hash) but with different signature bytes (aa0005 vs bb0005). From the spec perspective, a vote's identity is (voter_id, pipeline_slot, eb_hash) — the signature is a cryptographic proof of authenticity, not a distinguishing component. Two votes sharing the same identity tuple are duplicates regardless of whether their signatures differ. A conforming node must deduplicate on (voter_id, slot, eb_hash) and count voter 5's weight exactly once toward the EB1 tally. A node that uses the full tuple including signature as the dedup key would count voter 5 twice (once per signature), inflating the tally to 4 when the correct count is 3 (voters 5, 6, 7). This is an adversarial within-batch duplication attack distinct from the cross-batch case in leios_double_vote.",
+  "network_magic": 42,
+  "trace_output_path": "trace_leios_same_vote_different_signature.jsonl",
+  "expected_outcome": "success",
+  "sut_genesis_time_unix": 1783591775,
+  "sut_slot_duration_ms": 1000,
+  "steps": [
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3040"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client_conn",
+      "peer_id": "same_vote_diff_sig_server"
+    },
+    {
+      "kind": "serve_leios_notify",
+      "on": "client_conn",
+      "notifications": [
+        {
+          "kind": "block_offer",
+          "point": "${current_slot}:abababababababababababababababababababababababababababababababab",
+          "eb_size": 512
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 5,
+              "signature": "aa0005"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 5,
+              "signature": "bb0005"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 6,
+              "signature": "aa0006"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 7,
+              "signature": "aa0007"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "close_listener"
+    }
+  ]
+}

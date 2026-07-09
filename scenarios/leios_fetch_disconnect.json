@@ -1,0 +1,69 @@
+{
+  "name": "leios_fetch_disconnect",
+  "description": "The server offers EB1 (slot=100) via LeiosNotify block_offer and delivers votes from three voters to signal that EB1 is worth fetching. When the node subsequently sends a MsgLeiosBlockRequest via LeiosFetch, the server immediately disconnects instead of delivering the block body. This exercises the failure path of the Ftch-Action transition: a block was announced and requested but the peer vanished before delivering it. A conforming node must handle the fetch disconnect gracefully by logging an appropriate error, marking the fetch as failed, and continuing to operate normally rather than hanging, crashing, or retrying indefinitely. The EB1 vote tally should be abandoned or held pending a future successful fetch from a different peer.",
+  "network_magic": 42,
+  "trace_output_path": "trace_leios_fetch_disconnect.jsonl",
+  "expected_outcome": "success",
+  "steps": [
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3037"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client_conn",
+      "peer_id": "fetch_disconnect_server"
+    },
+    {
+      "kind": "serve_leios_notify",
+      "on": "client_conn",
+      "notifications": [
+        {
+          "kind": "block_offer",
+          "point": "${current_slot}:abababababababababababababababababababababababababababababababab",
+          "eb_size": 512
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 1,
+              "signature": "aabb"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 2,
+              "signature": "ccdd"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 3,
+              "signature": "eeff"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "serve_leios_fetch",
+      "on": "client_conn",
+      "responses": [
+        {
+          "on": "fetch_block",
+          "send": {
+            "kind": "disconnect"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "close_listener"
+    }
+  ],
+  "sut_genesis_time_unix": 1783591775,
+  "sut_slot_duration_ms": 1000
+}

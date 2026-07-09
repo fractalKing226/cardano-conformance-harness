@@ -1,0 +1,57 @@
+{
+  "name": "leios_vote_slot_mismatch",
+  "description": "The server offers EB1 via LeiosNotify block_offer at a slot 100 slots in the past ($current_slot_minus_100), then delivers three votes each claiming the current pipeline slot ($current_slot) for that same EB hash. In the Leios voting pipeline the voting slot must satisfy slot ≡ slotNumber(eb) + validityCheckTime(eb), placing it within a narrow window of a few slots after the EB production slot. A vote claiming a slot that is ~100 slots after the EB production slot is far outside that window and cannot be a valid vote for this EB. A conforming node must validate the slot field of each incoming vote against the expected pipeline window for the referenced EB and discard votes that fall outside it. Counting these votes would allow an adversary to inject phantom votes for arbitrary future slots and manipulate the certificate-formation threshold.",
+  "network_magic": 42,
+  "trace_output_path": "trace_leios_vote_slot_mismatch.jsonl",
+  "expected_outcome": "success",
+  "sut_genesis_time_unix": 1783591775,
+  "sut_slot_duration_ms": 1000,
+  "steps": [
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3034"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client_conn",
+      "peer_id": "slot_mismatch_server"
+    },
+    {
+      "kind": "serve_leios_notify",
+      "on": "client_conn",
+      "notifications": [
+        {
+          "kind": "block_offer",
+          "point": "${current_slot_minus_100}:abababababababababababababababababababababababababababababababab",
+          "eb_size": 512
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 1,
+              "signature": "aabb"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 2,
+              "signature": "ccdd"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 3,
+              "signature": "eeff"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "close_listener"
+    }
+  ]
+}

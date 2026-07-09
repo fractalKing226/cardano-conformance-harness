@@ -208,6 +208,23 @@ impl ScenarioRunner {
             ..Default::default()
         };
 
+        // Seed built-in slot variables when the scenario declares the SUT's genesis time.
+        // current_slot      = (now - genesis) / slot_duration
+        // current_slot_minus_100 = saturating_sub(100) — for scenarios that need a
+        //                          clearly-past slot (e.g. vote_slot_mismatch).
+        if let Some(genesis_unix) = self.scenario.sut_genesis_time_unix {
+            let slot_ms = self.scenario.sut_slot_duration_ms.unwrap_or(1000).max(1);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let elapsed_ms = now_ms.saturating_sub(genesis_unix * 1000);
+            let slot = elapsed_ms / slot_ms;
+            let mut vars = state.vars.lock().unwrap();
+            vars.insert("current_slot".into(), serde_json::json!(slot));
+            vars.insert("current_slot_minus_100".into(), serde_json::json!(slot.saturating_sub(100)));
+        }
+
         // Emit one NetworkDeclared event so the trace records the imaginary topology.
         if let Some(ref network) = self.scenario.network {
             let peers_json: Vec<serde_json::Value> = network.peers.iter().map(|p| {
@@ -1296,8 +1313,8 @@ fn execute_step<'a>(
                 let sc = co.get_mut();
                 let (ln_send, ln_recv) = sc.ln_channels.take()
                     .ok_or_else(|| anyhow::anyhow!("serve_leios_notify: no leios-notify channel"))?;
-                let actions: Vec<LeiosNotifyAction> = match step.raw_params.get("notifications") {
-                    Some(v) => serde_json::from_value((*v).clone())
+                let actions: Vec<LeiosNotifyAction> = match resolved.get("notifications") {
+                    Some(v) => serde_json::from_value(v.clone())
                         .context("serve_leios_notify: parsing notifications")?,
                     None => vec![],
                 };
@@ -1313,8 +1330,8 @@ fn execute_step<'a>(
                 let sc = co.get_mut();
                 let (lf_send, lf_recv) = sc.lf_channels.take()
                     .ok_or_else(|| anyhow::anyhow!("serve_leios_fetch: no leios-fetch channel"))?;
-                let rules: Vec<LeiosFetchRule> = match step.raw_params.get("responses") {
-                    Some(v) => serde_json::from_value((*v).clone())
+                let rules: Vec<LeiosFetchRule> = match resolved.get("responses") {
+                    Some(v) => serde_json::from_value(v.clone())
                         .context("serve_leios_fetch: parsing responses")?,
                     None => vec![],
                 };

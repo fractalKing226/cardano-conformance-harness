@@ -29,6 +29,8 @@ fn make_scenario(name: &str, trace_path: &std::path::Path, steps: Vec<StepDef>) 
         expected_outcome: None,
         network: None,
         steps,
+        sut_genesis_time_unix: None,
+        sut_slot_duration_ms: None,
     }
 }
 

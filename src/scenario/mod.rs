@@ -163,6 +163,16 @@ pub struct Scenario {
     /// here and `serve_*` steps can reference them via `as_peer:`.
     pub network: Option<Network>,
     pub steps: Vec<StepDef>,
+    /// Unix timestamp (seconds) of the SUT's genesis block. When set together
+    /// with `sut_slot_duration_ms`, the runner seeds `$current_slot` and
+    /// `$current_slot_minus_100` as built-in variables before executing steps.
+    /// Use `"slot": "$current_slot"` in vote specs and
+    /// `"point": "${current_slot}:hash"` in block_offer steps so scenarios
+    /// stay valid regardless of when they are run.
+    pub sut_genesis_time_unix: Option<u64>,
+    /// Duration of one SUT slot in milliseconds. Defaults to 1000 if
+    /// `sut_genesis_time_unix` is set but this field is absent.
+    pub sut_slot_duration_ms: Option<u64>,
 }
 
 /// A single scenario step, storing raw JSON params for uniform variable

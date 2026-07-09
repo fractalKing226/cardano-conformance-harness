@@ -116,6 +116,8 @@ A scenario is a JSON file that describes a sequence of steps to execute.
 | `network_magic` | yes | Cardano network magic number |
 | `trace_output_path` | yes | Path for the JSON-lines trace output |
 | `expected_outcome` | no | Informational string logged in `scenario_completed` (e.g. `"success"`) |
+| `sut_genesis_time_unix` | no | Unix timestamp (seconds) of the SUT's genesis slot. When set, seeds `$current_slot` at scenario start. |
+| `sut_slot_duration_ms` | no | Slot duration in milliseconds (default 1000). Used together with `sut_genesis_time_unix` to compute `$current_slot`. |
 | `network` | no | Imaginary-network declaration — peers, slot model, production rules. See [docs/network_declarations.md](docs/network_declarations.md) |
 
 ### Named connections (`as` and `on`)
@@ -163,11 +165,21 @@ Later steps reference variables using a `$name` prefix.
 
 | Form | Meaning |
 |------|---------|
-| `$name` | The whole variable value |
+| `$name` | The whole variable value (number stays a JSON number) |
 | `$name.field` | A field of a record variable |
 | `$name[i]` | An element of a list variable |
+| `${name}` | String interpolation — substituted inline within a larger string (always a string) |
 
 Variable substitution happens at parameter-binding time, just before each step executes. A `VariableReferenced` trace event is emitted for every substitution; `VariableSet` is emitted when a step stores a result. Unresolved references produce a clear error at that point.
+
+**Built-in variables.** When `sut_genesis_time_unix` is set in the scenario header, two slot variables are seeded automatically before the first step runs:
+
+| Variable | Value |
+|----------|-------|
+| `$current_slot` | `(now_unix_ms − genesis_unix_ms) / slot_duration_ms` — the SUT's slot at scenario start |
+| `$current_slot_minus_100` | `$current_slot − 100` (saturating) — a slot 100 behind the current one, useful for pipeline-window tests |
+
+Use `$current_slot` as a whole-value ref for numeric fields (`"slot": "$current_slot"`) and `${current_slot}` for compound strings (`"point": "${current_slot}:abcd..."`).
 
 ### Step kinds and parameters
 
@@ -713,6 +725,25 @@ Each scenario is paired with `client_block_fetch_one_range.json` in the integrat
 | `block_fetch_malformed_block.json` | 3014 | Raw `0x82 0xff` CBOR sent in Busy state | `cbor_poisoner` |
 | `block_fetch_no_blocks_after_start.json` | 3015 | StartBatch then NoBlocks (invalid in Streaming) | `no_blocks_mid_stream` |
 
+#### Server-side — adversarial Leios
+
+These scenarios require a Leios-capable peer to connect (Piranha / net-node from `input-output-hk/leios-adversarial-tools`). The harness acts as the server and delivers the adversarial stimulus; the verifier reads the node's own logs to determine whether it responded correctly. Current limitation: Piranha logs raw wire counts (`votes received count=N`) but does not log deduplication decisions or per-EB tallies, so these scenarios verify robustness (node doesn't crash) rather than full semantic conformance.
+
+| File | Port | Violation tested |
+|------|------|-----------------|
+| `leios_double_vote.json` | 3030 | Voter 7 appears in two consecutive `MsgLeiosVotes` batches for the same `(slot, eb_hash)` — node must not count the weight twice |
+| `leios_voter_votes_two_ebs.json` | 3031 | Voter 5 votes for EB1 then EB2 (both valid); catches nodes that deduplicate by `voter_id` alone rather than `(voter_id, slot, eb_hash)` |
+| `leios_vote_for_unannounced_eb.json` | 3032 | Second vote batch references an EB hash that was never announced or offered — node must track known EBs before counting votes |
+| `leios_bait_and_switch_block.json` | 3033 | EB offered at hash `ab…` via LeiosNotify; block delivered via LeiosFetch has a different hash — node must verify the block body |
+| `leios_vote_slot_mismatch.json` | 3034 | Three votes claim `slot=200` for an EB produced at slot 100 — voting slot must fall within the spec's pipeline window (`slotNumber + validityCheckTime`) |
+| `leios_cascading_vote_batches.json` | 3035 | 50 valid votes for one EB delivered across 5 consecutive batches (10 distinct voters each) — running tally must accumulate without resetting between batches |
+| `leios_interleaved_votes_two_ebs.json` | 3036 | Two EBs in-flight simultaneously; votes interleaved across four batches with voters 1-5 voting for both EBs — per-EB tallies must be tracked independently |
+| `leios_fetch_disconnect.json` | 3037 | EB offered and votes sent to encourage a fetch; server disconnects immediately on `MsgLeiosBlockRequest` — node must handle mid-fetch peer drop without hanging or crashing |
+| `leios_votes_before_offer.json` | 3038 | Three votes for an EB arrive before its `block_offer` — node must not crash on votes for an as-yet-unannounced EB; offer arrives afterwards |
+| `leios_voter_two_valid_rounds.json` | 3039 | Voter 7 votes in two distinct pipeline rounds (`$current_slot` for EB1, `$current_slot_minus_100` for EB2); catches nodes that deduplicate on `(voter_id, slot)` and ignore `eb_hash`, or on `(voter_id, eb_hash)` and ignore `slot` |
+| `leios_same_vote_different_signature.json` | 3040 | Voter 5 appears twice in the same batch with the same `(voter_id, slot, eb_hash)` but different signature bytes — dedup key must be the identity triple, not the full tuple including signature |
+| `leios_duplicate_block_offer.json` | 3041 | Same EB offered twice via `block_offer` before votes arrive — `block_offer` must be idempotent; a second offer for a known EB must not corrupt state or trigger a double fetch |
+
 ---
 
 ## Trace file format
@@ -813,13 +844,13 @@ Each line is a self-contained JSON object.
 cargo test
 ```
 
-143 unit tests covering:
+158 unit tests covering:
 
 - `trace::tests` — serialisation, `direction`, `with_protocol`/`with_states`, `peer_id`/`slot` propagation, concurrent emit
 - `scenario::tests` — parsing, validation, `parse_point`, per-step `target_address`, `peer_id` rules, production_rule validation
 - `scenario::fixture::tests` — load/save round-trip, cursor operations, anchor regression
 - `scenario::block_fixture::tests` — load, range lookup, round-trip
-- `scenario::vars::tests` — `resolve_ref` (all forms + error cases), `substitute_in_value`, `point_to_str`
+- `scenario::vars::tests` — `resolve_ref` (all forms + error cases), `substitute_in_value`, `expand_template` (string interpolation), `point_to_str`
 - `scenario::peer_state::tests` — `slots_in_range` for both rule kinds, `apply_production_rules` (sequencing, skip-on-conflict, block_number continuity, range inclusivity), `filtered_fixture_chain` slot filtering
 - `scenario::runner::tests` — assertion evaluator, `subscribed_protocols` suite, worker spawn lifecycle, slot advance/tick/rewind, `peer_extends_chain` runtime validation, `network_without_start_slot_does_not_activate_slot_tracking`
 - `scenario::response_rules::tests` — rule parsing, `rule_def_to_script`, `stream_batch` generation
@@ -923,8 +954,8 @@ scripts/
 
 ## What's next
 
-- **Piranha integration** — client-side LeiosNotify and LeiosFetch are implemented; live testing against a Piranha node is blocked on protocol-format alignment between `ouroboros-leios/net-rs` and `leios-tools/net-rs` (the latter is ~5 weeks ahead and the formats are wire-incompatible)
-- **Leios adversarial scenarios** — server-side `serve_leios_notify` and `serve_leios_fetch` handlers are now implemented; the next step is authoring wire-level violation test scenarios (wrong-state messages, malformed CBOR, truncated vote batches) to collect conformance evidence against Pallas
+- **Leios semantic conformance** — Piranha (net-node) live testing is working end-to-end; current Leios scenarios verify robustness (node survives adversarial input) but not semantic correctness (e.g. vote deduplication tallies). Next step: request structured telemetry from the Piranha team (per-EB unique vote count log) so scenarios can assert on deduplication outcomes
+- **Leios adversarial scenarios** — twelve adversarial scenarios written (ports 3030–3041); covers vote deduplication, per-EB tally isolation, vote-slot pipeline-window validation, vote accumulation across batches, hash-body mismatch, fetch-disconnect resilience, votes-before-offer ordering, multi-round valid votes, within-batch signature variants, and duplicate block_offer idempotency
 - Cryptographically valid block content — real KES signatures and VRF proofs for produced blocks
 - Cross-peer state interaction — peer A's chain visible to peer B's production rule
 - Parse slot/hash/block_number from Block-Fetch block body CBOR to enable `batch_size > 1` fixture capture
