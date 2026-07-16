@@ -1,0 +1,70 @@
+{
+  "name": "leios_eb_invalid_vrf",
+  "description": "The server offers an EB then delivers a body whose lottery proof does not verify. The VT-Role transition in Leios.Linear carries the premise isValid s (inj₁ (ebHeader eb)), which resolves via headerValid and ebValid to require lotteryPfValid: verify pk (slotNumber eb) st (lotteryPf eb) (Leios.Protocol). A body that fails this check is filtered out by L.filter (isValid? s) msgs in the Slot₁ transition and never enters EBs'. A conforming node must therefore not vote for an EB whose lottery proof cannot be verified against the announced producer's key and stake. NOTE: the block_bytes field below is a CBOR placeholder (0xa0 = empty map). For this scenario to isolate lotteryPfValid as the failing check rather than a parse error, block_bytes must be replaced with a correctly serialised EndorserBlock CBOR where all fields are valid except lotteryPf, which is set to an all-zero or otherwise invalid proof.",
+  "network_magic": 42,
+  "trace_output_path": "trace_leios_eb_invalid_vrf.jsonl",
+  "expected_outcome": "success",
+  "sut_genesis_time_unix": 1783591775,
+  "sut_slot_duration_ms": 1000,
+  "steps": [
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3043"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client_conn",
+      "peer_id": "invalid_vrf_server"
+    },
+    {
+      "kind": "serve_leios_notify",
+      "on": "client_conn",
+      "notifications": [
+        {
+          "kind": "block_offer",
+          "point": "${current_slot}:abababababababababababababababababababababababababababababababab",
+          "eb_size": 512
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 1,
+              "signature": "aa01"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 2,
+              "signature": "aa02"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 3,
+              "signature": "aa03"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "serve_leios_fetch",
+      "on": "client_conn",
+      "responses": [
+        {
+          "on": "fetch_block",
+          "send": {
+            "kind": "block",
+            "block_bytes": "a0"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "close_listener"
+    }
+  ]
+}

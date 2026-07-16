@@ -1,0 +1,105 @@
+{
+  "name": "leios_equivocating_producer",
+  "description": "The server offers two EBs at the same pipeline slot but with different hashes, then delivers both bodies via LeiosFetch. Two EBs sharing the same (slotNumber, producerID) are equivocated by definition: areEquivocated b b' = b ≢ b' × slotNumber b ≡ slotNumber b' × producerID b ≡ producerID b' (Leios.Blocks). The VT-Role transition in Leios.Linear carries the premise ¬ isEquivocated s eb, so a conforming node must not vote for either EB once it has both bodies in EBs' and can detect the equivocation. At the network diffusion layer, msgID (ebHeader h) = (slotNumber h, producerID h), so a duplicate msgID arriving via Forward is silently dropped by HeaderDiffusion.Receive2' — but the harness sends both offers from the same connection before the node has fetched either body, so both reach the LeiosNotify client before dedup can fire. NOTE: the block_bytes fields below are CBOR placeholders (0xa0 = empty map). For this scenario to produce a conformance finding rather than a parse error, both bytes strings must be replaced with correctly serialised EndorserBlock CBOR where slotNumber and producerID match across the two EBs but the overall block content differs.",
+  "network_magic": 42,
+  "trace_output_path": "trace_leios_equivocating_producer.jsonl",
+  "expected_outcome": "success",
+  "sut_genesis_time_unix": 1783591775,
+  "sut_slot_duration_ms": 1000,
+  "steps": [
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3042"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client_conn",
+      "peer_id": "equivocating_producer_server"
+    },
+    {
+      "kind": "serve_leios_notify",
+      "on": "client_conn",
+      "notifications": [
+        {
+          "kind": "block_offer",
+          "point": "${current_slot}:abababababababababababababababababababababababababababababababab",
+          "eb_size": 512
+        },
+        {
+          "kind": "block_offer",
+          "point": "${current_slot}:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "eb_size": 512
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 1,
+              "signature": "aa01"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 2,
+              "signature": "aa02"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 3,
+              "signature": "aa03"
+            }
+          ]
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 1,
+              "signature": "bb01"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 2,
+              "signature": "bb02"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "voter_id": 3,
+              "signature": "bb03"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "serve_leios_fetch",
+      "on": "client_conn",
+      "responses": [
+        {
+          "on": "fetch_block",
+          "send": {
+            "kind": "block",
+            "block_bytes": "a0"
+          }
+        },
+        {
+          "on": "fetch_block",
+          "send": {
+            "kind": "block",
+            "block_bytes": "a0"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "close_listener"
+    }
+  ]
+}

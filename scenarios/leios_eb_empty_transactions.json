@@ -1,0 +1,70 @@
+{
+  "name": "leios_eb_empty_transactions",
+  "description": "The server offers an EB then delivers a body whose transaction list is empty. The VT-Role transition in Leios.Linear carries the premise EndorserBlockOSig.txs eb ≢ [] — an EB with no transactions cannot be voted for regardless of whether it otherwise passes validation. This rule exists because an empty EB provides no throughput benefit and certifying one would waste committee voting weight. A conforming node that fetches this EB body and finds txs = [] must not cast a VT-Role vote for it; the EB should not enter the node's consideration for certificate formation. NOTE: the block_bytes field below is a CBOR placeholder (0xa0 = empty map). For this scenario to isolate the txs ≢ [] check, block_bytes must be replaced with a correctly serialised EndorserBlock CBOR where all fields are valid (passing lotteryPfValid and signatureValid) but the txs field encodes an empty list.",
+  "network_magic": 42,
+  "trace_output_path": "trace_leios_eb_empty_transactions.jsonl",
+  "expected_outcome": "success",
+  "sut_genesis_time_unix": 1783591775,
+  "sut_slot_duration_ms": 1000,
+  "steps": [
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3044"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client_conn",
+      "peer_id": "empty_txs_server"
+    },
+    {
+      "kind": "serve_leios_notify",
+      "on": "client_conn",
+      "notifications": [
+        {
+          "kind": "block_offer",
+          "point": "${current_slot}:abababababababababababababababababababababababababababababababab",
+          "eb_size": 64
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 1,
+              "signature": "aa01"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 2,
+              "signature": "aa02"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "abababababababababababababababababababababababababababababababab",
+              "voter_id": 3,
+              "signature": "aa03"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "serve_leios_fetch",
+      "on": "client_conn",
+      "responses": [
+        {
+          "on": "fetch_block",
+          "send": {
+            "kind": "block",
+            "block_bytes": "a0"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "close_listener"
+    }
+  ]
+}

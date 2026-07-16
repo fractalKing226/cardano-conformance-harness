@@ -743,6 +743,9 @@ These scenarios require a Leios-capable peer to connect (Piranha / net-node from
 | `leios_voter_two_valid_rounds.json` | 3039 | Voter 7 votes in two distinct pipeline rounds (`$current_slot` for EB1, `$current_slot_minus_100` for EB2); catches nodes that deduplicate on `(voter_id, slot)` and ignore `eb_hash`, or on `(voter_id, eb_hash)` and ignore `slot` |
 | `leios_same_vote_different_signature.json` | 3040 | Voter 5 appears twice in the same batch with the same `(voter_id, slot, eb_hash)` but different signature bytes — dedup key must be the identity triple, not the full tuple including signature |
 | `leios_duplicate_block_offer.json` | 3041 | Same EB offered twice via `block_offer` before votes arrive — `block_offer` must be idempotent; a second offer for a known EB must not corrupt state or trigger a double fetch |
+| `leios_equivocating_producer.json` | 3042 | Two EBs at the same pipeline slot from the same producer (different hashes) delivered via notify then fetch — node must detect equivocation (`¬ isEquivocated s eb` in `VT-Role`, `areEquivocated` in `Leios.Blocks`) and not vote for either. **Note:** `block_bytes` are CBOR placeholders; needs valid EB encoding with matching `producerID` to produce a conformance finding |
+| `leios_eb_invalid_vrf.json` | 3043 | EB body delivered with an invalid lottery proof — node must reject the EB at `isValid?` (`ebValid.lotteryPfValid: verify pk slot stake lotteryPf` in `Leios.Protocol`) and not vote for it. **Note:** `block_bytes` are CBOR placeholders; needs valid EB encoding with zeroed `lotteryPf` field |
+| `leios_eb_empty_transactions.json` | 3044 | EB body delivered with an empty transaction list — node must not vote for it (`EndorserBlockOSig.txs eb ≢ []` premise of `VT-Role` in `Leios.Linear`). **Note:** `block_bytes` are CBOR placeholders; needs valid EB encoding with `txs = []` |
 
 ---
 
@@ -955,7 +958,7 @@ scripts/
 ## What's next
 
 - **Leios semantic conformance** — Piranha (net-node) live testing is working end-to-end; current Leios scenarios verify robustness (node survives adversarial input) but not semantic correctness (e.g. vote deduplication tallies). Next step: request structured telemetry from the Piranha team (per-EB unique vote count log) so scenarios can assert on deduplication outcomes
-- **Leios adversarial scenarios** — twelve adversarial scenarios written (ports 3030–3041); covers vote deduplication, per-EB tally isolation, vote-slot pipeline-window validation, vote accumulation across batches, hash-body mismatch, fetch-disconnect resilience, votes-before-offer ordering, multi-round valid votes, within-batch signature variants, and duplicate block_offer idempotency
+- **Leios adversarial scenarios** — fifteen adversarial scenarios written (ports 3030–3044); covers vote deduplication, per-EB tally isolation, vote-slot pipeline-window validation, vote accumulation across batches, hash-body mismatch, fetch-disconnect resilience, votes-before-offer ordering, multi-round valid votes, within-batch signature variants, duplicate block_offer idempotency, equivocating producer detection, invalid VRF lottery proof, and empty-transaction EB rejection. The last three require valid EB CBOR (currently placeholder bytes) to produce a conformance finding
 - Cryptographically valid block content — real KES signatures and VRF proofs for produced blocks
 - Cross-peer state interaction — peer A's chain visible to peer B's production rule
 - Parse slot/hash/block_number from Block-Fetch block body CBOR to enable `batch_size > 1` fixture capture
