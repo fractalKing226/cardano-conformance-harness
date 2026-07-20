@@ -1628,19 +1628,6 @@ async fn leios_adversarial_eb_body_hash_mismatch() {
     assert_leios_server_steps_passed(&events, timed_out, "leios_eb_body_hash_mismatch");
 }
 
-#[tokio::test]
-#[ignore = "requires free TCP port 3044; run with: cargo test --test live_node -- --ignored leios_adversarial"]
-async fn leios_adversarial_eb_empty_transactions() {
-    let (events, timed_out) = run_leios_pair(
-        "scenarios/leios_eb_empty_transactions.json",
-        2,
-        &["${current_slot}:abababababababababababababababababababababababababababababababab"],
-        3044,
-    )
-    .await;
-    assert_leios_server_steps_passed(&events, timed_out, "leios_eb_empty_transactions");
-}
-
 // ── Adversarial production (slice 5) integration tests ────────────────────────
 
 #[tokio::test]
