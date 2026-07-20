@@ -611,6 +611,30 @@ The harness must be running in server mode before the node starts.
 
 ---
 
+### Pointing a Leios node at the harness
+
+The Leios adversarial scenarios require a Leios-capable node acting as the initiator (client). Start the harness first — it is the server and must be listening before the node connects.
+
+**Terminal 1 — start the harness:**
+
+```sh
+cargo run -- --scenario scenarios/leios_double_vote.json
+```
+
+**Terminal 2 — start your Leios node**, configured to connect to `127.0.0.1:3030` with:
+- `network_magic = 42`
+- `leios_enabled = true`
+- `genesis_time_unix = 1783591775`
+- `slot_duration_ms = 1000`
+
+The node connects, performs the handshake, and begins exchanging Leios mini-protocol messages. The harness delivers the scripted adversarial stimulus and writes its trace to the path declared in the scenario's `trace_output_path` field.
+
+**To run a different scenario**, update your node's peer address to match the scenario's `bind_address` port (3030–3044 for Leios scenarios — see the table below) and restart both the harness and the node.
+
+**What to look for:** the harness trace records every step outcome (`steps_failed: 0` means the harness completed its script without error). The node's own logs or telemetry are the conformance signal — cross-reference the two to determine whether the node responded correctly to the adversarial input.
+
+---
+
 ### Assertions (`expect`)
 
 Any step can have an optional `expect` object. Failures emit `assertion_failed` and abort the scenario.
