@@ -1617,15 +1617,15 @@ async fn leios_adversarial_equivocating_producer() {
 
 #[tokio::test]
 #[ignore = "requires free TCP port 3043; run with: cargo test --test live_node -- --ignored leios_adversarial"]
-async fn leios_adversarial_eb_invalid_vrf() {
+async fn leios_adversarial_eb_body_hash_mismatch() {
     let (events, timed_out) = run_leios_pair(
-        "scenarios/leios_eb_invalid_vrf.json",
+        "scenarios/leios_eb_body_hash_mismatch.json",
         2,
         &["${current_slot}:abababababababababababababababababababababababababababababababab"],
         3043,
     )
     .await;
-    assert_leios_server_steps_passed(&events, timed_out, "leios_eb_invalid_vrf");
+    assert_leios_server_steps_passed(&events, timed_out, "leios_eb_body_hash_mismatch");
 }
 
 #[tokio::test]

@@ -1,8 +1,8 @@
 {
-  "name": "leios_eb_invalid_vrf",
-  "description": "The server offers an EB then delivers a body whose lottery proof does not verify. The VT-Role transition in Leios.Linear carries the premise isValid s (inj₁ (ebHeader eb)), which resolves via headerValid and ebValid to require lotteryPfValid: verify pk (slotNumber eb) st (lotteryPf eb) (Leios.Protocol). A body that fails this check is filtered out by L.filter (isValid? s) msgs in the Slot₁ transition and never enters EBs'. A conforming node must therefore not vote for an EB whose lottery proof cannot be verified against the announced producer's key and stake. NOTE: the block_bytes field below is a CBOR placeholder (0xa0 = empty map). For this scenario to isolate lotteryPfValid as the failing check rather than a parse error, block_bytes must be replaced with a correctly serialised EndorserBlock CBOR where all fields are valid except lotteryPf, which is set to an all-zero or otherwise invalid proof.",
+  "name": "leios_eb_body_hash_mismatch",
+  "description": "The server offers an EB via LeiosNotify and then delivers a body via LeiosFetch whose content does not hash to the announced point. In CIP-0164 (Linear Leios) an EB body is a CBOR map { tx_hash => tx_size }; the announced point carries the blake2b-256 hash of that map. A conforming node that fetches the body and verifies the hash must reject an EB whose body hash does not match the announced identifier, and must not vote for it. The body delivered here is an empty map (0xa0), which does not hash to the abab... identifier announced in the block_offer.",
   "network_magic": 42,
-  "trace_output_path": "trace_leios_eb_invalid_vrf.jsonl",
+  "trace_output_path": "trace_leios_eb_body_hash_mismatch.jsonl",
   "expected_outcome": "success",
   "sut_genesis_time_unix": 1783591775,
   "sut_slot_duration_ms": 1000,
@@ -14,7 +14,7 @@
     {
       "kind": "accept_handshake",
       "as": "client_conn",
-      "peer_id": "invalid_vrf_server"
+      "peer_id": "hash_mismatch_server"
     },
     {
       "kind": "serve_leios_notify",
