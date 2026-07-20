@@ -1361,6 +1361,286 @@ async fn auto_production_two_peers_different_rules() {
     assert_eq!(sparse_fired.len(), 3, "sparse_peer must produce 3 blocks at [102,107,117]");
 }
 
+// ── Leios adversarial server scenarios ───────────────────────────────────────
+//
+// Each test pairs a scripted Leios server harness with a synthetic Leios client
+// built from the harness's own LeiosNotify + LeiosFetch client steps.
+//
+// The server scenario listens on a dedicated port (3030–3044). The synthetic
+// client connects, performs the handshake, receives all scripted notifications
+// via LeiosNotify, and — for scenarios that include a serve_leios_fetch step —
+// sends the appropriate fetch requests.
+//
+// Assertion: the SERVER trace must contain a scenario_completed event with
+// steps_failed: 0. The client may encounter errors (e.g. for fetch_disconnect
+// scenarios where the server deliberately drops the connection) — those are
+// expected and not asserted on.
+//
+// Run all: cargo test --test live_node -- --ignored leios_adversarial
+//
+// These tests do not require the devnet or Piranha; they are self-contained.
+// They do require the listed ports to be free, which is why they are #[ignore].
+
+/// Genesis / slot-duration shared by all Leios scenario files.
+const LEIOS_GENESIS_TIME: u64 = 1_783_591_775;
+const LEIOS_SLOT_DURATION_MS: u64 = 1_000;
+
+/// Build a Leios client scenario that connects to `localhost:{port}`, receives
+/// `notify_count` notifications, optionally sends fetch requests for
+/// `fetch_points`, then disconnects.
+fn make_leios_client_scenario(
+    port: u16,
+    notify_count: u64,
+    fetch_points: &[&str],
+    trace_file: &NamedTempFile,
+) -> Scenario {
+    let mut steps = vec![
+        StepDef {
+            kind: StepKind::Connect,
+            raw_params: serde_json::json!({}),
+            output: None,
+            as_name: None,
+            on_name: None,
+            expect: None,
+        },
+        StepDef {
+            kind: StepKind::Handshake,
+            raw_params: serde_json::json!({}),
+            output: None,
+            as_name: None,
+            on_name: None,
+            expect: None,
+        },
+        StepDef {
+            kind: StepKind::LeiosNotify,
+            raw_params: serde_json::json!({ "count": notify_count, "await_timeout_secs": 5 }),
+            output: None,
+            as_name: None,
+            on_name: None,
+            expect: None,
+        },
+    ];
+
+    if !fetch_points.is_empty() {
+        steps.push(StepDef {
+            kind: StepKind::LeiosFetch,
+            raw_params: serde_json::json!({ "points": fetch_points }),
+            output: None,
+            as_name: None,
+            on_name: None,
+            expect: None,
+        });
+    }
+
+    steps.push(simple_step(StepKind::Disconnect));
+
+    Scenario {
+        name: format!("leios_client_{port}"),
+        description: None,
+        target_address: Some(format!("localhost:{port}")),
+        network_magic: DEVNET_MAGIC,
+        trace_output_path: trace_file.path().to_path_buf(),
+        expected_outcome: None,
+        network: None,
+        steps,
+        sut_genesis_time_unix: Some(LEIOS_GENESIS_TIME),
+        sut_slot_duration_ms: Some(LEIOS_SLOT_DURATION_MS),
+    }
+}
+
+/// Start the Leios server scenario, connect a synthetic client, wait for
+/// both to finish (10 s timeout), and return the server trace events.
+async fn run_leios_pair(
+    server_path: &str,
+    notify_count: u64,
+    fetch_points: &[&str],
+    port: u16,
+) -> (Vec<Value>, bool) {
+    let server_trace = NamedTempFile::new().unwrap();
+    let client_trace = NamedTempFile::new().unwrap();
+
+    let server_scenario = load_adversarial_scenario(server_path, &server_trace);
+    let client_scenario = make_leios_client_scenario(port, notify_count, fetch_points, &client_trace);
+
+    let local = tokio::task::LocalSet::new();
+    let timed_out = tokio::time::timeout(
+        Duration::from_secs(10),
+        local.run_until(async move {
+            let server_handle = tokio::task::spawn_local(ScenarioRunner::new(server_scenario).run());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = ScenarioRunner::new(client_scenario).run().await;
+            let _ = server_handle.await;
+        }),
+    )
+    .await
+    .is_err();
+
+    (read_trace(&server_trace), timed_out)
+}
+
+fn assert_leios_server_steps_passed(events: &[Value], timed_out: bool, scenario: &str) {
+    assert!(!timed_out, "{scenario}: scenario pair must complete within 10 s timeout");
+    let sc = events
+        .iter()
+        .find(|e| e["kind"] == "scenario_completed")
+        .unwrap_or_else(|| panic!("{scenario}: server trace must contain scenario_completed"));
+    assert_eq!(
+        sc["payload"]["steps_failed"], 0,
+        "{scenario}: server scenario must have steps_failed = 0; got: {}",
+        sc["payload"]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3030; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_double_vote() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_double_vote.json", 2, &[], 3030).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_double_vote");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3031; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_voter_votes_two_ebs() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_voter_votes_two_ebs.json", 4, &[], 3031).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_voter_votes_two_ebs");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3032; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_vote_for_unannounced_eb() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_vote_for_unannounced_eb.json", 3, &[], 3032).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_vote_for_unannounced_eb");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3033; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_bait_and_switch_block() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_bait_and_switch_block.json",
+        1,
+        &["${current_slot}:abababababababababababababababababababababababababababababababab"],
+        3033,
+    )
+    .await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_bait_and_switch_block");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3034; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_vote_slot_mismatch() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_vote_slot_mismatch.json", 2, &[], 3034).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_vote_slot_mismatch");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3035; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_cascading_vote_batches() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_cascading_vote_batches.json", 6, &[], 3035).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_cascading_vote_batches");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3036; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_interleaved_votes_two_ebs() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_interleaved_votes_two_ebs.json", 6, &[], 3036).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_interleaved_votes_two_ebs");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3037; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_fetch_disconnect() {
+    // Server disconnects on the first fetch request; the client's leios_fetch step
+    // will fail, but the SERVER scenario must still complete with steps_failed = 0.
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_fetch_disconnect.json",
+        2,
+        &["${current_slot}:abababababababababababababababababababababababababababababababab"],
+        3037,
+    )
+    .await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_fetch_disconnect");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3038; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_votes_before_offer() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_votes_before_offer.json", 2, &[], 3038).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_votes_before_offer");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3039; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_voter_two_valid_rounds() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_voter_two_valid_rounds.json", 4, &[], 3039).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_voter_two_valid_rounds");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3040; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_same_vote_different_signature() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_same_vote_different_signature.json", 2, &[], 3040).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_same_vote_different_signature");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3041; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_duplicate_block_offer() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_duplicate_block_offer.json", 3, &[], 3041).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_duplicate_block_offer");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3042; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_equivocating_producer() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_equivocating_producer.json",
+        4,
+        &[
+            "${current_slot}:abababababababababababababababababababababababababababababababab",
+            "${current_slot}:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        ],
+        3042,
+    )
+    .await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_equivocating_producer");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3043; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_eb_invalid_vrf() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_eb_invalid_vrf.json",
+        2,
+        &["${current_slot}:abababababababababababababababababababababababababababababababab"],
+        3043,
+    )
+    .await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_eb_invalid_vrf");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3044; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_eb_empty_transactions() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_eb_empty_transactions.json",
+        2,
+        &["${current_slot}:abababababababababababababababababababababababababababababababab"],
+        3044,
+    )
+    .await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_eb_empty_transactions");
+}
+
 // ── Adversarial production (slice 5) integration tests ────────────────────────
 
 #[tokio::test]
