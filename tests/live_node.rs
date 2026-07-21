@@ -1628,6 +1628,258 @@ async fn leios_adversarial_eb_body_hash_mismatch() {
     assert_leios_server_steps_passed(&events, timed_out, "leios_eb_body_hash_mismatch");
 }
 
+#[tokio::test]
+#[ignore = "requires free TCP port 3045; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_quorum_votes() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_quorum_votes.json", 11, &[], 3045).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_quorum_votes");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3046; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_multi_eb_session() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_multi_eb_session.json", 15, &[], 3046).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_multi_eb_session");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3047; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_honest_then_adversarial() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_honest_then_adversarial.json", 10, &[], 3047).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_honest_then_adversarial");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3053; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_interleaved_quorum_race() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_interleaved_quorum_race.json",
+        22,
+        &[],
+        3053,
+    )
+    .await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_interleaved_quorum_race");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3054; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_votes_then_hash_mismatch() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_votes_then_hash_mismatch.json",
+        11,
+        &["100:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        3054,
+    )
+    .await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_votes_then_hash_mismatch");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3055; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_withheld_fetch_at_quorum() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_withheld_fetch_at_quorum.json",
+        21,
+        &["${current_slot}:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        3055,
+    )
+    .await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_withheld_fetch_at_quorum");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3056; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_max_vote_batch() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_max_vote_batch.json", 2, &[], 3056).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_max_vote_batch");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3057; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_malformed_cbor_injection() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_malformed_cbor_injection.json", 3, &[], 3057).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_malformed_cbor_injection");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3058; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_equivocation_vote_flood() {
+    let (events, timed_out) =
+        run_leios_pair("scenarios/leios_equivocation_vote_flood.json", 22, &[], 3058).await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_equivocation_vote_flood");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3048; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_equivocation_after_partial_votes() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_equivocation_after_partial_votes.json",
+        6,
+        &[],
+        3048,
+    )
+    .await;
+    assert_leios_server_steps_passed(
+        &events,
+        timed_out,
+        "leios_equivocation_after_partial_votes",
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3049; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_multi_slot_nonmonotonic_votes() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_multi_slot_nonmonotonic_votes.json",
+        9,
+        &[],
+        3049,
+    )
+    .await;
+    assert_leios_server_steps_passed(
+        &events,
+        timed_out,
+        "leios_multi_slot_nonmonotonic_votes",
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3050; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_quorum_on_honest_eb_despite_equivocation() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_quorum_on_honest_eb_despite_equivocation.json",
+        10,
+        &[],
+        3050,
+    )
+    .await;
+    assert_leios_server_steps_passed(
+        &events,
+        timed_out,
+        "leios_quorum_on_honest_eb_despite_equivocation",
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3051; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_two_independent_equivocations() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_two_independent_equivocations.json",
+        8,
+        &[],
+        3051,
+    )
+    .await;
+    assert_leios_server_steps_passed(
+        &events,
+        timed_out,
+        "leios_two_independent_equivocations",
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3052; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_compound_adversarial_session() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_compound_adversarial_session.json",
+        12,
+        &["200:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"],
+        3052,
+    )
+    .await;
+    assert_leios_server_steps_passed(
+        &events,
+        timed_out,
+        "leios_compound_adversarial_session",
+    );
+}
+
+// ── Full-pipeline Leios scenarios (happy path + cross-phase interference) ────
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3059; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_full_pipeline_valid_eb() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_full_pipeline_valid_eb.json",
+        11,
+        &["${current_slot}:d36a2619a672494604e11bb447cbcf5231e9f2ba25c2169177edc941bd50ad6c"],
+        3059,
+    )
+    .await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_full_pipeline_valid_eb");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3060; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_equivocation_then_valid_fetch() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_equivocation_then_valid_fetch.json",
+        17,
+        &[
+            "${current_slot}:d36a2619a672494604e11bb447cbcf5231e9f2ba25c2169177edc941bd50ad6c",
+            "${current_slot}:74a96d312005ff5c1a43088e51f3f8981a4510eae6eb1dc8f389eb974dec07f2",
+        ],
+        3060,
+    )
+    .await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_equivocation_then_valid_fetch");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3061; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_parallel_pipeline_two_ebs() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_parallel_pipeline_two_ebs.json",
+        22,
+        &[
+            "100:d36a2619a672494604e11bb447cbcf5231e9f2ba25c2169177edc941bd50ad6c",
+            "200:74a96d312005ff5c1a43088e51f3f8981a4510eae6eb1dc8f389eb974dec07f2",
+        ],
+        3061,
+    )
+    .await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_parallel_pipeline_two_ebs");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3062; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_retry_after_bad_body() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_retry_after_bad_body.json",
+        11,
+        &[
+            "${current_slot}:d36a2619a672494604e11bb447cbcf5231e9f2ba25c2169177edc941bd50ad6c",
+            "${current_slot}:d36a2619a672494604e11bb447cbcf5231e9f2ba25c2169177edc941bd50ad6c",
+        ],
+        3062,
+    )
+    .await;
+    assert_leios_server_steps_passed(&events, timed_out, "leios_retry_after_bad_body");
+}
+
+#[tokio::test]
+#[ignore = "requires free TCP port 3063; run with: cargo test --test live_node -- --ignored leios_adversarial"]
+async fn leios_adversarial_equivocation_blocks_certification() {
+    let (events, timed_out) = run_leios_pair(
+        "scenarios/leios_equivocation_blocks_certification.json",
+        14,
+        &[],
+        3063,
+    )
+    .await;
+    assert_leios_server_steps_passed(
+        &events,
+        timed_out,
+        "leios_equivocation_blocks_certification",
+    );
+}
+
 // ── Adversarial production (slice 5) integration tests ────────────────────────
 
 #[tokio::test]

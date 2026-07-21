@@ -1,0 +1,552 @@
+{
+  "name": "leios_compound_adversarial_session",
+  "description": "A single session exercises three distinct adversarial patterns concurrently. EB-A (slot 100, hash=aa\u00d732) is a legitimate EB: it receives 50 votes across five batches and should reach quorum, producing a VT bundle. EB-B (current_slot, hash=cc\u00d732) is equivocated: a second offer EB-B' (hash=dd\u00d732) arrives at the same slot before votes are delivered; ten votes then arrive for each equivocated EB and should be suppressed. EB-C (slot 200, hash=ee\u00d732) is offered and fetched, but the body delivered via LeiosFetch is an empty CBOR map (0xa0) whose hash does not match ee\u00d732; five votes for EB-C arrive after the offer and should not produce a certificate since the body is invalid. All three threads run interleaved in a single notification stream. A conforming node must track each (slot, eb_hash) independently: EB-A's clean quorum must not be disrupted by the equivocation detected for EB-B's slot or the hash mismatch for EB-C. The verifier should observe a VTBundleGenerated for EB-A, an equivocation event for current_slot, and a hash-mismatch rejection for EB-C.",
+  "network_magic": 42,
+  "trace_output_path": "trace_leios_compound_adversarial_session.jsonl",
+  "expected_outcome": "success",
+  "sut_genesis_time_unix": 1783591775,
+  "sut_slot_duration_ms": 1000,
+  "steps": [
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3052"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client_conn",
+      "peer_id": "compound_adversarial"
+    },
+    {
+      "kind": "serve_leios_notify",
+      "on": "client_conn",
+      "notifications": [
+        {
+          "kind": "block_offer",
+          "point": "100:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "eb_size": 256
+        },
+        {
+          "kind": "block_offer",
+          "point": "${current_slot}:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "eb_size": 512
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 1,
+              "signature": "a101"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 2,
+              "signature": "a102"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 3,
+              "signature": "a103"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 4,
+              "signature": "a104"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 5,
+              "signature": "a105"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 6,
+              "signature": "a106"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 7,
+              "signature": "a107"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 8,
+              "signature": "a108"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 9,
+              "signature": "a109"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 10,
+              "signature": "a10a"
+            }
+          ]
+        },
+        {
+          "kind": "block_offer",
+          "point": "${current_slot}:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "eb_size": 512
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 11,
+              "signature": "a20b"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 12,
+              "signature": "a20c"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 13,
+              "signature": "a20d"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 14,
+              "signature": "a20e"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 15,
+              "signature": "a20f"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 16,
+              "signature": "a210"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 17,
+              "signature": "a211"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 18,
+              "signature": "a212"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 19,
+              "signature": "a213"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 20,
+              "signature": "a214"
+            }
+          ]
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 1,
+              "signature": "ce01"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 2,
+              "signature": "ce02"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 3,
+              "signature": "ce03"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 4,
+              "signature": "ce04"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 5,
+              "signature": "ce05"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 6,
+              "signature": "ce06"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 7,
+              "signature": "ce07"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 8,
+              "signature": "ce08"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 9,
+              "signature": "ce09"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 10,
+              "signature": "ce0a"
+            }
+          ]
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 21,
+              "signature": "a315"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 22,
+              "signature": "a316"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 23,
+              "signature": "a317"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 24,
+              "signature": "a318"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 25,
+              "signature": "a319"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 26,
+              "signature": "a31a"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 27,
+              "signature": "a31b"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 28,
+              "signature": "a31c"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 29,
+              "signature": "a31d"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 30,
+              "signature": "a31e"
+            }
+          ]
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 1,
+              "signature": "de01"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 2,
+              "signature": "de02"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 3,
+              "signature": "de03"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 4,
+              "signature": "de04"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 5,
+              "signature": "de05"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 6,
+              "signature": "de06"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 7,
+              "signature": "de07"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 8,
+              "signature": "de08"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 9,
+              "signature": "de09"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 10,
+              "signature": "de0a"
+            }
+          ]
+        },
+        {
+          "kind": "block_offer",
+          "point": "200:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "eb_size": 256
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 31,
+              "signature": "a41f"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 32,
+              "signature": "a420"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 33,
+              "signature": "a421"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 34,
+              "signature": "a422"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 35,
+              "signature": "a423"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 36,
+              "signature": "a424"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 37,
+              "signature": "a425"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 38,
+              "signature": "a426"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 39,
+              "signature": "a427"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 40,
+              "signature": "a428"
+            }
+          ]
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": 200,
+              "eb_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "voter_id": 1,
+              "signature": "ee01"
+            },
+            {
+              "slot": 200,
+              "eb_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "voter_id": 2,
+              "signature": "ee02"
+            },
+            {
+              "slot": 200,
+              "eb_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "voter_id": 3,
+              "signature": "ee03"
+            },
+            {
+              "slot": 200,
+              "eb_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "voter_id": 4,
+              "signature": "ee04"
+            },
+            {
+              "slot": 200,
+              "eb_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "voter_id": 5,
+              "signature": "ee05"
+            }
+          ]
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 41,
+              "signature": "a529"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 42,
+              "signature": "a52a"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 43,
+              "signature": "a52b"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 44,
+              "signature": "a52c"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 45,
+              "signature": "a52d"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 46,
+              "signature": "a52e"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 47,
+              "signature": "a52f"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 48,
+              "signature": "a530"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 49,
+              "signature": "a531"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 50,
+              "signature": "a532"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "serve_leios_fetch",
+      "on": "client_conn",
+      "responses": [
+        {
+          "on": "fetch_block",
+          "send": {
+            "kind": "block",
+            "block_bytes": "a0"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "close_listener"
+    }
+  ]
+}

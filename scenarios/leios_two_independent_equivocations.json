@@ -1,0 +1,189 @@
+{
+  "name": "leios_two_independent_equivocations",
+  "description": "Two completely independent equivocations occur in the same session, at two different pipeline slots. EB-A (hash=aa\u00d732) and EB-A' (hash=bb\u00d732) are offered at current_slot, and EB-B (hash=cc\u00d732) and EB-B' (hash=dd\u00d732) are offered at slot 100. Votes arrive for all four EBs. Both equivocations must be detected independently: a node that tracks equivocation state only for the most-recently-seen offending slot would miss the earlier one once a second equivocation is observed. An implementation with a single global 'equivocation flag' rather than a per-slot record would incorrectly suppress votes for legitimate EBs in uninvolved slots. The verifier should observe two distinct equivocation-detected events (one per slot) and confirm no VT bundle is formed for any of the four EBs.",
+  "network_magic": 42,
+  "trace_output_path": "trace_leios_two_independent_equivocations.jsonl",
+  "expected_outcome": "success",
+  "sut_genesis_time_unix": 1783591775,
+  "sut_slot_duration_ms": 1000,
+  "steps": [
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3051"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client_conn",
+      "peer_id": "two_equivocations_server"
+    },
+    {
+      "kind": "serve_leios_notify",
+      "on": "client_conn",
+      "notifications": [
+        {
+          "kind": "block_offer",
+          "point": "${current_slot}:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "eb_size": 512
+        },
+        {
+          "kind": "block_offer",
+          "point": "100:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "eb_size": 256
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 1,
+              "signature": "ae01"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 2,
+              "signature": "ae02"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 3,
+              "signature": "ae03"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 4,
+              "signature": "ae04"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 5,
+              "signature": "ae05"
+            }
+          ]
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": 100,
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 1,
+              "signature": "ce01"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 2,
+              "signature": "ce02"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 3,
+              "signature": "ce03"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 4,
+              "signature": "ce04"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "voter_id": 5,
+              "signature": "ce05"
+            }
+          ]
+        },
+        {
+          "kind": "block_offer",
+          "point": "${current_slot}:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "eb_size": 512
+        },
+        {
+          "kind": "block_offer",
+          "point": "100:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "eb_size": 256
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "voter_id": 1,
+              "signature": "be01"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "voter_id": 2,
+              "signature": "be02"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "voter_id": 3,
+              "signature": "be03"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "voter_id": 4,
+              "signature": "be04"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "voter_id": 5,
+              "signature": "be05"
+            }
+          ]
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": 100,
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 1,
+              "signature": "de01"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 2,
+              "signature": "de02"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 3,
+              "signature": "de03"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 4,
+              "signature": "de04"
+            },
+            {
+              "slot": 100,
+              "eb_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "voter_id": 5,
+              "signature": "de05"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "close_listener"
+    }
+  ]
+}

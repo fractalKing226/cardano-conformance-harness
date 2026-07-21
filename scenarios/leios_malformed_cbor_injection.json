@@ -1,0 +1,73 @@
+{
+  "network_magic": 42,
+  "expected_outcome": "success",
+  "sut_genesis_time_unix": 1783591775,
+  "sut_slot_duration_ms": 1000,
+  "name": "leios_malformed_cbor_injection",
+  "description": "EB-A (current_slot, hash=aa\u00d732) is offered and five legitimate votes are delivered \u2014 establishing valid protocol state on the node. The harness then injects a single byte 0xff directly into the LeiosNotify mux channel. 0xff is the CBOR break code and is illegal as the first byte of a top-level CBOR item, so the node's codec must produce a parse error immediately. A conforming node must handle this gracefully: log a protocol error, tear down the affected mini-protocol session cleanly, and not crash or corrupt unrelated protocol state. The five votes accumulated before the injection must not be lost from the node's internal state (they were validly received). The verifier should observe a protocol-error or codec-error event for the LeiosNotify session and confirm the node continues operating normally.",
+  "trace_output_path": "trace_leios_malformed_cbor_injection.jsonl",
+  "steps": [
+    {
+      "kind": "listen",
+      "bind_address": "0.0.0.0:3057"
+    },
+    {
+      "kind": "accept_handshake",
+      "as": "client_conn",
+      "peer_id": "malformed_cbor_server"
+    },
+    {
+      "kind": "serve_leios_notify",
+      "on": "client_conn",
+      "notifications": [
+        {
+          "kind": "block_offer",
+          "point": "${current_slot}:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "eb_size": 512
+        },
+        {
+          "kind": "votes",
+          "votes": [
+            {
+              "slot": "$current_slot",
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 1,
+              "signature": "aa01"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 2,
+              "signature": "aa02"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 3,
+              "signature": "aa03"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 4,
+              "signature": "aa04"
+            },
+            {
+              "slot": "$current_slot",
+              "eb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "voter_id": 5,
+              "signature": "aa05"
+            }
+          ]
+        },
+        {
+          "kind": "raw_bytes",
+          "bytes": "ff"
+        }
+      ]
+    },
+    {
+      "kind": "close_listener"
+    }
+  ]
+}
